@@ -7,6 +7,7 @@ from flask import Flask, request, jsonify
 from PIL import Image
 import torch
 
+
 # Imports from your local scripts
 # NOTE: Ensure the file is renamed to extract_references_french_v3_3.py
 from extract_references_french_v3_3 import process_powerpoint
