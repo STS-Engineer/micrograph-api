@@ -14,5 +14,6 @@ python-pptx
 tqdm
 pandas
 requests
+werkzeug
 # Optional: for better image handling
 opencv-python
