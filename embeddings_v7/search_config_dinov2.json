@@ -1,0 +1,9 @@
+{
+  "model": "dinov2",
+  "index_file": "embeddings_v7\\faiss_index_dinov2.index",
+  "metadata_file": "embeddings_v7\\metadata_dinov2.json",
+  "embeddings_file": "embeddings_v7\\embeddings_dinov2.npy",
+  "index_type": "IndexFlatIP",
+  "dimension": 1024,
+  "num_vectors": 64
+}

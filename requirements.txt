@@ -1,0 +1,18 @@
+# Core dependencies
+torch
+torchvision
+transformers
+pillow
+numpy
+faiss-cpu
+flask
+flask_cors
+# PPT extraction
+python-pptx
+
+# Utilities
+tqdm
+pandas
+
+# Optional: for better image handling
+opencv-python

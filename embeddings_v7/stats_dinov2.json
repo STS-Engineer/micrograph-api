@@ -1,0 +1,7 @@
+{
+  "model": "dinov2",
+  "num_embeddings": 64,
+  "embedding_dim": 1024,
+  "mean_norm": 45.07957458496094,
+  "std_norm": 1.29779052734375
+}
