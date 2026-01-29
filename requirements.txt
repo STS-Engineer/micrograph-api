@@ -13,6 +13,7 @@ python-pptx
 # Utilities
 tqdm
 pandas
+Image
 
 # Optional: for better image handling
 opencv-python
