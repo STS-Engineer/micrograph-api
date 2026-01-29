@@ -1,12 +1,5 @@
 #!/bin/bash
 
-# --- 1. Environment Setup ---
-echo "🌐 Setting up Python virtual environment..."
-if [ ! -d "venv" ]; then
-    python3 -m venv venv
-fi
-source venv/bin/activate
-
 # --- 2. Dependency Installation ---
 echo "📦 Installing core dependencies..."
 pip install --upgrade pip
