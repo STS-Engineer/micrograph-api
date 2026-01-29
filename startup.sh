@@ -12,12 +12,6 @@ echo "📦 Installing core dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# --- 3. Directory Initialization ---
-# Ensure directories exist for input PowerPoints and output data
-echo "📁 Preparing local directories..."
-mkdir -p ./inputs 
-mkdir -p ./embeddings_v7 
-
 # --- 4. Model Pre-caching ---
 # Force download the DINOv2 model to avoid timeout on first API call
 echo "🧬 Pre-caching DINOv2-Large model..."
