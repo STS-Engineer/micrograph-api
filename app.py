@@ -3,8 +3,7 @@ import argparse
 import shutil
 import json
 from pathlib import Path
-from flask import Flask, request, jsonify, send_file  # Added send_file
-from werkzeug.utils import secure_filename           # Added secure_filename
+from flask import Flask, request, jsonify
 from PIL import Image
 import torch
 
@@ -76,7 +75,7 @@ def update_index():
 
         # 3. Compute Embeddings
         print("🧬 Step 2: Computing embeddings...")
-        computer = EmbeddingComputer(model_name=MODEL_NAME)
+        computer = EmbeddingComputer(model_name=MODEL_NAME) #
         embeddings, valid_metadata = computer.compute_batch(
             all_metadata, 
             metadata_path=temp_meta_path, 
@@ -87,7 +86,7 @@ def update_index():
         # 4. Build FAISS Index
         print("🏗️ Step 3: Building FAISS index...")
         embeddings_path = os.path.join(OUTPUT_BASE_DIR, f"embeddings_{MODEL_NAME}.npy")
-        build_faiss_index(
+        build_faiss_index( #
             embeddings_path=embeddings_path,
             output_dir=OUTPUT_BASE_DIR,
             model_name=MODEL_NAME
@@ -128,20 +127,6 @@ def search():
         return jsonify({"results": results}), 200
     except Exception as e:
         return jsonify({"error": "search_failed", "message": str(e)}), 400
-
-@app.route('/images/<filename>', methods=['GET'])
-def serve_image(filename):
-    """Required to view the images returned by the process route."""
-    try:
-        # Construct path to the images subfolder within your output base
-        image_path = Path(OUTPUT_BASE_DIR) / "images" / secure_filename(filename)
-        
-        if not image_path.exists():
-            return jsonify({"success": False, "error": "Image not found"}), 404
-            
-        return send_file(str(image_path), mimetype='image/jpeg')
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
