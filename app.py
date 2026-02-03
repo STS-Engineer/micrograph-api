@@ -40,8 +40,34 @@ def load_engine(config_path: str):
 
 
 # -----------------------------
-# HEALTH CHECK
+# AUTO-LOAD ENGINE (works under Gunicorn)
 # -----------------------------
+existing_config = str(OUTPUT_BASE_DIR / f"search_config_{MODEL_NAME}.json")
+if os.path.exists(existing_config):
+    try:
+        load_engine(existing_config)
+        print("✅ Search engine loaded on import (gunicorn)")
+    except Exception as e:
+        print(f"⚠️ Engine auto-load failed on import: {e}")
+        print("   Use /update_index endpoint to build a new index")
+
+
+# -----------------------------
+# ROOT / HEALTH
+# -----------------------------
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify(
+        {
+            "status": "ok",
+            "service": "micrographie-ia",
+            "engine_loaded": ENGINE is not None,
+            "model": MODEL_NAME,
+            "endpoints": ["/health", "/search", "/update_index", "/uploads/<filename>"],
+        }
+    ), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     """Health check endpoint"""
@@ -79,25 +105,19 @@ def serve_image(filename):
 def search():
     """
     Search for similar micrographs
-    
+
     Request:
         - file: Image file (multipart/form-data)
         - top_k (optional): Number of results to return (default: 1)
-    
+
     Response:
-        {
-            "results": [
-                {
-                    "similarity_score": 0.95,
-                    "reference": "...",
-                    "image_path": "...",
-                    ...
-                }
-            ]
-        }
+        { "results": [ ... ] }
     """
     if ENGINE is None:
-        return jsonify({"error": "engine_not_loaded", "message": "Search engine is not initialized"}), 500
+        return (
+            jsonify({"error": "engine_not_loaded", "message": "Search engine is not initialized"}),
+            500,
+        )
 
     if "file" not in request.files:
         return jsonify({"error": "missing_file", "message": "No file provided in request"}), 400
@@ -109,7 +129,6 @@ def search():
         img = Image.open(f.stream).convert("RGB")
         results = ENGINE.search_from_pil(img, top_k=top_k)
         return jsonify({"results": results}), 200
-
     except Exception as e:
         return jsonify({"error": "search_failed", "message": str(e)}), 400
 
@@ -121,18 +140,12 @@ def search():
 def update_index():
     """
     Rebuild the search index from PowerPoint files in the inputs directory
-    
+
     This endpoint will:
     1. Extract images from all .ppt/.pptx files in the inputs directory
     2. Compute embeddings for all extracted images
     3. Build a FAISS index for fast similarity search
     4. Reload the search engine with the new index
-    
-    Response:
-        {
-            "status": "success",
-            "images_indexed": 123
-        }
     """
     global ENGINE
 
@@ -145,10 +158,15 @@ def update_index():
         # Find PowerPoint files
         ppt_files = list(INPUT_PPT_DIR.glob("*.pptx")) + list(INPUT_PPT_DIR.glob("*.ppt"))
         if not ppt_files:
-            return jsonify({
-                "error": "no_ppt_files_found",
-                "message": f"No PowerPoint files found in {INPUT_PPT_DIR}"
-            }), 400
+            return (
+                jsonify(
+                    {
+                        "error": "no_ppt_files_found",
+                        "message": f"No PowerPoint files found in {INPUT_PPT_DIR}",
+                    }
+                ),
+                400,
+            )
 
         # Extract images and metadata from PowerPoints
         all_metadata = []
@@ -187,19 +205,14 @@ def update_index():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        return jsonify(
-            {
-                "status": "success",
-                "images_indexed": len(valid_metadata),
-            }
-        ), 200
+        return jsonify({"status": "success", "images_indexed": len(valid_metadata)}), 200
 
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
 # -----------------------------
-# MAIN
+# MAIN (local dev only)
 # -----------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -207,19 +220,10 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
     args = parser.parse_args()
 
-    # Try to load existing index on startup
-    existing_config = str(OUTPUT_BASE_DIR / f"search_config_{MODEL_NAME}.json")
-    if os.path.exists(existing_config):
-        try:
-            load_engine(existing_config)
-            print("✅ Search engine loaded successfully on startup")
-        except Exception as e:
-            print(f"⚠️ Engine auto-load failed: {e}")
-            print("   Use /update_index endpoint to build a new index")
-
     print(f"\n🚀 API Server starting on {args.host}:{args.port}")
+    print(f"   Root: http://{args.host}:{args.port}/")
     print(f"   Health check: http://{args.host}:{args.port}/health")
     print(f"   Search: POST http://{args.host}:{args.port}/search")
     print(f"   Update index: POST http://{args.host}:{args.port}/update_index")
-    
+
     app.run(host=args.host, port=args.port)
