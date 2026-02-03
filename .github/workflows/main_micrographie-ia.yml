@@ -1,4 +1,4 @@
-# Optimized GitHub Actions workflow matching original authentication structure
+# Optimized GitHub Actions workflow for Azure Web App deployment
 name: Build and deploy Python app to Azure Web App - micrographie-ia
 
 on:
@@ -36,10 +36,15 @@ jobs:
         
       - name: Create deployment package
         run: |
+          # Create a clean deployment directory
           mkdir -p deploy_package
+          
+          # Copy application files (ignoring errors if files don't exist)
           cp -r *.py deploy_package/ 2>/dev/null || true
           cp requirements.txt deploy_package/
-          cp startup.sh deploy_package/ 2>/dev/null || true
+          [ -f "startup.sh" ] && cp startup.sh deploy_package/ || true
+          
+          # Copy necessary directories
           [ -d "inputs" ] && cp -r inputs deploy_package/ || mkdir -p deploy_package/inputs
           [ -d "embeddings_v7" ] && cp -r embeddings_v7 deploy_package/ || true
           [ -f ".deployment" ] && cp .deployment deploy_package/ || true
@@ -71,6 +76,8 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_78701A2BB0374BD6B7F614741A0F70D1 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_4862F8976B2E47A4A6F753F5C43F51C3 }}
 
+      # NOTE: This step requires "Contributor" role on the Resource Group.
+      # If it still fails, grant the role in Azure IAM or delete this specific step.
       - name: Configure Azure App Service settings
         run: |
           az webapp config appsettings set \
@@ -85,27 +92,28 @@ jobs:
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
+        id: deploy-to-webapp
         with:
           app-name: 'micrographie-ia'
           slot-name: 'Production'
 
       - name: Health check
         run: |
-          echo "Performing health check..."
-          # Giving the app 30 seconds to start before first check
+          echo "Waiting 30 seconds for app to initialize..."
           sleep 30
           MAX_RETRIES=5
           RETRY_COUNT=0
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://micrographie-ia.azurewebsites.net/health || echo "000")
             if [ "$HTTP_CODE" = "200" ]; then
-              echo "✅ Health check passed"
+              echo "✅ Health check passed (HTTP 200)"
               exit 0
             fi
-            echo "⏳ Attempt $((RETRY_COUNT + 1)) failed (HTTP $HTTP_CODE), retrying..."
+            echo "⏳ Attempt $((RETRY_COUNT + 1)) failed (HTTP $HTTP_CODE), retrying in 15s..."
             RETRY_COUNT=$((RETRY_COUNT + 1))
             sleep 15
           done
+          echo "❌ Health check failed. Check Azure logs."
           exit 1
 
       - name: Logout from Azure
