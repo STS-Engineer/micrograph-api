@@ -1,4 +1,4 @@
-# Core dependencies
+--extra-index-url https://download.pytorch.org/whl/cpu
 torch
 torchvision
 transformers
@@ -7,12 +7,9 @@ numpy
 faiss-cpu
 flask
 flask_cors
-# PPT extraction
 python-pptx
-
-# Utilities
 tqdm
 pandas
 requests
 werkzeug
-
+gunicorn
