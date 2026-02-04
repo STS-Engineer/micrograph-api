@@ -14,3 +14,4 @@ pandas
 requests
 werkzeug
 gunicorn
+openai 
