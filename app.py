@@ -185,6 +185,9 @@ def upload_temp_image():
 # -----------------------------
 # SEARCH
 # -----------------------------
+# Amélioration de l'endpoint /search dans app.py
+# Remplacez votre fonction search() actuelle par celle-ci
+
 @app.route("/search", methods=["POST"])
 def search():
     """
@@ -217,21 +220,47 @@ def search():
     elif "file_id" in data:
         file_id = data["file_id"]
         try:
+            # Vérifier d'abord que le fichier existe
+            file_info = client.files.retrieve(file_id)
+            
+            # Vérifier le purpose (doit être "assistants" ou "vision")
+            if file_info.purpose not in ["assistants", "vision", "assistants_output"]:
+                return jsonify({
+                    "error": "invalid_file_purpose",
+                    "message": f"File purpose is '{file_info.purpose}'. Must be 'assistants' or 'vision'. Please re-upload the file with correct purpose."
+                }), 400
+            
             # Télécharger le contenu du fichier depuis OpenAI
             file_content = client.files.content(file_id).read()
             img = Image.open(io.BytesIO(file_content)).convert("RGB")
+            
         except Exception as e:
-            return jsonify({"error": "openai_retrieval_failed", "message": str(e)}), 400
+            error_msg = str(e)
+            
+            # Message d'erreur plus explicite pour l'utilisateur GPT
+            if "No such File object" in error_msg or "Could not find" in error_msg:
+                return jsonify({
+                    "error": "file_not_accessible",
+                    "message": "The file_id cannot be accessed. This usually means: (1) The file is a conversation attachment, not uploaded via Files API, or (2) The file has expired. Please upload the image using OpenAI's Files API with purpose='assistants'.",
+                    "hint": "In GPT, use the file upload function with purpose='assistants' before calling this API."
+                }), 400
+            else:
+                return jsonify({
+                    "error": "openai_retrieval_failed", 
+                    "message": error_msg
+                }), 400
     
     else:
-        return jsonify({"error": "missing_input", "message": "Provide either file_id or temp_filename"}), 400
+        return jsonify({
+            "error": "missing_input", 
+            "message": "Provide either file_id or temp_filename"
+        }), 400
 
     try:
         results = ENGINE.search_from_pil(img, top_k=top_k)
         return jsonify({"results": results}), 200
     except Exception as e:
         return jsonify({"error": "search_failed", "message": str(e)}), 400
-
 
 # -----------------------------
 # INDEX PIPELINE
