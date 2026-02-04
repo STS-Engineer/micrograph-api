@@ -3,9 +3,12 @@ import argparse
 import shutil
 import json
 import torch
+import time
+import uuid
 from pathlib import Path
+from threading import Thread
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, url_for
 from PIL import Image
 
 # Imports from your local scripts
@@ -25,9 +28,38 @@ OUTPUT_BASE_DIR = Path("embeddings_v7")
 IMAGES_DIR = OUTPUT_BASE_DIR / "images"
 MODEL_NAME = "dinov2"
 
+# Dossier pour le stockage temporaire sur le serveur Azure
+TEMP_UPLOAD_DIR = Path("temp_uploads")
+TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 INPUT_PPT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# -----------------------------
+# BACKGROUND CLEANUP TASK
+# -----------------------------
+def cleanup_old_files(interval=1800): # Vérifie toutes les 30 minutes
+    """
+    Supprime les fichiers du dossier temp_uploads s'ils ont plus de 2 heures.
+    """
+    while True:
+        now = time.time()
+        for f in TEMP_UPLOAD_DIR.glob("*"):
+            if f.is_file():
+                # 7200 secondes = 2 heures
+                if now - f.stat().st_mtime > 7200:
+                    try:
+                        f.unlink()
+                        print(f"🗑️ Fichier temporaire supprimé : {f.name}")
+                    except Exception as e:
+                        print(f"⚠️ Erreur lors de la suppression de {f.name} : {e}")
+        time.sleep(interval)
+
+# Lancer le thread de nettoyage en arrière-plan
+cleanup_thread = Thread(target=cleanup_old_files, daemon=True)
+cleanup_thread.start()
 
 
 # -----------------------------
@@ -63,7 +95,7 @@ def root():
             "service": "micrographie-ia",
             "engine_loaded": ENGINE is not None,
             "model": MODEL_NAME,
-            "endpoints": ["/health", "/search", "/update_index", "/uploads/<filename>"],
+            "endpoints": ["/health", "/search", "/update_index", "/upload_temp_image", "/temp_files/<filename>"],
         }
     ), 200
 
@@ -85,17 +117,55 @@ def health():
 # -----------------------------
 @app.route("/uploads/<path:filename>", methods=["GET"])
 def serve_image(filename):
-    """
-    Serve images from the embeddings/images directory
-    This handles the matched micrograph images
-    """
+    """Serve images from the embeddings/images directory"""
     try:
-        if IMAGES_DIR.exists():
-            return send_from_directory(str(IMAGES_DIR), filename, as_attachment=False)
-        else:
-            return jsonify({"error": "images_directory_not_found"}), 404
+        return send_from_directory(str(IMAGES_DIR), filename)
     except Exception as e:
-        return jsonify({"error": "image_not_found", "message": str(e)}), 404
+        return jsonify({"error": "not_found"}), 404
+
+@app.route("/temp_files/<path:filename>", methods=["GET"])
+def serve_temp_image(filename):
+    """Sert les images temporaires stockées localement"""
+    try:
+        return send_from_directory(str(TEMP_UPLOAD_DIR), filename)
+    except Exception as e:
+        return jsonify({"error": "temp_file_not_found"}), 404
+
+
+# -----------------------------
+# LOCAL TEMPORARY STORAGE
+# -----------------------------
+@app.route("/upload_temp_image", methods=["POST"])
+def upload_temp_image():
+    """
+    Sauvegarde une image localement dans le dossier temp_uploads.
+    Retourne l'URL locale pour que l'assistant GPT puisse l'utiliser.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "missing_file"}), 400
+
+    f = request.files["file"]
+    
+    # Générer un nom de fichier unique pour éviter les collisions
+    ext = os.path.splitext(f.filename)[1]
+    unique_filename = f"{uuid.uuid4()}{ext}"
+    file_path = TEMP_UPLOAD_DIR / unique_filename
+    
+    try:
+        f.save(file_path)
+        
+        # Construire l'URL complète vers ce fichier
+        # Note: En production, assurez-vous que request.host_url est correct
+        file_url = f"{request.host_url.rstrip('/')}/temp_files/{unique_filename}"
+        
+        return jsonify({
+            "url": file_url,
+            "filename": unique_filename,
+            "expires_in": "2 hours"
+        }), 200
+            
+    except Exception as e:
+        return jsonify({"error": "save_failed", "message": str(e)}), 500
 
 
 # -----------------------------
@@ -105,28 +175,38 @@ def serve_image(filename):
 def search():
     """
     Search for similar micrographs
-
-    Request:
-        - file: Image file (multipart/form-data)
-        - top_k (optional): Number of results to return (default: 1)
-
-    Response:
-        { "results": [ ... ] }
+    Accepts either a direct file upload or a filename from temp_uploads
     """
     if ENGINE is None:
-        return (
-            jsonify({"error": "engine_not_loaded", "message": "Search engine is not initialized"}),
-            500,
-        )
+        return jsonify({"error": "engine_not_loaded"}), 500
 
-    if "file" not in request.files:
-        return jsonify({"error": "missing_file", "message": "No file provided in request"}), 400
-
-    f = request.files["file"]
     top_k = request.form.get("top_k", 1, type=int)
+    img = None
+
+    # Option 1: Recherche via un fichier déjà uploadé temporairement
+    temp_filename = request.form.get("temp_filename")
+    if temp_filename:
+        file_path = TEMP_UPLOAD_DIR / temp_filename
+        if file_path.exists():
+            try:
+                img = Image.open(file_path).convert("RGB")
+            except Exception as e:
+                return jsonify({"error": "invalid_temp_file", "message": str(e)}), 400
+        else:
+            return jsonify({"error": "temp_file_expired_or_not_found"}), 404
+
+    # Option 2: Recherche via upload direct
+    elif "file" in request.files:
+        f = request.files["file"]
+        try:
+            img = Image.open(f.stream).convert("RGB")
+        except Exception as e:
+            return jsonify({"error": "invalid_image"}), 400
+    
+    else:
+        return jsonify({"error": "missing_input"}), 400
 
     try:
-        img = Image.open(f.stream).convert("RGB")
         results = ENGINE.search_from_pil(img, top_k=top_k)
         return jsonify({"results": results}), 200
     except Exception as e:
@@ -138,47 +218,25 @@ def search():
 # -----------------------------
 @app.route("/update_index", methods=["POST"])
 def update_index():
-    """
-    Rebuild the search index from PowerPoint files in the inputs directory
-
-    This endpoint will:
-    1. Extract images from all .ppt/.pptx files in the inputs directory
-    2. Compute embeddings for all extracted images
-    3. Build a FAISS index for fast similarity search
-    4. Reload the search engine with the new index
-    """
+    """Rebuild the search index from PowerPoint files"""
     global ENGINE
-
     try:
-        # Clean output directory
         if OUTPUT_BASE_DIR.exists():
             shutil.rmtree(OUTPUT_BASE_DIR)
         OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Find PowerPoint files
         ppt_files = list(INPUT_PPT_DIR.glob("*.pptx")) + list(INPUT_PPT_DIR.glob("*.ppt"))
         if not ppt_files:
-            return (
-                jsonify(
-                    {
-                        "error": "no_ppt_files_found",
-                        "message": f"No PowerPoint files found in {INPUT_PPT_DIR}",
-                    }
-                ),
-                400,
-            )
+            return jsonify({"error": "no_ppt_files_found"}), 400
 
-        # Extract images and metadata from PowerPoints
         all_metadata = []
         for ppt_file in ppt_files:
             all_metadata.extend(process_powerpoint(ppt_file, OUTPUT_BASE_DIR))
 
-        # Save metadata
         meta_path = OUTPUT_BASE_DIR / "metadata.json"
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(all_metadata, f, indent=2, ensure_ascii=False)
 
-        # Compute embeddings
         computer = EmbeddingComputer(model_name=MODEL_NAME)
         embeddings, valid_metadata = computer.compute_batch(
             all_metadata,
@@ -186,44 +244,25 @@ def update_index():
             images_root=str(OUTPUT_BASE_DIR / "images"),
         )
 
-        # Save embeddings
         save_embeddings(embeddings, valid_metadata, str(OUTPUT_BASE_DIR), MODEL_NAME)
 
-        # Build FAISS index
         embeddings_path = str(OUTPUT_BASE_DIR / f"embeddings_{MODEL_NAME}.npy")
-        build_faiss_index(
-            embeddings_path=embeddings_path,
-            output_dir=str(OUTPUT_BASE_DIR),
-            model_name=MODEL_NAME,
-        )
+        build_faiss_index(embeddings_path=embeddings_path, output_dir=str(OUTPUT_BASE_DIR), model_name=MODEL_NAME)
 
-        # Reload search engine
         config_path = str(OUTPUT_BASE_DIR / f"search_config_{MODEL_NAME}.json")
         load_engine(config_path)
 
-        # Clean up GPU memory if available
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         return jsonify({"status": "success", "images_indexed": len(valid_metadata)}), 200
-
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# -----------------------------
-# MAIN (local dev only)
-# -----------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
     args = parser.parse_args()
-
-    print(f"\n🚀 API Server starting on {args.host}:{args.port}")
-    print(f"   Root: http://{args.host}:{args.port}/")
-    print(f"   Health check: http://{args.host}:{args.port}/health")
-    print(f"   Search: POST http://{args.host}:{args.port}/search")
-    print(f"   Update index: POST http://{args.host}:{args.port}/update_index")
-
     app.run(host=args.host, port=args.port)
