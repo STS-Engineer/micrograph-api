@@ -5,11 +5,13 @@ import json
 import torch
 import time
 import uuid
+import io
 from pathlib import Path
 from threading import Thread
 
 from flask import Flask, request, jsonify, send_from_directory, url_for
 from PIL import Image
+from openai import OpenAI
 
 # Imports from your local scripts
 from extract_references_french_v3_3 import process_powerpoint
@@ -35,6 +37,10 @@ TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 INPUT_PPT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Initialisation du client OpenAI
+# L'API Key est récupérée automatiquement depuis la variable d'environnement OPENAI_API_KEY
+client = OpenAI()
 
 
 # -----------------------------
@@ -95,7 +101,7 @@ def root():
             "service": "micrographie-ia",
             "engine_loaded": ENGINE is not None,
             "model": MODEL_NAME,
-            "endpoints": ["/health", "/search", "/update_index", "/upload_temp_image", "/temp_files/<filename>"],
+            "endpoints": ["/health", "/search", "/upload_temp_image", "/temp_files/<filename>"],
         }
     ), 200
 
@@ -138,24 +144,32 @@ def serve_temp_image(filename):
 @app.route("/upload_temp_image", methods=["POST"])
 def upload_temp_image():
     """
-    Sauvegarde une image localement dans le dossier temp_uploads.
+    Récupère une image depuis OpenAI via son file_id et la sauvegarde localement.
     Retourne l'URL locale pour que l'assistant GPT puisse l'utiliser.
     """
-    if "file" not in request.files:
-        return jsonify({"error": "missing_file"}), 400
+    data = request.get_json()
+    if not data or "file_id" not in data:
+        return jsonify({"error": "missing_file_id"}), 400
 
-    f = request.files["file"]
-    
-    # Générer un nom de fichier unique pour éviter les collisions
-    ext = os.path.splitext(f.filename)[1]
-    unique_filename = f"{uuid.uuid4()}{ext}"
-    file_path = TEMP_UPLOAD_DIR / unique_filename
+    file_id = data["file_id"]
     
     try:
-        f.save(file_path)
+        # Récupérer les infos du fichier pour avoir l'extension originale
+        file_info = client.files.retrieve(file_id)
+        ext = os.path.splitext(file_info.filename)[1] or ".png"
         
-        # Construire l'URL complète vers ce fichier
-        # Note: En production, assurez-vous que request.host_url est correct
+        # Télécharger le contenu du fichier
+        file_content = client.files.content(file_id).read()
+        
+        # Générer un nom de fichier unique
+        unique_filename = f"{uuid.uuid4()}{ext}"
+        file_path = TEMP_UPLOAD_DIR / unique_filename
+        
+        # Sauvegarder localement
+        with open(file_path, "wb") as f:
+            f.write(file_content)
+        
+        # Construire l'URL complète
         file_url = f"{request.host_url.rstrip('/')}/temp_files/{unique_filename}"
         
         return jsonify({
@@ -165,7 +179,7 @@ def upload_temp_image():
         }), 200
             
     except Exception as e:
-        return jsonify({"error": "save_failed", "message": str(e)}), 500
+        return jsonify({"error": "openai_retrieval_failed", "message": str(e)}), 500
 
 
 # -----------------------------
@@ -175,16 +189,20 @@ def upload_temp_image():
 def search():
     """
     Search for similar micrographs
-    Accepts either a direct file upload or a filename from temp_uploads
+    Accepts either an OpenAI file_id or a filename from temp_uploads (via JSON)
     """
     if ENGINE is None:
         return jsonify({"error": "engine_not_loaded"}), 500
 
-    top_k = request.form.get("top_k", 1, type=int)
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "missing_json_body"}), 400
+
+    top_k = data.get("top_k", 1)
     img = None
 
     # Option 1: Recherche via un fichier déjà uploadé temporairement
-    temp_filename = request.form.get("temp_filename")
+    temp_filename = data.get("temp_filename")
     if temp_filename:
         file_path = TEMP_UPLOAD_DIR / temp_filename
         if file_path.exists():
@@ -195,16 +213,18 @@ def search():
         else:
             return jsonify({"error": "temp_file_expired_or_not_found"}), 404
 
-    # Option 2: Recherche via upload direct
-    elif "file" in request.files:
-        f = request.files["file"]
+    # Option 2: Recherche via OpenAI file_id
+    elif "file_id" in data:
+        file_id = data["file_id"]
         try:
-            img = Image.open(f.stream).convert("RGB")
+            # Télécharger le contenu du fichier depuis OpenAI
+            file_content = client.files.content(file_id).read()
+            img = Image.open(io.BytesIO(file_content)).convert("RGB")
         except Exception as e:
-            return jsonify({"error": "invalid_image"}), 400
+            return jsonify({"error": "openai_retrieval_failed", "message": str(e)}), 400
     
     else:
-        return jsonify({"error": "missing_input"}), 400
+        return jsonify({"error": "missing_input", "message": "Provide either file_id or temp_filename"}), 400
 
     try:
         results = ENGINE.search_from_pil(img, top_k=top_k)
