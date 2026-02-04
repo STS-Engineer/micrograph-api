@@ -48,9 +48,9 @@ def build_faiss_index(embeddings_path: str, output_dir: str, model_name: str):
     
     config = {
         "model": model_name,
-        "index_file": str(index_file),
-        "metadata_file": str(metadata_file),
-        "embeddings_file": str(embeddings_file),
+        "index_file": f"faiss_index_{model_name}.index",
+        "metadata_file": f"metadata_{model_name}.json",
+        "embeddings_file": f"embeddings_{model_name}.npy",
         "index_type": "IndexFlatIP",
         "dimension": int(dimension),
         "num_vectors": int(index.ntotal)
