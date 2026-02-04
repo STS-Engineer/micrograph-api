@@ -28,22 +28,31 @@ class FrenchMicrographSearchEngine:
         # ================================
         def _resolve_path(p: str) -> str:
             p = str(p).strip().strip('"').strip("'")
-
+        
+            # 🔥 FIX 1: normalize Windows paths → Linux
+            p = p.replace("\\", "/")
+        
+            # 🔥 FIX 2: avoid duplicated embeddings_v7/embeddings_v7
+            p = p.lstrip("./")
+            if p.startswith("embeddings_v7/"):
+                p = p[len("embeddings_v7/"):]
+        
             if os.path.isabs(p):
                 return p
-
+        
             # 1) relative to config directory
             cand1 = Path(self.config_dir) / p
             if cand1.exists():
                 return str(cand1.resolve())
-
+        
             # 2) relative to current working directory
             cand2 = Path(os.getcwd()) / p
             if cand2.exists():
                 return str(cand2.resolve())
-
-            # 3) fallback (clear error path)
+        
+            # 3) fallback (for clear error message)
             return str(cand1.resolve())
+
 
         self.config["index_file"] = _resolve_path(self.config["index_file"])
         self.config["metadata_file"] = _resolve_path(self.config["metadata_file"])
