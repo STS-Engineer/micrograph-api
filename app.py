@@ -14,7 +14,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from PIL import Image
 from openai import OpenAI
 from werkzeug.utils import secure_filename
-
+from dotenv import load_dotenv  # Add this import
 # Imports from your local scripts
 from extract_references_french_v3_3 import process_powerpoint
 from compute_embeddings import EmbeddingComputer, save_embeddings
@@ -22,7 +22,7 @@ from build_faiss_index_proper import build_faiss_index
 from search_similar_french_v2 import FrenchMicrographSearchEngine
 
 app = Flask(__name__)
-
+load_dotenv()
 # -----------------------------
 # CONFIGURATION
 # -----------------------------
