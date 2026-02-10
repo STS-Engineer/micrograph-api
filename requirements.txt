@@ -15,5 +15,3 @@ requests
 werkzeug
 gunicorn
 openai 
-
-psycopg2-binary
