@@ -1,40 +1,74 @@
+from __future__ import annotations
+
+import argparse
+import io
+import time
+import uuid
 from pathlib import Path
 from threading import Thread
+from typing import Optional
 
 import requests
-from flask import Flask, request, jsonify, send_from_directory
-from PIL import Image
+from flask import Flask, jsonify, request, send_from_directory
 from openai import OpenAI
+from PIL import Image
 from werkzeug.utils import secure_filename
 
-# Imports from your local scripts
-from extract_references_french_v3_3 import process_powerpoint
-@@ -30,23 +32,56 @@
+# Imports from your local scripts (à adapter selon ton projet)
+from extract_references_french_v3_3 import process_powerpoint  # noqa: F401
+
+# --------------------------------------------------------------------------------------
+# APP + PATHS
+# --------------------------------------------------------------------------------------
+app = Flask(__name__)
+
+# Upload limits (16MB)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+
+OUTPUT_BASE_DIR = Path("embeddings")
+INPUT_PPT_DIR = Path("input_ppt")
 IMAGES_DIR = OUTPUT_BASE_DIR / "images"
 MODEL_NAME = "dinov2"
+
+OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+INPUT_PPT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Dossier pour le stockage temporaire sur le serveur
 TEMP_UPLOAD_DIR = Path("temp_uploads")
 TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Upload limits (16MB)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
-
-INPUT_PPT_DIR.mkdir(parents=True, exist_ok=True)
-
-# Initialisation du client OpenAI (API key via env OPENAI_API_KEY)
-
+# OpenAI client
 client = OpenAI()
 
-# -----------------------------
-# TEMP UPLOAD VALIDATION (like your 1st code)
-# -----------------------------
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "pdf", "txt", "csv", "xlsx", "docx", "pptx", "md", "json"}
+# --------------------------------------------------------------------------------------
+# ENGINE (placeholder: adapte à ton code)
+# --------------------------------------------------------------------------------------
+ENGINE = None  # sera chargé via load_engine()
+
+def load_engine(config_path: str):
+    """
+    Doit initialiser ENGINE (ex: FrenchMicrographSearchEngine)
+    Adapte ici selon ta classe réelle.
+    """
+    global ENGINE
+    print(f"📄 Loading search engine: {config_path}")
+    # from your_engine_module import FrenchMicrographSearchEngine
+    # ENGINE = FrenchMicrographSearchEngine(config_path=config_path)
+    raise NotImplementedError("load_engine() doit être adapté à ton moteur de recherche.")
+
+
+# --------------------------------------------------------------------------------------
+# TEMP UPLOAD VALIDATION
+# --------------------------------------------------------------------------------------
+ALLOWED_EXTENSIONS = {
+    "png", "jpg", "jpeg", "pdf", "txt", "csv", "xlsx", "docx", "pptx", "md", "json"
+}
 
 def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def guess_extension_from_mime(mime_type: str | None) -> str | None:
+def guess_extension_from_mime(mime_type: Optional[str]) -> Optional[str]:
     if not mime_type:
         return None
     mt = mime_type.lower()
@@ -60,61 +94,54 @@ def guess_extension_from_mime(mime_type: str | None) -> str | None:
         return ".md"
     return None
 
-# -----------------------------
-# BACKGROUND CLEANUP TASK
-# -----------------------------
-def cleanup_old_files(interval=1800):  # toutes les 30 minutes
-    """
-    Supprime les fichiers du dossier temp_uploads s'ils ont plus de 2 heures.
-    """
-@@ -63,11 +98,9 @@ def cleanup_old_files(interval=1800): # Vérifie toutes les 30 minutes
-                        print(f"⚠️ Erreur lors de la suppression de {f.name} : {e}")
-        time.sleep(interval)
 
+# --------------------------------------------------------------------------------------
+# BACKGROUND CLEANUP TASK
+# --------------------------------------------------------------------------------------
+def cleanup_old_files(interval: int = 1800, max_age_seconds: int = 2 * 3600):
+    """
+    Supprime les fichiers du dossier temp_uploads s'ils ont plus de max_age_seconds.
+    Vérifie toutes les `interval` secondes.
+    """
+    while True:
+        now = time.time()
+        try:
+            for f in TEMP_UPLOAD_DIR.iterdir():
+                if not f.is_file():
+                    continue
+                try:
+                    age = now - f.stat().st_mtime
+                    if age > max_age_seconds:
+                        f.unlink(missing_ok=True)
+                        print(f"🧹 Deleted old temp file: {f.name}")
+                except Exception as e:
+                    print(f"⚠️ Erreur lors de la suppression de {f.name} : {e}")
+        except Exception as e:
+            print(f"⚠️ Cleanup scan error: {e}")
+
+        time.sleep(interval)
 
 cleanup_thread = Thread(target=cleanup_old_files, daemon=True)
 cleanup_thread.start()
 
 
-# -----------------------------
-# HELPERS
-# -----------------------------
-@@ -76,7 +109,6 @@ def load_engine(config_path: str):
-    print(f"📄 Loading search engine: {config_path}")
-    ENGINE = FrenchMicrographSearchEngine(config_path=config_path)
-
-
-# -----------------------------
-# AUTO-LOAD ENGINE (works under Gunicorn)
-# -----------------------------
-@@ -89,7 +121,6 @@ def load_engine(config_path: str):
-        print(f"⚠️ Engine auto-load failed on import: {e}")
-        print("   Use /update_index endpoint to build a new index")
-
-
-# -----------------------------
+# --------------------------------------------------------------------------------------
 # ROOT / HEALTH
-# -----------------------------
-@@ -105,10 +136,8 @@ def root():
-        }
-    ), 200
-
+# --------------------------------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"service": "micrograph-search-api", "status": "ok"}), 200
 
 @app.route("/health", methods=["GET"])
 def health():
-
-    return jsonify(
-        {
-            "status": "ok",
-@@ -117,7 +146,6 @@ def health():
-        }
-    ), 200
+    return jsonify({"status": "ok"}), 200
 
 
-# -----------------------------
+# --------------------------------------------------------------------------------------
 # IMAGE SERVING
-# -----------------------------
-@@ -126,78 +154,156 @@ def serve_image(filename):
+# --------------------------------------------------------------------------------------
+@app.route("/images/<path:filename>", methods=["GET"])
+def serve_image(filename):
     """Serve images from the embeddings/images directory"""
     try:
         return send_from_directory(str(IMAGES_DIR), filename)
@@ -122,7 +149,7 @@ def health():
         return jsonify({"error": "not_found"}), 404
 
 @app.route("/temp_files/<path:filename>", methods=["GET"])
-def serve_temp_image(filename):
+def serve_temp_file(filename):
     """Sert les fichiers temporaires stockés localement"""
     try:
         return send_from_directory(str(TEMP_UPLOAD_DIR), filename)
@@ -130,13 +157,13 @@ def serve_temp_image(filename):
         return jsonify({"error": "temp_file_not_found"}), 404
 
 
-# -----------------------------
-# LOCAL TEMPORARY STORAGE (UPDATED)
-# -----------------------------
+# --------------------------------------------------------------------------------------
+# LOCAL TEMPORARY STORAGE
+# --------------------------------------------------------------------------------------
 @app.route("/upload_temp_image", methods=["POST"])
 def upload_temp_image():
     """
-    Logique type "premier code" MAIS stockage temporaire local:
+    Stockage temporaire local:
     - Reçoit openaiFileIdRefs: [ {id, download_link?, name?, mime_type?}, ... ] ou ["file-..."]
     - (Compat) accepte aussi {"file_id": "..."} (ancien format)
     - Télécharge bytes: download_link -> fallback OpenAI file_id
@@ -146,8 +173,6 @@ def upload_temp_image():
     """
     data = request.get_json(silent=True) or {}
 
-
-
     refs = data.get("openaiFileIdRefs")
 
     # Backward-compat: ancien payload {"file_id": "..."}
@@ -155,13 +180,11 @@ def upload_temp_image():
         refs = [{"id": data["file_id"], "name": None, "download_link": None, "mime_type": None}]
 
     if not refs or not isinstance(refs, list):
-        return jsonify(
-            {
-                "success": False,
-                "error": "missing_openaiFileIdRefs",
-                "message": "Provide openaiFileIdRefs (list) or legacy file_id",
-            }
-        ), 400
+        return jsonify({
+            "success": False,
+            "error": "missing_openaiFileIdRefs",
+            "message": "Provide openaiFileIdRefs (list) or legacy file_id",
+        }), 400
 
     uploaded_results = []
     errors = []
@@ -203,9 +226,6 @@ def upload_temp_image():
                         file_info = client.files.retrieve(file_id)
                         if getattr(file_info, "filename", None):
                             original_name = file_info.filename
-                        if not mime_type and getattr(file_info, "purpose", None):
-                            # purpose isn't mime; keep mime_type as-is
-                            pass
                     except Exception:
                         pass
 
@@ -213,6 +233,8 @@ def upload_temp_image():
 
             # Filename sanitization + extension handling
             filename_safe = secure_filename(original_name or "uploaded_file")
+            if not filename_safe:
+                filename_safe = "uploaded_file"
 
             if "." not in filename_safe:
                 ext = guess_extension_from_mime(mime_type) or ".bin"
@@ -231,14 +253,12 @@ def upload_temp_image():
 
             file_url = f"{request.host_url.rstrip('/')}/temp_files/{unique_filename}"
 
-            uploaded_results.append(
-                {
-                    "original_name": original_name,
-                    "filename": unique_filename,
-                    "url": file_url,
-                    "expires_in": "2 hours",
-                }
-            )
+            uploaded_results.append({
+                "original_name": original_name,
+                "filename": unique_filename,
+                "url": file_url,
+                "expires_in": "2 hours",
+            })
 
         except Exception as e:
             print(f"❌ Error processing {file_ref}: {e}")
@@ -247,21 +267,17 @@ def upload_temp_image():
     if not uploaded_results and errors:
         return jsonify({"success": False, "message": "All uploads failed", "errors": errors}), 500
 
-    return jsonify(
-        {
-            "success": True,
-            "message": f"Processed {len(uploaded_results)} files.",
-            "files": uploaded_results,
-            "errors": errors,
-        }
-    ), 200
+    return jsonify({
+        "success": True,
+        "message": f"Processed {len(uploaded_results)} files.",
+        "files": uploaded_results,
+        "errors": errors,
+    }), 200
 
-# -----------------------------
+
+# --------------------------------------------------------------------------------------
 # SEARCH
-# -----------------------------
-
-
-
+# --------------------------------------------------------------------------------------
 @app.route("/search", methods=["POST"])
 def search():
     """
@@ -277,63 +293,72 @@ def search():
     if not data:
         return jsonify({"error": "missing_json_body"}), 400
 
-@@ -222,39 +328,34 @@ def search():
+    top_k = int(data.get("top_k", 5))
+    temp_filename = data.get("temp_filename")
+    file_id = data.get("file_id")
+
+    img = None
+
+    # 1) temp_filename branch
+    if temp_filename:
+        file_path = TEMP_UPLOAD_DIR / temp_filename
+        if not file_path.exists():
+            return jsonify({"error": "temp_file_not_found", "message": f"{temp_filename} not found"}), 404
         try:
-            # Vérifier d'abord que le fichier existe
+            img = Image.open(file_path).convert("RGB")
+        except Exception as e:
+            return jsonify({"error": "invalid_image", "message": str(e)}), 400
+
+    # 2) OpenAI file_id branch
+    elif file_id:
+        try:
             file_info = client.files.retrieve(file_id)
 
-            # Vérifier le purpose (doit être "assistants" ou "vision")
+            # Vérifier le purpose (selon ton usage)
             if getattr(file_info, "purpose", None) not in ["assistants", "vision", "assistants_output"]:
-                return jsonify(
-                    {
-                        "error": "invalid_file_purpose",
-                        "message": f"File purpose is '{getattr(file_info, 'purpose', None)}'. Must be 'assistants' or 'vision'. Please re-upload the file with correct purpose.",
-                    }
-                ), 400
+                return jsonify({
+                    "error": "invalid_file_purpose",
+                    "message": (
+                        f"File purpose is '{getattr(file_info, 'purpose', None)}'. "
+                        "Must be 'assistants' or 'vision' (or 'assistants_output')."
+                    ),
+                }), 400
 
-            # Télécharger le contenu du fichier depuis OpenAI
             file_content = client.files.content(file_id).read()
             img = Image.open(io.BytesIO(file_content)).convert("RGB")
 
         except Exception as e:
             error_msg = str(e)
-
-
             if "No such File object" in error_msg or "Could not find" in error_msg:
-                return jsonify(
-                    {
-                        "error": "file_not_accessible",
-                        "message": "The file_id cannot be accessed. This usually means: (1) The file is a conversation attachment, not uploaded via Files API, or (2) The file has expired. Please upload the image using OpenAI's Files API with purpose='assistants'.",
-                        "hint": "In GPT, use the file upload function with purpose='assistants' before calling this API.",
-                    }
-                ), 400
+                return jsonify({
+                    "error": "file_not_accessible",
+                    "message": (
+                        "The file_id cannot be accessed. This usually means: "
+                        "(1) The file is a conversation attachment, not uploaded via Files API, or "
+                        "(2) The file has expired. Please upload using Files API with purpose='assistants'."
+                    ),
+                }), 400
             return jsonify({"error": "openai_retrieval_failed", "message": error_msg}), 400
-
-
 
     else:
         return jsonify({"error": "missing_input", "message": "Provide either file_id or temp_filename"}), 400
 
-
-
-
+    # Run search
     try:
         results = ENGINE.search_from_pil(img, top_k=top_k)
-@@ -296,7 +397,9 @@ def update_index():
-        save_embeddings(embeddings, valid_metadata, str(OUTPUT_BASE_DIR), MODEL_NAME)
-
-        embeddings_path = str(OUTPUT_BASE_DIR / f"embeddings_{MODEL_NAME}.npy")
-        build_faiss_index(
-            embeddings_path=embeddings_path, output_dir=str(OUTPUT_BASE_DIR), model_name=MODEL_NAME
-        )
-
-        config_path = str(OUTPUT_BASE_DIR / f"search_config_{MODEL_NAME}.json")
-        load_engine(config_path)
-@@ -308,7 +411,6 @@ def update_index():
+        return jsonify({"success": True, "results": results}), 200
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"success": False, "error": "search_failed", "message": str(e)}), 500
 
 
+# --------------------------------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    app.run(host=args.host, port=args.port, debug=args.debug)
