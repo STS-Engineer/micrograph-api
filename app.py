@@ -359,7 +359,7 @@ def get_material_details(matiere_id):
             
             # 2) Get fiches_matieres
             cur.execute("""
-                SELECT fiche_id, date_creation_fiche, dernier_modification
+                SELECT fiche_id, date_creation_fiche, derniere_modification
                 FROM public.fiches_matieres
                 WHERE matiere_id = %s
                 ORDER BY fiche_id DESC
@@ -370,7 +370,7 @@ def get_material_details(matiere_id):
             specifications = []
             for fiche in fiches:
                 cur.execute("""
-                    SELECT spec_id, fiche_id, source_type, donnees, date_creation, dernier_modification
+                    SELECT spec_id, fiche_id, source_type, donnees, date_creation, derniere_modification
                     FROM public.specifications
                     WHERE fiche_id = %s
                     ORDER BY spec_id
