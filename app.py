@@ -184,7 +184,6 @@ def build_image_url(image_path: str) -> str:
     image_path stored in DB is like: embeddings_v7/images/xxx.png
     We want to expose it through /images/<filename>.
     """
-    # keep only filename
     filename = Path(image_path).name
     return f"{request.host_url.rstrip('/')}/images/{secure_filename(filename)}"
 
@@ -238,22 +237,18 @@ def serve_temp_file(filename):
 def upload_temp_image():
     """
     Receives:
-      - openaiFileIdRefs: [ {id, download_link?, name?, mime_type?}, ... ] or ["file-..."]
-      - (compat) {"file_id": "..."}
+      - openaiFileIdRefs: [ {id, download_link?, name?, mime_type?}, ... ]
     Saves into temp_uploads/ and returns local URLs /temp_files/<filename>
     """
     data = request.get_json(silent=True) or {}
-
     refs = data.get("openaiFileIdRefs")
-    if not refs and data.get("file_id"):
-        refs = [{"id": data["file_id"], "name": None, "download_link": None, "mime_type": None}]
 
     if not refs or not isinstance(refs, list):
         return jsonify(
             {
                 "success": False,
                 "error": "missing_openaiFileIdRefs",
-                "message": "Provide openaiFileIdRefs (list) or legacy file_id",
+                "message": "Provide openaiFileIdRefs (list).",
             }
         ), 400
 
@@ -262,33 +257,31 @@ def upload_temp_image():
 
     for file_ref in refs:
         try:
-            if isinstance(file_ref, dict):
-                file_id = file_ref.get("id")
-                download_link = file_ref.get("download_link")
-                original_name = file_ref.get("name") or "uploaded_file"
-                mime_type = file_ref.get("mime_type")
-            else:
-                file_id = str(file_ref)
-                download_link = None
-                original_name = "uploaded_file"
-                mime_type = None
+            if not isinstance(file_ref, dict):
+                errors.append("Each item in openaiFileIdRefs must be an object.")
+                continue
+
+            file_id = file_ref.get("id")
+            download_link = file_ref.get("download_link")
+            original_name = file_ref.get("name") or "uploaded_file"
+            mime_type = file_ref.get("mime_type")
 
             if not file_id:
-                errors.append("Missing file_id in file reference")
+                errors.append("Missing id in file reference.")
                 continue
 
             file_bytes = None
 
-            # 1) try direct link
+            # 1) Try direct link if provided
             if download_link:
                 try:
-                    r = requests.get(download_link, timeout=15)
+                    r = requests.get(download_link, timeout=20)
                     r.raise_for_status()
                     file_bytes = r.content
                 except Exception as e:
-                    print(f"⚠️ download_link failed, falling back to file_id: {e}")
+                    print(f"⚠️ download_link failed, fallback to file_id: {e}")
 
-            # 2) fallback OpenAI file content
+            # 2) Fallback: OpenAI file content
             if file_bytes is None:
                 file_bytes = client.files.content(file_id).read()
 
@@ -299,7 +292,7 @@ def upload_temp_image():
                 filename_safe += ext
 
             if not allowed_file(filename_safe):
-                errors.append(f"{original_name}: File type not allowed")
+                errors.append(f"{original_name}: File type not allowed (png/jpg/jpeg only).")
                 continue
 
             unique_filename = f"{uuid.uuid4().hex}_{int(time.time())}_{filename_safe}"
@@ -319,7 +312,7 @@ def upload_temp_image():
             )
 
         except Exception as e:
-            print(f"❌ Error processing {file_ref}: {e}")
+            print(f"❌ Error processing file_ref: {e}")
             errors.append(f"{file_ref}: {str(e)}")
 
     if not uploaded_results and errors:
@@ -344,51 +337,57 @@ def get_material_details(matiere_id):
     Get complete material information by matiere_id.
     Returns: matieres + fiches_matieres + specifications + expert_notes
     """
+    conn = None
     try:
         conn = get_db_conn()
-        
+
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # 1) Get material base info
             cur.execute("SELECT * FROM public.matieres WHERE matiere_id = %s", (matiere_id,))
             material = cur.fetchone()
-            
+
             if not material:
-                return jsonify({"error": "material_not_found", "message": f"matiere_id {matiere_id} not found"}), 404
-            
+                return jsonify(
+                    {"success": False, "error": "material_not_found", "message": f"matiere_id {matiere_id} not found"}
+                ), 404
+
             material = dict(material)
-            
-            # 2) Get fiches_matieres
-            cur.execute("""
+
+            cur.execute(
+                """
                 SELECT fiche_id, date_creation_fiche, derniere_modification
                 FROM public.fiches_matieres
                 WHERE matiere_id = %s
                 ORDER BY fiche_id DESC
-            """, (matiere_id,))
+                """,
+                (matiere_id,),
+            )
             fiches = [dict(row) for row in cur.fetchall()]
-            
-            # 3) Get specifications (via fiches_matieres)
+
             specifications = []
             for fiche in fiches:
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT spec_id, fiche_id, source_type, donnees, date_creation, derniere_modification
                     FROM public.specifications
                     WHERE fiche_id = %s
                     ORDER BY spec_id
-                """, (fiche["fiche_id"],))
-                fiche_specs = [dict(row) for row in cur.fetchall()]
-                specifications.extend(fiche_specs)
-            
-            # 4) Get expert notes (from matiere_images linked to this matiere)
-            cur.execute("""
+                    """,
+                    (fiche["fiche_id"],),
+                )
+                specifications.extend([dict(row) for row in cur.fetchall()])
+
+            cur.execute(
+                """
                 SELECT men.id, men.matiere_image_id, men.note_json, men.created_at
                 FROM public.matiere_expert_notes men
                 INNER JOIN public.matiere_images mi ON mi.id = men.matiere_image_id
                 WHERE mi.matiere_id = %s
                 ORDER BY men.created_at DESC
-            """, (matiere_id,))
+                """,
+                (matiere_id,),
+            )
             expert_notes = [dict(row) for row in cur.fetchall()]
-            
-            # 5) Build response
+
             response = {
                 "success": True,
                 "material": material,
@@ -402,77 +401,92 @@ def get_material_details(matiere_id):
                     "type_matiere": material.get("type_matiere"),
                     "num_fiches": len(fiches),
                     "num_specifications": len(specifications),
-                    "num_expert_notes": len(expert_notes)
-                }
+                    "num_expert_notes": len(expert_notes),
+                },
             }
-            
+
             return jsonify(response), 200
-        
+
     except Exception as e:
         return jsonify({"success": False, "error": "retrieval_failed", "message": str(e)}), 500
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
-
+# -----------------------------------------------------------------------------
+# SEARCH (FIXED)
+# -----------------------------------------------------------------------------
 @app.route("/search", methods=["POST"])
 def search():
     """
     Search similar micrographs (pgvector).
-    Accepts (in priority order):
-      - download_link (persistent URL to image)
-      - temp_filename (from /upload_temp_image)
-      - file_id (OpenAI Files API)
+    Accepts ONE of:
+      - download_link (recommended: robust for autoscaling)
+      - temp_filename (fallback: local file)
+      - file_id (fallback: OpenAI Files API)
     """
     data = request.get_json(silent=True) or {}
     if not data:
-        return jsonify({"error": "missing_json_body"}), 400
+        return jsonify({"success": False, "error": "missing_json_body", "message": "Missing JSON body"}), 400
 
     top_k = int(data.get("top_k", 5))
+    if top_k < 1 or top_k > 50:
+        return jsonify({"success": False, "error": "invalid_top_k", "message": "top_k must be 1..50"}), 400
+
     temp_filename = data.get("temp_filename")
     file_id = data.get("file_id")
     download_link = data.get("download_link")
 
+    provided = [bool(download_link), bool(temp_filename), bool(file_id)]
+    if sum(provided) != 1:
+        return jsonify(
+            {
+                "success": False,
+                "error": "invalid_input",
+                "message": "Provide exactly ONE of: download_link, temp_filename, file_id",
+            }
+        ), 400
+
     img = None
 
-    # Priority 1: download_link (persistent, works with auto-scaling)
+    # 1) download_link (BEST)
     if download_link:
         try:
-            r = requests.get(download_link, timeout=15)
+            r = requests.get(download_link, timeout=20)
             r.raise_for_status()
             img = Image.open(io.BytesIO(r.content)).convert("RGB")
         except Exception as e:
-            return jsonify({"error": "download_link_failed", "message": str(e)}), 400
+            return jsonify({"success": False, "error": "download_link_failed", "message": str(e)}), 400
 
-    # Priority 2: temp_filename (local cache)
+    # 2) temp_filename (fallback)
     elif temp_filename:
         file_path = TEMP_UPLOAD_DIR / temp_filename
         if not file_path.exists():
-            return jsonify({"error": "temp_file_not_found", "message": f"{temp_filename} not found"}), 404
+            return jsonify(
+                {
+                    "success": False,
+                    "error": "temp_file_not_found",
+                    "message": f"{temp_filename} not found (likely autoscaling issue). Use download_link instead.",
+                }
+            ), 404
         try:
             img = Image.open(file_path).convert("RGB")
         except Exception as e:
-            return jsonify({"error": "invalid_image", "message": str(e)}), 400
+            return jsonify({"success": False, "error": "invalid_image", "message": str(e)}), 400
 
-    # Priority 3: file_id (OpenAI Files API)
+    # 3) file_id (fallback)
     elif file_id:
         try:
             file_content = client.files.content(file_id).read()
             img = Image.open(io.BytesIO(file_content)).convert("RGB")
         except Exception as e:
-            return jsonify({"error": "openai_retrieval_failed", "message": str(e)}), 400
-
-    else:
-        return jsonify({"error": "missing_input", "message": "Provide download_link, file_id, or temp_filename"}), 400
+            return jsonify({"success": False, "error": "openai_retrieval_failed", "message": str(e)}), 400
 
     try:
-        # 1) embedding
         query_embedding = compute_embedding_from_pil(img)
-
-        # 2) pgvector search
         rows = search_similar_in_db(query_embedding, top_k=top_k)
 
-        # 3) build API response
         results = []
         for r in rows:
             results.append(
@@ -480,8 +494,8 @@ def search():
                     "id": r["id"],
                     "image_url": build_image_url(r["image_path"]),
                     "matiere_id": r["matiere_id"],
-                    "material_name": r["nom_matiere"],  # Use nom_matiere from matieres table
-                    "reference": r["reference"],  # Use reference from matieres table
+                    "material_name": r["nom_matiere"],
+                    "reference": r["reference"],
                     "similarity": float(r["similarity"]) if r["similarity"] is not None else None,
                 }
             )
