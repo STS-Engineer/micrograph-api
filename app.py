@@ -23,7 +23,7 @@ from psycopg2.extras import RealDictCursor
 from pgvector.psycopg2 import register_vector
 from pgvector import Vector
 
-from db_config import DB_DSN
+DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Micrographie_IA"
 
 
 # -----------------------------------------------------------------------------
