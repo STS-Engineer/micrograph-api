@@ -336,8 +336,85 @@ def upload_temp_image():
 
 
 # -----------------------------------------------------------------------------
-# SEARCH
+# MATERIAL DETAILS
 # -----------------------------------------------------------------------------
+@app.route("/material_details/<int:matiere_id>", methods=["GET"])
+def get_material_details(matiere_id):
+    """
+    Get complete material information by matiere_id.
+    Returns: matieres + fiches_matieres + specifications + expert_notes
+    """
+    try:
+        conn = get_db_conn()
+        
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # 1) Get material base info
+            cur.execute("SELECT * FROM public.matieres WHERE matiere_id = %s", (matiere_id,))
+            material = cur.fetchone()
+            
+            if not material:
+                return jsonify({"error": "material_not_found", "message": f"matiere_id {matiere_id} not found"}), 404
+            
+            material = dict(material)
+            
+            # 2) Get fiches_matieres
+            cur.execute("""
+                SELECT fiche_id, date_creation_fiche, dernier_modification
+                FROM public.fiches_matieres
+                WHERE matiere_id = %s
+                ORDER BY fiche_id DESC
+            """, (matiere_id,))
+            fiches = [dict(row) for row in cur.fetchall()]
+            
+            # 3) Get specifications (via fiches_matieres)
+            specifications = []
+            for fiche in fiches:
+                cur.execute("""
+                    SELECT spec_id, fiche_id, source_type, donnees, date_creation, dernier_modification
+                    FROM public.specifications
+                    WHERE fiche_id = %s
+                    ORDER BY spec_id
+                """, (fiche["fiche_id"],))
+                fiche_specs = [dict(row) for row in cur.fetchall()]
+                specifications.extend(fiche_specs)
+            
+            # 4) Get expert notes (from matiere_images linked to this matiere)
+            cur.execute("""
+                SELECT men.id, men.matiere_image_id, men.note_json, men.created_at
+                FROM public.matiere_expert_notes men
+                INNER JOIN public.matiere_images mi ON mi.id = men.matiere_image_id
+                WHERE mi.matiere_id = %s
+                ORDER BY men.created_at DESC
+            """, (matiere_id,))
+            expert_notes = [dict(row) for row in cur.fetchall()]
+            
+            # 5) Build response
+            response = {
+                "success": True,
+                "material": material,
+                "fiches_matieres": fiches,
+                "specifications": specifications,
+                "expert_notes": expert_notes,
+                "summary": {
+                    "matiere_id": matiere_id,
+                    "nom_matiere": material.get("nom_matiere"),
+                    "reference": material.get("reference"),
+                    "type_matiere": material.get("type_matiere"),
+                    "num_fiches": len(fiches),
+                    "num_specifications": len(specifications),
+                    "num_expert_notes": len(expert_notes)
+                }
+            }
+            
+            return jsonify(response), 200
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": "retrieval_failed", "message": str(e)}), 500
+    finally:
+        conn.close()
+
+
+
 @app.route("/search", methods=["POST"])
 def search():
     """
