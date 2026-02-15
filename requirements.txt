@@ -5,7 +5,6 @@ torchvision
 transformers
 pillow
 numpy
-faiss-cpu
 flask
 flask_cors
 python-pptx
@@ -15,3 +14,7 @@ requests
 werkzeug
 gunicorn
 openai 
+python-dotenv
+pgvector
+
+psycopg2-binary

@@ -7,16 +7,24 @@ import time
 import uuid
 from pathlib import Path
 from threading import Thread
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
+import numpy as np
 import requests
+import torch
 from flask import Flask, jsonify, request, send_from_directory
 from openai import OpenAI
 from PIL import Image
+from transformers import AutoModel, AutoImageProcessor
 from werkzeug.utils import secure_filename
 
-# ✅ Your engine (as provided)
-from search_similar_french_v2 import FrenchMicrographSearchEngine  # :contentReference[oaicite:3]{index=3}
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from pgvector.psycopg2 import register_vector
+from pgvector import Vector
+
+from db_config import DB_DSN
+
 
 # -----------------------------------------------------------------------------
 # APP
@@ -24,74 +32,67 @@ from search_similar_french_v2 import FrenchMicrographSearchEngine  # :contentRef
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB
 
+
 # -----------------------------------------------------------------------------
-# PATHS (robust on Azure/Gunicorn)
+# PATHS
 # -----------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 
-# ✅ Matches your repo folder name
 OUTPUT_BASE_DIR = BASE_DIR / "embeddings_v7"
 IMAGES_DIR = OUTPUT_BASE_DIR / "images"
-MODEL_NAME = "dinov2"
+TEMP_UPLOAD_DIR = BASE_DIR / "temp_uploads"
 
 OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-
-TEMP_UPLOAD_DIR = BASE_DIR / "temp_uploads"
 TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+
 # -----------------------------------------------------------------------------
-# OPENAI CLIENT (OPENAI_API_KEY via env)
+# OPENAI CLIENT
 # -----------------------------------------------------------------------------
 client = OpenAI()
 
+
 # -----------------------------------------------------------------------------
-# ENGINE (lazy load per worker)
+# DINOv2 (lazy load)
 # -----------------------------------------------------------------------------
-ENGINE: Optional[FrenchMicrographSearchEngine] = None
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DINO_MODEL_NAME = "facebook/dinov2-large"
+
+DINO_MODEL: Optional[AutoModel] = None
+DINO_PROCESSOR: Optional[AutoImageProcessor] = None
 
 
-def load_engine(config_path: str) -> FrenchMicrographSearchEngine:
-    """Instantiate the search engine from config path."""
-    global ENGINE
-    print(f"📄 Loading search engine: {config_path}")
-    ENGINE = FrenchMicrographSearchEngine(config_path=config_path)
-    return ENGINE
-
-
-def ensure_engine_loaded() -> None:
-    """Lazy-load engine (each Gunicorn worker loads it when needed)."""
-    global ENGINE
-    if ENGINE is not None:
+def ensure_dino_loaded():
+    global DINO_MODEL, DINO_PROCESSOR
+    if DINO_MODEL is not None and DINO_PROCESSOR is not None:
         return
 
-    config_path = OUTPUT_BASE_DIR / f"search_config_{MODEL_NAME}.json"
-    if not config_path.exists():
-        raise FileNotFoundError(
-            f"Missing engine config: {config_path}. "
-            "Make sure embeddings_v7/ is deployed with search_config_dinov2.json."
-        )
-
-    load_engine(str(config_path))
-    print("✅ ENGINE loaded")
+    print(f"🔧 Loading DINOv2 on {DEVICE}...")
+    DINO_MODEL = AutoModel.from_pretrained(DINO_MODEL_NAME).to(DEVICE).eval()
+    DINO_PROCESSOR = AutoImageProcessor.from_pretrained(DINO_MODEL_NAME)
+    print("✅ DINOv2 loaded")
 
 
-# Optional autoload (won't crash app if it fails)
-try:
-    print("CWD:", Path().resolve())
-    print("BASE_DIR:", BASE_DIR)
-    print("OUTPUT_BASE_DIR:", OUTPUT_BASE_DIR)
-    print("CONFIG:", OUTPUT_BASE_DIR / f"search_config_{MODEL_NAME}.json")
-    print("CONFIG EXISTS:", (OUTPUT_BASE_DIR / f"search_config_{MODEL_NAME}.json").exists())
-    ensure_engine_loaded()
-except Exception as e:
-    print(f"⚠️ Engine auto-load failed on import: {e}")
-    ENGINE = None
+def compute_embedding_from_pil(image: Image.Image) -> np.ndarray:
+    """Compute DINOv2 embedding (1024 dims)."""
+    ensure_dino_loaded()
+
+    image = image.convert("RGB")
+    inputs = DINO_PROCESSOR(images=image, return_tensors="pt")
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = DINO_MODEL(**inputs)
+        embedding = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
+
+    return embedding.astype("float32")
+
 
 # -----------------------------------------------------------------------------
 # TEMP UPLOAD VALIDATION
 # -----------------------------------------------------------------------------
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "pdf", "txt", "csv", "xlsx", "docx", "pptx", "md", "json"}
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
 
 
 def allowed_file(filename: str) -> bool:
@@ -106,22 +107,6 @@ def guess_extension_from_mime(mime_type: Optional[str]) -> Optional[str]:
         return ".png"
     if "jpeg" in mt or "jpg" in mt:
         return ".jpg"
-    if "pdf" in mt:
-        return ".pdf"
-    if "json" in mt:
-        return ".json"
-    if "csv" in mt:
-        return ".csv"
-    if "text" in mt or "plain" in mt:
-        return ".txt"
-    if "word" in mt or "docx" in mt:
-        return ".docx"
-    if "presentation" in mt or "pptx" in mt:
-        return ".pptx"
-    if "spreadsheet" in mt or "xlsx" in mt:
-        return ".xlsx"
-    if "markdown" in mt:
-        return ".md"
     return None
 
 
@@ -152,6 +137,58 @@ def cleanup_old_files(interval: int = 1800, max_age_seconds: int = 2 * 3600):
 cleanup_thread = Thread(target=cleanup_old_files, daemon=True)
 cleanup_thread.start()
 
+
+# -----------------------------------------------------------------------------
+# DB HELPERS
+# -----------------------------------------------------------------------------
+def get_db_conn():
+    conn = psycopg2.connect(DB_DSN)
+    register_vector(conn)
+    return conn
+
+
+def search_similar_in_db(query_embedding: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
+    """
+    Returns top_k similar images from pgvector.
+    Uses cosine distance (<=>).
+    similarity = 1 - distance
+    """
+    query_vec = Vector(query_embedding.tolist())
+
+    sql = """
+        SELECT
+            mi.id,
+            mi.image_path,
+            mi.matiere_id,
+            m.nom_matiere,
+            m.reference,
+            (1 - (mi.embedding <=> %s)) AS similarity
+        FROM public.matiere_images mi
+        JOIN public.matieres m ON m.matiere_id = mi.matiere_id
+        ORDER BY mi.embedding <=> %s
+        LIMIT %s;
+    """
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (query_vec, query_vec, top_k))
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def build_image_url(image_path: str) -> str:
+    """
+    image_path stored in DB is like: embeddings_v7/images/xxx.png
+    We want to expose it through /images/<filename>.
+    """
+    # keep only filename
+    filename = Path(image_path).name
+    return f"{request.host_url.rstrip('/')}/images/{secure_filename(filename)}"
+
+
 # -----------------------------------------------------------------------------
 # ROOT / HEALTH
 # -----------------------------------------------------------------------------
@@ -161,16 +198,16 @@ def root():
         {
             "service": "micrograph-search-api",
             "status": "ok",
-            "model": MODEL_NAME,
-            "engine_loaded": ENGINE is not None,
-            "output_dir": str(OUTPUT_BASE_DIR),
+            "model": DINO_MODEL_NAME,
+            "dino_loaded": DINO_MODEL is not None,
+            "images_dir": str(IMAGES_DIR),
         }
     ), 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "engine_loaded": ENGINE is not None}), 200
+    return jsonify({"status": "ok", "dino_loaded": DINO_MODEL is not None}), 200
 
 
 # -----------------------------------------------------------------------------
@@ -253,21 +290,12 @@ def upload_temp_image():
 
             # 2) fallback OpenAI file content
             if file_bytes is None:
-                # try retrieve filename if missing
-                if not original_name or original_name == "uploaded_file":
-                    try:
-                        file_info = client.files.retrieve(file_id)
-                        if getattr(file_info, "filename", None):
-                            original_name = file_info.filename
-                    except Exception:
-                        pass
-
                 file_bytes = client.files.content(file_id).read()
 
             filename_safe = secure_filename(original_name or "uploaded_file") or "uploaded_file"
 
             if "." not in filename_safe:
-                ext = guess_extension_from_mime(mime_type) or ".bin"
+                ext = guess_extension_from_mime(mime_type) or ".png"
                 filename_safe += ext
 
             if not allowed_file(filename_safe):
@@ -279,7 +307,7 @@ def upload_temp_image():
             with open(file_path, "wb") as f:
                 f.write(file_bytes)
 
-            file_url = f"{request.host_url.rstrip('/')}/temp_files/{unique_filename}"
+            file_url = f"{request.host_url.rstrip('/')}/temp_files/{secure_filename(unique_filename)}"
 
             uploaded_results.append(
                 {
@@ -313,16 +341,11 @@ def upload_temp_image():
 @app.route("/search", methods=["POST"])
 def search():
     """
-    Search similar micrographs.
-    Accepts either:
-      - temp_filename (from /upload_temp_image)
+    Search similar micrographs (pgvector).
+    Accepts:
+      - temp_filename
       - file_id (OpenAI Files API)
     """
-    try:
-        ensure_engine_loaded()
-    except Exception as e:
-        return jsonify({"error": "engine_not_loaded", "message": str(e)}), 500
-
     data = request.get_json(silent=True) or {}
     if not data:
         return jsonify({"error": "missing_json_body"}), 400
@@ -344,59 +367,39 @@ def search():
 
     elif file_id:
         try:
-            file_info = client.files.retrieve(file_id)
-            if getattr(file_info, "purpose", None) not in ["assistants", "vision", "assistants_output"]:
-                return jsonify(
-                    {
-                        "error": "invalid_file_purpose",
-                        "message": (
-                            f"File purpose is '{getattr(file_info, 'purpose', None)}'. "
-                            "Must be 'assistants' or 'vision' (or 'assistants_output')."
-                        ),
-                    }
-                ), 400
-
             file_content = client.files.content(file_id).read()
             img = Image.open(io.BytesIO(file_content)).convert("RGB")
-
         except Exception as e:
-            error_msg = str(e)
-            if "No such File object" in error_msg or "Could not find" in error_msg:
-                return jsonify(
-                    {
-                        "error": "file_not_accessible",
-                        "message": (
-                            "The file_id cannot be accessed. This usually means: "
-                            "(1) the file is a conversation attachment (not Files API), or "
-                            "(2) it expired. Upload via Files API with purpose='assistants'."
-                        ),
-                    }
-                ), 400
-            return jsonify({"error": "openai_retrieval_failed", "message": error_msg}), 400
+            return jsonify({"error": "openai_retrieval_failed", "message": str(e)}), 400
 
     else:
         return jsonify({"error": "missing_input", "message": "Provide either file_id or temp_filename"}), 400
 
     try:
-        results = ENGINE.search_from_pil(img, top_k=top_k)  # :contentReference[oaicite:4]{index=4}
+        # 1) embedding
+        query_embedding = compute_embedding_from_pil(img)
+
+        # 2) pgvector search
+        rows = search_similar_in_db(query_embedding, top_k=top_k)
+
+        # 3) build API response
+        results = []
+        for r in rows:
+            results.append(
+                {
+                    "id": r["id"],
+                    "image_url": build_image_url(r["image_path"]),
+                    "matiere_id": r["matiere_id"],
+                    "material_name": r["nom_matiere"],  # Use nom_matiere from matieres table
+                    "reference": r["reference"],  # Use reference from matieres table
+                    "similarity": float(r["similarity"]) if r["similarity"] is not None else None,
+                }
+            )
+
         return jsonify({"success": True, "results": results}), 200
+
     except Exception as e:
         return jsonify({"success": False, "error": "search_failed", "message": str(e)}), 500
-
-
-# -----------------------------------------------------------------------------
-# OPTIONAL: reload engine endpoint
-# -----------------------------------------------------------------------------
-@app.route("/reload_engine", methods=["POST"])
-def reload_engine():
-    global ENGINE
-    try:
-        ENGINE = None
-        ensure_engine_loaded()
-        return jsonify({"success": True, "engine_loaded": True}), 200
-    except Exception as e:
-        ENGINE = None
-        return jsonify({"success": False, "error": "engine_reload_failed", "message": str(e)}), 500
 
 
 # -----------------------------------------------------------------------------

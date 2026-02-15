@@ -1,6 +1,35 @@
+# Virtual Environment
+.venv/
 venv/
+env/
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Environment
 .env
-__pycache__/
-*.pyc
+.env.local
+
+# Temporary files
+temp_uploads/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.db
+*.sqlite
+
+# Logs
+*.log
