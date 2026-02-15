@@ -342,8 +342,9 @@ def upload_temp_image():
 def search():
     """
     Search similar micrographs (pgvector).
-    Accepts:
-      - temp_filename
+    Accepts (in priority order):
+      - download_link (persistent URL to image)
+      - temp_filename (from /upload_temp_image)
       - file_id (OpenAI Files API)
     """
     data = request.get_json(silent=True) or {}
@@ -353,10 +354,21 @@ def search():
     top_k = int(data.get("top_k", 5))
     temp_filename = data.get("temp_filename")
     file_id = data.get("file_id")
+    download_link = data.get("download_link")
 
     img = None
 
-    if temp_filename:
+    # Priority 1: download_link (persistent, works with auto-scaling)
+    if download_link:
+        try:
+            r = requests.get(download_link, timeout=15)
+            r.raise_for_status()
+            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        except Exception as e:
+            return jsonify({"error": "download_link_failed", "message": str(e)}), 400
+
+    # Priority 2: temp_filename (local cache)
+    elif temp_filename:
         file_path = TEMP_UPLOAD_DIR / temp_filename
         if not file_path.exists():
             return jsonify({"error": "temp_file_not_found", "message": f"{temp_filename} not found"}), 404
@@ -365,6 +377,7 @@ def search():
         except Exception as e:
             return jsonify({"error": "invalid_image", "message": str(e)}), 400
 
+    # Priority 3: file_id (OpenAI Files API)
     elif file_id:
         try:
             file_content = client.files.content(file_id).read()
@@ -373,7 +386,7 @@ def search():
             return jsonify({"error": "openai_retrieval_failed", "message": str(e)}), 400
 
     else:
-        return jsonify({"error": "missing_input", "message": "Provide either file_id or temp_filename"}), 400
+        return jsonify({"error": "missing_input", "message": "Provide download_link, file_id, or temp_filename"}), 400
 
     try:
         # 1) embedding
