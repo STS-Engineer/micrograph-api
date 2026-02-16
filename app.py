@@ -234,17 +234,20 @@ def serve_temp_file(filename):
 
 
 # -----------------------------------------------------------------------------
-# LOCAL TEMP UPLOAD (OpenAI file_id -> local temp file)
+# UPLOAD AND SEARCH (MERGED)
 # -----------------------------------------------------------------------------
-@app.route("/upload_temp_image", methods=["POST"])
-def upload_temp_image():
+@app.route("/upload_and_search", methods=["POST"])
+def upload_and_search():
     """
-    Receives:
-      - openaiFileIdRefs: [ {id, download_link?, name?, mime_type?}, ... ]
-    Saves into temp_uploads/ and returns local URLs /temp_files/<filename>
+    Merged endpoint:
+    1) Receives openaiFileIdRefs (list of file references).
+    2) Downloads and saves them to temp_uploads/.
+    3) For each file, computes embedding and searches for similar images.
+    4) Returns both the local file info and the search results.
     """
     data = request.get_json(silent=True) or {}
     refs = data.get("openaiFileIdRefs")
+    top_k = int(data.get("top_k", 5))
 
     if not refs or not isinstance(refs, list):
         return jsonify(
@@ -255,7 +258,10 @@ def upload_temp_image():
             }
         ), 400
 
-    uploaded_results = []
+    if top_k < 1 or top_k > 50:
+        return jsonify({"success": False, "error": "invalid_top_k", "message": "top_k must be 1..50"}), 400
+
+    final_results = []
     errors = []
 
     for file_ref in refs:
@@ -298,21 +304,42 @@ def upload_temp_image():
                 errors.append(f"{original_name}: File type not allowed (png/jpg/jpeg only).")
                 continue
 
+            # Save to temp
             unique_filename = f"{uuid.uuid4().hex}_{int(time.time())}_{filename_safe}"
             file_path = TEMP_UPLOAD_DIR / unique_filename
             with open(file_path, "wb") as f:
                 f.write(file_bytes)
 
-            file_url = f"{request.host_url.rstrip('/')}/temp_files/{secure_filename(unique_filename)}"
+            # Generate local URL
+            file_url = f"{request.host_url.rstrip('/')}/temp_files/{unique_filename}"
             if file_url.startswith("http://"):
                 file_url = "https://" + file_url[len("http://"):]
 
-            uploaded_results.append(
+            # --- SEARCH PART ---
+            img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+            query_embedding = compute_embedding_from_pil(img)
+            rows = search_similar_in_db(query_embedding, top_k=top_k)
+
+            search_results = []
+            for r in rows:
+                search_results.append(
+                    {
+                        "id": r["id"],
+                        "image_url": build_image_url(r["image_path"]),
+                        "matiere_id": r["matiere_id"],
+                        "material_name": r["nom_matiere"],
+                        "reference": r["reference"],
+                        "similarity": float(r["similarity"]) if r["similarity"] is not None else None,
+                    }
+                )
+
+            final_results.append(
                 {
                     "original_name": original_name,
                     "filename": unique_filename,
                     "url": file_url,
                     "expires_in": "2 hours",
+                    "search_results": search_results
                 }
             )
 
@@ -320,14 +347,14 @@ def upload_temp_image():
             print(f"❌ Error processing file_ref: {e}")
             errors.append(f"{file_ref}: {str(e)}")
 
-    if not uploaded_results and errors:
-        return jsonify({"success": False, "message": "All uploads failed", "errors": errors}), 500
+    if not final_results and errors:
+        return jsonify({"success": False, "message": "All operations failed", "errors": errors}), 500
 
     return jsonify(
         {
             "success": True,
-            "message": f"Processed {len(uploaded_results)} files.",
-            "files": uploaded_results,
+            "message": f"Processed {len(final_results)} files with search results.",
+            "results": final_results,
             "errors": errors,
         }
     ), 200
@@ -420,7 +447,7 @@ def get_material_details(matiere_id):
 
 
 # -----------------------------------------------------------------------------
-# SEARCH (FIXED)
+# SEARCH (KEEPING FOR BACKWARD COMPATIBILITY)
 # -----------------------------------------------------------------------------
 @app.route("/search", methods=["POST"])
 def search():
