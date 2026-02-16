@@ -447,6 +447,155 @@ def get_material_details(matiere_id):
 
 
 # -----------------------------------------------------------------------------
+# FICHE ADN - MATERIAL DNA SHEET
+# -----------------------------------------------------------------------------
+@app.route("/fiche_adn", methods=["GET"])
+def get_fiche_adn():
+    """
+    Get the complete ADN (DNA) specifications sheet for a material.
+    
+    Query Parameters:
+        - reference (str): Material reference (e.g., "6600135")
+    
+    Returns: Complete JSON specifications aggregating all fiches, specs, and expert notes
+    """
+    reference = request.args.get("reference", "").strip()
+    
+    if not reference:
+        return jsonify({
+            "success": False, 
+            "error": "missing_parameters",
+            "message": "The 'reference' query parameter is required"
+        }), 400
+    
+    conn = None
+    try:
+        conn = get_db_conn()
+        
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Query the fiches_ADN_matieres table
+            cur.execute("""
+                SELECT 
+                    fiche_adn_id,
+                    matiere_id,
+                    nom_matiere,
+                    reference,
+                    type_matiere,
+                    specifications,
+                    num_specifications,
+                    date_creation,
+                    derniere_modification
+                FROM public.fiches_ADN_matieres
+                WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
+                LIMIT 1
+            """, (reference,))
+            
+            result = cur.fetchone()
+            
+            if not result:
+                return jsonify({
+                    "success": False,
+                    "error": "fiche_adn_not_found",
+                    "message": f"No fiche ADN found for reference: {reference}"
+                }), 404
+            
+            result_dict = dict(result)
+            
+            return jsonify({
+                "success": True,
+                "fiche_adn": {
+                    "fiche_adn_id": result_dict["fiche_adn_id"],
+                    "matiere_id": result_dict["matiere_id"],
+                    "nom_matiere": result_dict["nom_matiere"],
+                    "reference": result_dict["reference"],
+                    "type_matiere": result_dict["type_matiere"],
+                    "num_specifications": result_dict["num_specifications"],
+                    "date_creation": result_dict["date_creation"],
+                    "derniere_modification": result_dict["derniere_modification"],
+                    "specifications": result_dict["specifications"]  # Complete JSON blob
+                }
+            }), 200
+    
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": "retrieval_failed",
+            "message": str(e)
+        }), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+# Alternative endpoint: Get by matiere_id only (faster)
+@app.route("/fiche_adn/<int:matiere_id>", methods=["GET"])
+def get_fiche_adn_by_id(matiere_id):
+    """
+    Get the complete ADN specifications sheet for a material by matiere_id.
+    
+    Path Parameter:
+        - matiere_id (int): The material ID
+    
+    Returns: Complete JSON specifications aggregating all fiches, specs, and expert notes
+    """
+    conn = None
+    try:
+        conn = get_db_conn()
+        
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT 
+                    fiche_adn_id,
+                    matiere_id,
+                    nom_matiere,
+                    reference,
+                    type_matiere,
+                    specifications,
+                    num_specifications,
+                    date_creation,
+                    derniere_modification
+                FROM public.fiches_ADN_matieres
+                WHERE matiere_id = %s
+                LIMIT 1
+            """, (matiere_id,))
+            
+            result = cur.fetchone()
+            
+            if not result:
+                return jsonify({
+                    "success": False,
+                    "error": "fiche_adn_not_found",
+                    "message": f"No fiche ADN found for matiere_id: {matiere_id}"
+                }), 404
+            
+            result_dict = dict(result)
+            
+            return jsonify({
+                "success": True,
+                "fiche_adn": {
+                    "fiche_adn_id": result_dict["fiche_adn_id"],
+                    "matiere_id": result_dict["matiere_id"],
+                    "nom_matiere": result_dict["nom_matiere"],
+                    "reference": result_dict["reference"],
+                    "type_matiere": result_dict["type_matiere"],
+                    "num_specifications": result_dict["num_specifications"],
+                    "date_creation": result_dict["date_creation"],
+                    "derniere_modification": result_dict["derniere_modification"],
+                    "specifications": result_dict["specifications"]  # Complete JSON blob
+                }
+            }), 200
+    
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": "retrieval_failed",
+            "message": str(e)
+        }), 500
+    finally:
+        if conn:
+            conn.close()
+
+
 # SEARCH (KEEPING FOR BACKWARD COMPATIBILITY)
 # -----------------------------------------------------------------------------
 @app.route("/search", methods=["POST"])
