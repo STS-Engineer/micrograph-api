@@ -12,32 +12,34 @@ from typing import Optional, List, Dict, Any
 import numpy as np
 import requests
 import torch
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, url_for
 from openai import OpenAI
 from PIL import Image
 from transformers import AutoModel, AutoImageProcessor
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from pgvector.psycopg2 import register_vector
 from pgvector import Vector
 
-DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Micrographie_IA"
 
+DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Micrographie_IA"
 
 # -----------------------------------------------------------------------------
 # APP
 # -----------------------------------------------------------------------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
+# 🔥 IMPORTANT: Trust Azure reverse proxy headers
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # -----------------------------------------------------------------------------
 # PATHS
 # -----------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-
 OUTPUT_BASE_DIR = BASE_DIR / "embeddings_v7"
 IMAGES_DIR = OUTPUT_BASE_DIR / "images"
 TEMP_UPLOAD_DIR = BASE_DIR / "temp_uploads"
@@ -46,12 +48,10 @@ OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-
 # -----------------------------------------------------------------------------
 # OPENAI CLIENT
 # -----------------------------------------------------------------------------
 client = OpenAI()
-
 
 # -----------------------------------------------------------------------------
 # DINOv2 (lazy load)
@@ -67,7 +67,6 @@ def ensure_dino_loaded():
     global DINO_MODEL, DINO_PROCESSOR
     if DINO_MODEL is not None and DINO_PROCESSOR is not None:
         return
-
     print(f"🔧 Loading DINOv2 on {DEVICE}...")
     DINO_MODEL = AutoModel.from_pretrained(DINO_MODEL_NAME).to(DEVICE).eval()
     DINO_PROCESSOR = AutoImageProcessor.from_pretrained(DINO_MODEL_NAME)
@@ -75,71 +74,36 @@ def ensure_dino_loaded():
 
 
 def compute_embedding_from_pil(image: Image.Image) -> np.ndarray:
-    """Compute DINOv2 embedding (1024 dims)."""
     ensure_dino_loaded()
-
     image = image.convert("RGB")
     inputs = DINO_PROCESSOR(images=image, return_tensors="pt")
     inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-
     with torch.no_grad():
         outputs = DINO_MODEL(**inputs)
         embedding = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
-
     return embedding.astype("float32")
 
 
 # -----------------------------------------------------------------------------
-# TEMP UPLOAD VALIDATION
-# -----------------------------------------------------------------------------
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
-
-
-def allowed_file(filename: str) -> bool:
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
-
-
-def guess_extension_from_mime(mime_type: Optional[str]) -> Optional[str]:
-    if not mime_type:
-        return None
-    mt = mime_type.lower()
-    if "png" in mt:
-        return ".png"
-    if "jpeg" in mt or "jpg" in mt:
-        return ".jpg"
-    return None
-
-
-# -----------------------------------------------------------------------------
-# BACKGROUND CLEANUP TASK
+# CLEANUP THREAD
 # -----------------------------------------------------------------------------
 def cleanup_old_files(interval: int = 1800, max_age_seconds: int = 2 * 3600):
-    """Deletes files in temp_uploads/ older than max_age_seconds."""
     while True:
         now = time.time()
-        try:
-            for f in TEMP_UPLOAD_DIR.iterdir():
-                if not f.is_file():
-                    continue
+        for f in TEMP_UPLOAD_DIR.iterdir():
+            if f.is_file() and (now - f.stat().st_mtime > max_age_seconds):
                 try:
-                    age = now - f.stat().st_mtime
-                    if age > max_age_seconds:
-                        f.unlink(missing_ok=True)
-                        print(f"🧹 Deleted old temp file: {f.name}")
+                    f.unlink(missing_ok=True)
+                    print(f"🧹 Deleted old temp file: {f.name}")
                 except Exception as e:
                     print(f"⚠️ Error deleting {f.name}: {e}")
-        except Exception as e:
-            print(f"⚠️ Cleanup scan error: {e}")
-
         time.sleep(interval)
 
 
-cleanup_thread = Thread(target=cleanup_old_files, daemon=True)
-cleanup_thread.start()
-
+Thread(target=cleanup_old_files, daemon=True).start()
 
 # -----------------------------------------------------------------------------
-# DB HELPERS
+# DB
 # -----------------------------------------------------------------------------
 def get_db_conn():
     conn = psycopg2.connect(DB_DSN)
@@ -147,12 +111,7 @@ def get_db_conn():
     return conn
 
 
-def search_similar_in_db(query_embedding: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
-    """
-    Returns top_k similar images from pgvector.
-    Uses cosine distance (<=>).
-    similarity = 1 - distance
-    """
+def search_similar_in_db(query_embedding: np.ndarray, top_k: int = 5):
     query_vec = Vector(query_embedding.tolist())
 
     sql = """
@@ -173,40 +132,9 @@ def search_similar_in_db(query_embedding: np.ndarray, top_k: int = 5) -> List[Di
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, (query_vec, query_vec, top_k))
-            rows = cur.fetchall()
-            return [dict(r) for r in rows]
+            return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
-
-
-def build_image_url(image_path: str) -> str:
-    """
-    image_path stored in DB is like: embeddings_v7/images/xxx.png
-    We want to expose it through /images/<filename>.
-    """
-    filename = Path(image_path).name
-    return f"{request.host_url.rstrip('/')}/images/{secure_filename(filename)}"
-
-
-# -----------------------------------------------------------------------------
-# ROOT / HEALTH
-# -----------------------------------------------------------------------------
-@app.route("/", methods=["GET"])
-def root():
-    return jsonify(
-        {
-            "service": "micrograph-search-api",
-            "status": "ok",
-            "model": DINO_MODEL_NAME,
-            "dino_loaded": DINO_MODEL is not None,
-            "images_dir": str(IMAGES_DIR),
-        }
-    ), 200
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "dino_loaded": DINO_MODEL is not None}), 200
 
 
 # -----------------------------------------------------------------------------
@@ -214,93 +142,61 @@ def health():
 # -----------------------------------------------------------------------------
 @app.route("/images/<path:filename>", methods=["GET"])
 def serve_image(filename):
-    """Serve images from embeddings_v7/images"""
-    try:
-        return send_from_directory(str(IMAGES_DIR), filename)
-    except Exception:
-        return jsonify({"error": "not_found"}), 404
+    return send_from_directory(str(IMAGES_DIR), filename)
 
 
 @app.route("/temp_files/<path:filename>", methods=["GET"])
 def serve_temp_file(filename):
-    """Serve locally stored temp uploads"""
-    try:
-        return send_from_directory(str(TEMP_UPLOAD_DIR), filename)
-    except Exception:
-        return jsonify({"error": "temp_file_not_found"}), 404
+    return send_from_directory(str(TEMP_UPLOAD_DIR), filename)
+
+
+def build_image_url(filename: str) -> str:
+    return url_for("serve_image", filename=secure_filename(filename), _external=True, _scheme="https")
 
 
 # -----------------------------------------------------------------------------
-# LOCAL TEMP UPLOAD (OpenAI file_id -> local temp file)
+# UPLOAD TEMP IMAGE
 # -----------------------------------------------------------------------------
 @app.route("/upload_temp_image", methods=["POST"])
 def upload_temp_image():
-    """
-    Receives:
-      - openaiFileIdRefs: [ {id, download_link?, name?, mime_type?}, ... ]
-    Saves into temp_uploads/ and returns local URLs /temp_files/<filename>
-    """
     data = request.get_json(silent=True) or {}
     refs = data.get("openaiFileIdRefs")
 
     if not refs or not isinstance(refs, list):
-        return jsonify(
-            {
-                "success": False,
-                "error": "missing_openaiFileIdRefs",
-                "message": "Provide openaiFileIdRefs (list).",
-            }
-        ), 400
+        return jsonify({"success": False, "error": "missing_openaiFileIdRefs"}), 400
 
     uploaded_results = []
     errors = []
 
     for file_ref in refs:
         try:
-            if not isinstance(file_ref, dict):
-                errors.append("Each item in openaiFileIdRefs must be an object.")
-                continue
-
             file_id = file_ref.get("id")
-            download_link = file_ref.get("download_link")
             original_name = file_ref.get("name") or "uploaded_file"
             mime_type = file_ref.get("mime_type")
 
             if not file_id:
-                errors.append("Missing id in file reference.")
+                errors.append("Missing id")
                 continue
 
-            file_bytes = None
+            file_bytes = client.files.content(file_id).read()
 
-            # 1) Try direct link if provided
-            if download_link:
-                try:
-                    r = requests.get(download_link, timeout=20)
-                    r.raise_for_status()
-                    file_bytes = r.content
-                except Exception as e:
-                    print(f"⚠️ download_link failed, fallback to file_id: {e}")
-
-            # 2) Fallback: OpenAI file content
-            if file_bytes is None:
-                file_bytes = client.files.content(file_id).read()
-
-            filename_safe = secure_filename(original_name or "uploaded_file") or "uploaded_file"
-
+            filename_safe = secure_filename(original_name)
             if "." not in filename_safe:
-                ext = guess_extension_from_mime(mime_type) or ".png"
-                filename_safe += ext
-
-            if not allowed_file(filename_safe):
-                errors.append(f"{original_name}: File type not allowed (png/jpg/jpeg only).")
-                continue
+                filename_safe += ".png"
 
             unique_filename = f"{uuid.uuid4().hex}_{int(time.time())}_{filename_safe}"
             file_path = TEMP_UPLOAD_DIR / unique_filename
+
             with open(file_path, "wb") as f:
                 f.write(file_bytes)
 
-            file_url = f"{request.host_url.rstrip('/')}/temp_files/{secure_filename(unique_filename)}"
+            # ✅ HTTPS URL FORCÉE
+            file_url = url_for(
+                "serve_temp_file",
+                filename=secure_filename(unique_filename),
+                _external=True,
+                _scheme="https"
+            )
 
             uploaded_results.append(
                 {
@@ -312,11 +208,7 @@ def upload_temp_image():
             )
 
         except Exception as e:
-            print(f"❌ Error processing file_ref: {e}")
-            errors.append(f"{file_ref}: {str(e)}")
-
-    if not uploaded_results and errors:
-        return jsonify({"success": False, "message": "All uploads failed", "errors": errors}), 500
+            errors.append(str(e))
 
     return jsonify(
         {
@@ -329,181 +221,44 @@ def upload_temp_image():
 
 
 # -----------------------------------------------------------------------------
-# MATERIAL DETAILS
-# -----------------------------------------------------------------------------
-@app.route("/material_details/<int:matiere_id>", methods=["GET"])
-def get_material_details(matiere_id):
-    """
-    Get complete material information by matiere_id.
-    Returns: matieres + fiches_matieres + specifications + expert_notes
-    """
-    conn = None
-    try:
-        conn = get_db_conn()
-
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM public.matieres WHERE matiere_id = %s", (matiere_id,))
-            material = cur.fetchone()
-
-            if not material:
-                return jsonify(
-                    {"success": False, "error": "material_not_found", "message": f"matiere_id {matiere_id} not found"}
-                ), 404
-
-            material = dict(material)
-
-            cur.execute(
-                """
-                SELECT fiche_id, date_creation_fiche, derniere_modification
-                FROM public.fiches_matieres
-                WHERE matiere_id = %s
-                ORDER BY fiche_id DESC
-                """,
-                (matiere_id,),
-            )
-            fiches = [dict(row) for row in cur.fetchall()]
-
-            specifications = []
-            for fiche in fiches:
-                cur.execute(
-                    """
-                    SELECT spec_id, fiche_id, source_type, donnees, date_creation, derniere_modification
-                    FROM public.specifications
-                    WHERE fiche_id = %s
-                    ORDER BY spec_id
-                    """,
-                    (fiche["fiche_id"],),
-                )
-                specifications.extend([dict(row) for row in cur.fetchall()])
-
-            cur.execute(
-                """
-                SELECT men.id, men.matiere_image_id, men.note_json, men.created_at
-                FROM public.matiere_expert_notes men
-                INNER JOIN public.matiere_images mi ON mi.id = men.matiere_image_id
-                WHERE mi.matiere_id = %s
-                ORDER BY men.created_at DESC
-                """,
-                (matiere_id,),
-            )
-            expert_notes = [dict(row) for row in cur.fetchall()]
-
-            response = {
-                "success": True,
-                "material": material,
-                "fiches_matieres": fiches,
-                "specifications": specifications,
-                "expert_notes": expert_notes,
-                "summary": {
-                    "matiere_id": matiere_id,
-                    "nom_matiere": material.get("nom_matiere"),
-                    "reference": material.get("reference"),
-                    "type_matiere": material.get("type_matiere"),
-                    "num_fiches": len(fiches),
-                    "num_specifications": len(specifications),
-                    "num_expert_notes": len(expert_notes),
-                },
-            }
-
-            return jsonify(response), 200
-
-    except Exception as e:
-        return jsonify({"success": False, "error": "retrieval_failed", "message": str(e)}), 500
-    finally:
-        if conn:
-            conn.close()
-
-
-# -----------------------------------------------------------------------------
-# SEARCH (FIXED)
+# SEARCH
 # -----------------------------------------------------------------------------
 @app.route("/search", methods=["POST"])
 def search():
-    """
-    Search similar micrographs (pgvector).
-    Accepts ONE of:
-      - download_link (recommended: robust for autoscaling)
-      - temp_filename (fallback: local file)
-      - file_id (fallback: OpenAI Files API)
-    """
     data = request.get_json(silent=True) or {}
-    if not data:
-        return jsonify({"success": False, "error": "missing_json_body", "message": "Missing JSON body"}), 400
-
-    top_k = int(data.get("top_k", 5))
-    if top_k < 1 or top_k > 50:
-        return jsonify({"success": False, "error": "invalid_top_k", "message": "top_k must be 1..50"}), 400
-
-    temp_filename = data.get("temp_filename")
-    file_id = data.get("file_id")
     download_link = data.get("download_link")
+    top_k = int(data.get("top_k", 5))
 
-    provided = [bool(download_link), bool(temp_filename), bool(file_id)]
-    if sum(provided) != 1:
-        return jsonify(
-            {
-                "success": False,
-                "error": "invalid_input",
-                "message": "Provide exactly ONE of: download_link, temp_filename, file_id",
-            }
-        ), 400
+    if not download_link:
+        return jsonify({"success": False, "error": "missing_download_link"}), 400
 
-    img = None
-
-    # 1) download_link (BEST)
-    if download_link:
-        try:
-            r = requests.get(download_link, timeout=20)
-            r.raise_for_status()
-            img = Image.open(io.BytesIO(r.content)).convert("RGB")
-        except Exception as e:
-            return jsonify({"success": False, "error": "download_link_failed", "message": str(e)}), 400
-
-    # 2) temp_filename (fallback)
-    elif temp_filename:
-        file_path = TEMP_UPLOAD_DIR / temp_filename
-        if not file_path.exists():
-            return jsonify(
-                {
-                    "success": False,
-                    "error": "temp_file_not_found",
-                    "message": f"{temp_filename} not found (likely autoscaling issue). Use download_link instead.",
-                }
-            ), 404
-        try:
-            img = Image.open(file_path).convert("RGB")
-        except Exception as e:
-            return jsonify({"success": False, "error": "invalid_image", "message": str(e)}), 400
-
-    # 3) file_id (fallback)
-    elif file_id:
-        try:
-            file_content = client.files.content(file_id).read()
-            img = Image.open(io.BytesIO(file_content)).convert("RGB")
-        except Exception as e:
-            return jsonify({"success": False, "error": "openai_retrieval_failed", "message": str(e)}), 400
+    if not download_link.startswith("https://"):
+        return jsonify({"success": False, "error": "download_link_must_be_https"}), 400
 
     try:
-        query_embedding = compute_embedding_from_pil(img)
-        rows = search_similar_in_db(query_embedding, top_k=top_k)
-
-        results = []
-        for r in rows:
-            results.append(
-                {
-                    "id": r["id"],
-                    "image_url": build_image_url(r["image_path"]),
-                    "matiere_id": r["matiere_id"],
-                    "material_name": r["nom_matiere"],
-                    "reference": r["reference"],
-                    "similarity": float(r["similarity"]) if r["similarity"] is not None else None,
-                }
-            )
-
-        return jsonify({"success": True, "results": results}), 200
-
+        r = requests.get(download_link, timeout=20)
+        r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content)).convert("RGB")
     except Exception as e:
-        return jsonify({"success": False, "error": "search_failed", "message": str(e)}), 500
+        return jsonify({"success": False, "error": "download_link_failed", "message": str(e)}), 400
+
+    query_embedding = compute_embedding_from_pil(img)
+    rows = search_similar_in_db(query_embedding, top_k)
+
+    results = []
+    for r in rows:
+        results.append(
+            {
+                "id": r["id"],
+                "image_url": build_image_url(Path(r["image_path"]).name),
+                "matiere_id": r["matiere_id"],
+                "material_name": r["nom_matiere"],
+                "reference": r["reference"],
+                "similarity": float(r["similarity"]),
+            }
+        )
+
+    return jsonify({"success": True, "results": results}), 200
 
 
 # -----------------------------------------------------------------------------
