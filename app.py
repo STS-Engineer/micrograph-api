@@ -185,7 +185,10 @@ def build_image_url(image_path: str) -> str:
     We want to expose it through /images/<filename>.
     """
     filename = Path(image_path).name
-    return f"{request.host_url.rstrip('/')}/images/{secure_filename(filename)}"
+    url = f"{request.host_url.rstrip('/')}/images/{secure_filename(filename)}"
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    return url
 
 
 # -----------------------------------------------------------------------------
@@ -301,6 +304,8 @@ def upload_temp_image():
                 f.write(file_bytes)
 
             file_url = f"{request.host_url.rstrip('/')}/temp_files/{secure_filename(unique_filename)}"
+            if file_url.startswith("http://"):
+                file_url = "https://" + file_url[len("http://"):]
 
             uploaded_results.append(
                 {
