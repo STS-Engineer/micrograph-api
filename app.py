@@ -26,8 +26,6 @@ from threading import Thread
 from flask import send_from_directory
 
 # --- CONFIGURATION ---
-load_dotenv()
-
 UPLOAD_FOLDER = Path('/tmp/uploads')
 OUTPUT_FOLDER = Path('/tmp/output_images')
 
