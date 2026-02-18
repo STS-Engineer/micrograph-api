@@ -1,1087 +1,700 @@
-import logging
-import time
-from pathlib import Path
-import contextlib
+from __future__ import annotations
+
+import argparse
+import io
 import os
-import urllib.parse
-from datetime import datetime, timedelta
-# Flask & Networking
-from werkzeug.utils import secure_filename
-from werkzeug.middleware.proxy_fix import ProxyFix
-from flask import Flask, request, jsonify, send_file
-import requests
-import psycopg2
-
-# PDF & Image Processing
-import fitz  # PyMuPDF
-import cv2
-from paddleocr import PaddleOCR, DocImgOrientationClassification
-
-import re
-from openai import OpenAI
-from psycopg2.extras import Json
-
+import time
 import uuid
+from pathlib import Path
 from threading import Thread
-from flask import send_from_directory
+from typing import Optional, List, Dict, Any
 
-# --- CONFIGURATION ---
-UPLOAD_FOLDER = Path('/tmp/uploads')
-OUTPUT_FOLDER = Path('/tmp/output_images')
+import numpy as np
+import requests
+import torch
+from flask import Flask, jsonify, request, send_from_directory
+from openai import OpenAI
+from PIL import Image
+from transformers import AutoModel, AutoImageProcessor
+from werkzeug.utils import secure_filename
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from pgvector.psycopg2 import register_vector
+from pgvector import Vector
 
 DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Micrographie_IA"
+
+
+# -----------------------------------------------------------------------------
+# APP
+# -----------------------------------------------------------------------------
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB
+
+
+# -----------------------------------------------------------------------------
+# PATHS
+# -----------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+
+OUTPUT_BASE_DIR = BASE_DIR / "embeddings_v7"
+IMAGES_DIR = OUTPUT_BASE_DIR / "images"
+TEMP_UPLOAD_DIR = BASE_DIR / "temp_uploads"
+
+OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# -----------------------------------------------------------------------------
+# OPENAI CLIENT
+# -----------------------------------------------------------------------------
 client = OpenAI()
 
-TEMP_PDF_FOLDER = Path('/tmp/temp_pdfs')  # TTL 30 min
-TEMP_PDF_FOLDER.mkdir(exist_ok=True, parents=True)
 
-# DB Config
-DB_CONFIG = {
-    "host": "avo-adb-002.postgres.database.azure.com",
-    "database": "Costing_DB",
-    "user": "administrationSTS",
-    "password": "St$@0987"
-}
+# -----------------------------------------------------------------------------
+# DINOv2 (lazy load)
+# -----------------------------------------------------------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DINO_MODEL_NAME = "facebook/dinov2-large"
 
-# GitHub Config
-GITHUB_OWNER = "STS-Engineer"
-GITHUB_REPO = "RFQ-back"
-GITHUB_BRANCH = "main"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-
-app = Flask(__name__)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-
-# Ensure directories exist
-UPLOAD_FOLDER.mkdir(exist_ok=True, parents=True)
-OUTPUT_FOLDER.mkdir(exist_ok=True, parents=True)
-
-# ----------------- MODEL INITIALIZATION ----------------- #
-
-paddle_engine = None
-doc_ori = None
-
-def init_models():
-    """Initialize PaddleOCR and Orientation models."""
-    global paddle_engine, doc_ori
-    
-    try:
-        logging.info("Loading PaddleOCR (lang=ch)...")
-        # Main OCR Engine
-        paddle_engine = PaddleOCR(
-            lang="ch",
-            use_doc_orientation_classify=True, 
-            use_doc_unwarping=False,            
-            use_textline_orientation=True     
-        )
-        
-        # Orientation Classification Model
-        doc_ori = DocImgOrientationClassification(model_name="PP-LCNet_x1_0_doc_ori")
-        
-        logging.info("Models initialized successfully.")
-    except Exception as e:
-        logging.error(f"FATAL: Failed to load models: {e}")
-
-# Pre-load models
-init_models()
-
-# ----------------- HELPER FUNCTIONS ----------------- #
-
-def cleanup_old_files(folder, max_age_hours=24):
-    """Deletes files older than max_age_hours to prevent disk clutter."""
-    try:
-        cutoff_time = datetime.now() - timedelta(hours=max_age_hours)
-        for file_path in folder.iterdir():
-            if file_path.is_file():
-                file_time = datetime.fromtimestamp(file_path.stat().st_mtime)
-                if file_time < cutoff_time:
-                    os.remove(file_path)
-    except Exception:
-        pass # Silent fail is fine for cleanup
+DINO_MODEL: Optional[AutoModel] = None
+DINO_PROCESSOR: Optional[AutoImageProcessor] = None
 
 
-def cleanup_temp_pdfs(interval_seconds=300, max_age_seconds=30 * 60):
-    """Delete temp pdfs older than 30 minutes."""
+def ensure_dino_loaded():
+    global DINO_MODEL, DINO_PROCESSOR
+    if DINO_MODEL is not None and DINO_PROCESSOR is not None:
+        return
+
+    print(f"🔧 Loading DINOv2 on {DEVICE}...")
+    DINO_MODEL = AutoModel.from_pretrained(DINO_MODEL_NAME).to(DEVICE).eval()
+    DINO_PROCESSOR = AutoImageProcessor.from_pretrained(DINO_MODEL_NAME)
+    print("✅ DINOv2 loaded")
+
+
+def compute_embedding_from_pil(image: Image.Image) -> np.ndarray:
+    """Compute DINOv2 embedding (1024 dims)."""
+    ensure_dino_loaded()
+
+    image = image.convert("RGB")
+    inputs = DINO_PROCESSOR(images=image, return_tensors="pt")
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = DINO_MODEL(**inputs)
+        embedding = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
+
+    return embedding.astype("float32")
+
+
+# -----------------------------------------------------------------------------
+# TEMP UPLOAD VALIDATION
+# -----------------------------------------------------------------------------
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
+
+
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def guess_extension_from_mime(mime_type: Optional[str]) -> Optional[str]:
+    if not mime_type:
+        return None
+    mt = mime_type.lower()
+    if "png" in mt:
+        return ".png"
+    if "jpeg" in mt or "jpg" in mt:
+        return ".jpg"
+    return None
+
+
+# -----------------------------------------------------------------------------
+# BACKGROUND CLEANUP TASK
+# -----------------------------------------------------------------------------
+def cleanup_old_files(interval: int = 1800, max_age_seconds: int = 2 * 3600):
+    """Deletes files in temp_uploads/ older than max_age_seconds."""
     while True:
         now = time.time()
         try:
-            for f in TEMP_PDF_FOLDER.iterdir():
+            for f in TEMP_UPLOAD_DIR.iterdir():
                 if not f.is_file():
                     continue
-                age = now - f.stat().st_mtime
-                if age > max_age_seconds:
-                    with contextlib.suppress(Exception):
-                        f.unlink()
-        except Exception:
-            pass
-        time.sleep(interval_seconds)
+                try:
+                    age = now - f.stat().st_mtime
+                    if age > max_age_seconds:
+                        f.unlink(missing_ok=True)
+                        print(f"🧹 Deleted old temp file: {f.name}")
+                except Exception as e:
+                    print(f"⚠️ Error deleting {f.name}: {e}")
+        except Exception as e:
+            print(f"⚠️ Cleanup scan error: {e}")
 
-Thread(target=cleanup_temp_pdfs, daemon=True).start()
-
-
-def extract_material_name_from_filename(filename: str) -> str:
-    stem = Path(filename).stem
-    s = re.sub(r"[_\-]+", " ", stem).strip()
-
-    s = re.sub(r"(?i)^\s*data\s*sheet\s*", "", s)
-    s = re.sub(r"(?i)^\s*datasheet\s*", "", s)
-    s = re.sub(r"(?i)^\s*technical\s*data\s*sheet\s*", "", s)
-    s = re.sub(r"(?i)^\s*fiche\s*technique\s*", "", s)
-    s = re.sub(r"(?i)^\s*fiche\s*de\s*donn[eé]es\s*", "", s)
-
-    s = re.sub(r"\s+", " ", s).strip()
-    return s or "UNKNOWN"
+        time.sleep(interval)
 
 
-def extract_reference_from_msds_filename(filename: str) -> str:
+cleanup_thread = Thread(target=cleanup_old_files, daemon=True)
+cleanup_thread.start()
+
+
+# -----------------------------------------------------------------------------
+# DB HELPERS
+# -----------------------------------------------------------------------------
+def get_db_conn():
+    conn = psycopg2.connect(DB_DSN)
+    register_vector(conn)
+    return conn
+
+
+def search_similar_in_db(query_embedding: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
     """
-    Extracts reference number from MSDS filenames like:
-    '6600125 - TIMCAL - SDS - English.pdf' -> '6600125'
-    Returns None if pattern doesn't match.
+    Returns top_k similar images from pgvector.
+    Uses cosine distance (<=>).
+    similarity = 1 - distance
     """
-    stem = Path(filename).stem
-    # Extract first part before ' - '
-    parts = stem.split(' - ')
-    if parts and parts[0].strip():
-        ref = parts[0].strip()
-        # Verify it looks like a reference (digits)
-        if ref.replace(' ', '').isdigit():
-            return ref
-    return None
+    query_vec = Vector(query_embedding.tolist())
+
+    sql = """
+        SELECT
+            mi.id,
+            mi.image_path,
+            mi.matiere_id,
+            m.nom_matiere,
+            m.reference,
+            (1 - (mi.embedding <=> %s)) AS similarity
+        FROM public.matiere_images mi
+        JOIN public.matieres m ON m.matiere_id = mi.matiere_id
+        ORDER BY mi.embedding <=> %s
+        LIMIT %s;
+    """
+
+    conn = get_db_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (query_vec, query_vec, top_k))
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
-def extract_reference_from_inspection_filename(filename: str) -> str:
+def build_image_url(image_path: str) -> str:
     """
-    Extracts reference number from Inspection/Control sheet filenames like:
-    '6600125.xls' -> '6600125'
-    '6600125.xlsx' -> '6600125'
-    Returns None if pattern doesn't match.
+    image_path stored in DB is like: embeddings_v7/images/xxx.png
+    We want to expose it through /images/<filename>.
     """
-    stem = Path(filename).stem
-    # For inspection sheets, the stem IS the reference
-    ref = stem.strip()
-    # Verify it looks like a reference (digits)
-    if ref.replace(' ', '').isdigit():
-        return ref
-    return None
+    filename = Path(image_path).name
+    url = f"{request.host_url.rstrip('/')}/images/{secure_filename(filename)}"
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    return url
+
+
+# -----------------------------------------------------------------------------
+# ROOT / HEALTH
+# -----------------------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify(
+        {
+            "service": "micrograph-search-api",
+            "status": "ok",
+            "model": DINO_MODEL_NAME,
+            "dino_loaded": DINO_MODEL is not None,
+            "images_dir": str(IMAGES_DIR),
+        }
+    ), 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "dino_loaded": DINO_MODEL is not None}), 200
+
+
+# -----------------------------------------------------------------------------
+# FILE SERVING
+# -----------------------------------------------------------------------------
+@app.route("/images/<path:filename>", methods=["GET"])
+def serve_image(filename):
+    """Serve images from embeddings_v7/images"""
+    try:
+        return send_from_directory(str(IMAGES_DIR), filename)
+    except Exception:
+        return jsonify({"error": "not_found"}), 404
 
 
 @app.route("/temp_files/<path:filename>", methods=["GET"])
 def serve_temp_file(filename):
+    """Serve locally stored temp uploads"""
     try:
-        return send_from_directory(str(TEMP_PDF_FOLDER), filename)
+        return send_from_directory(str(TEMP_UPLOAD_DIR), filename)
     except Exception:
-        return jsonify({"success": False, "error": "temp_file_not_found"}), 404
+        return jsonify({"error": "temp_file_not_found"}), 404
 
 
-@app.route("/upload-temp-pdf", methods=["POST"])
-def upload_temp_pdf():
+# -----------------------------------------------------------------------------
+# UPLOAD AND SEARCH (MERGED)
+# -----------------------------------------------------------------------------
+@app.route("/upload_and_search", methods=["POST"])
+def upload_and_search():
     """
-    JSON accepté (ordre de priorité):
-      1) openaiFileIdRefs: [ {id, download_link?, name?, mime_type?}, ... ]
-      2) download_link: Azure SAS URL (preferred)
-      3) openai_file_id: fallback OpenAI Files API
-
-    Returns:
-      - temp_filename + temp_url (valid until cleanup ~30 min)
+    Merged endpoint:
+    1) Receives openaiFileIdRefs (list of file references).
+    2) Downloads and saves them to temp_uploads/.
+    3) For each file, computes embedding and searches for similar images.
+    4) Returns both the local file info and the search results.
     """
-    if not request.is_json:
-        return jsonify({"success": False, "error": "JSON required"}), 400
-
     data = request.get_json(silent=True) or {}
-
-    # --- NEW: accept openaiFileIdRefs ---
     refs = data.get("openaiFileIdRefs")
-    download_link = data.get("download_link")
-    openai_file_id = data.get("openai_file_id")
-    original_name = data.get("filename") or "uploaded.pdf"
+    top_k = int(data.get("top_k", 5))
 
-    # If openaiFileIdRefs is provided, it has priority
-    if refs and isinstance(refs, list) and len(refs) > 0:
-        first_ref = refs[0] if isinstance(refs[0], dict) else {"id": str(refs[0])}
+    if not refs or not isinstance(refs, list):
+        return jsonify(
+            {
+                "success": False,
+                "error": "missing_openaiFileIdRefs",
+                "message": "Provide openaiFileIdRefs (list).",
+            }
+        ), 400
 
-        # Prefer download_link if present
-        dl = first_ref.get("download_link")
-        if dl:
-            download_link = dl
+    if top_k < 1 or top_k > 50:
+        return jsonify({"success": False, "error": "invalid_top_k", "message": "top_k must be 1..50"}), 400
 
-        # Keep file id as fallback
-        fid = first_ref.get("id")
-        if fid and not openai_file_id:
-            openai_file_id = fid
+    final_results = []
+    errors = []
 
-        # Try to use original filename
-        ref_name = first_ref.get("name")
-        if ref_name:
-            original_name = ref_name
-
-    if not download_link and not openai_file_id:
-        return jsonify({
-            "success": False,
-            "error": "Provide 'openaiFileIdRefs', 'download_link' (Azure SAS) or 'openai_file_id'"
-        }), 400
-
-    try:
-        pdf_bytes = None
-
-        # 1) Preferred: download from link (Azure SAS OR Actions temp link)
-        if download_link:
-            r = requests.get(download_link, stream=True, timeout=60)
-            if r.status_code != 200:
-                return jsonify({
-                    "success": False,
-                    "error": f"Failed to download from link (status={r.status_code}). Maybe expired?"
-                }), 400
-            pdf_bytes = r.content
-
-        # 2) Fallback: OpenAI Files API
-        if pdf_bytes is None and openai_file_id:
-            file_metadata = client.files.retrieve(openai_file_id)
-            if getattr(file_metadata, "filename", None):
-                original_name = file_metadata.filename
-            pdf_bytes = client.files.content(openai_file_id).read()
-
-        if pdf_bytes is None:
-            return jsonify({"success": False, "error": "Unable to retrieve PDF bytes"}), 400
-
-        # Save temp file
-        safe = secure_filename(original_name) or "uploaded.pdf"
-        if not safe.lower().endswith(".pdf"):
-            safe += ".pdf"
-
-        temp_filename = f"{uuid.uuid4().hex}_{int(time.time())}_{safe}"
-        temp_path = TEMP_PDF_FOLDER / temp_filename
-
-        with open(temp_path, "wb") as f:
-            f.write(pdf_bytes)
-
-        temp_url = f"{request.host_url.rstrip('/')}/temp_files/{temp_filename}"
-
-        return jsonify({
-            "success": True,
-            "temp_filename": temp_filename,
-            "temp_url": temp_url,
-            "expires_in_seconds": 30 * 60
-        }), 200
-
-    except Exception as e:
-        logging.error(f"Temp upload failed: {e}", exc_info=True)
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route("/upload-temp-pdf-and-ocr", methods=["POST"])
-def upload_temp_pdf_and_ocr():
-    """
-    Combined endpoint:
-      - Upload/download PDF (same inputs as /upload-temp-pdf)
-      - Save as temp file
-      - Run OCR (same behavior as /process-pdf-to-ocr)
-      - Return temp_url + OCR results
-    """
-    if not request.is_json:
-        return jsonify({
-            "success": False,
-            "error": "JSON required. Provide 'openaiFileIdRefs', 'download_link' OR 'openai_file_id'"
-        }), 400
-
-    data = request.get_json(silent=True) or {}
-
-    refs = data.get("openaiFileIdRefs")
-    download_link = data.get("download_link")
-    openai_file_id = data.get("openai_file_id")
-    max_pages = int(data.get("max_pages", 20))
-    original_name = data.get("filename") or "uploaded.pdf"
-
-    if refs and isinstance(refs, list) and len(refs) > 0:
-        first_ref = refs[0] if isinstance(refs[0], dict) else {"id": str(refs[0])}
-        dl = first_ref.get("download_link")
-        if dl:
-            download_link = dl
-        fid = first_ref.get("id")
-        if fid and not openai_file_id:
-            openai_file_id = fid
-        ref_name = first_ref.get("name")
-        if ref_name:
-            original_name = ref_name
-
-    if not download_link and not openai_file_id:
-        return jsonify({
-            "success": False,
-            "error": "Provide 'openaiFileIdRefs', 'download_link' (Azure SAS) or 'openai_file_id'"
-        }), 400
-
-    timestamp = int(time.time())
-    temp_path = None
-
-    try:
-        pdf_bytes = None
-
-        if download_link:
-            r = requests.get(download_link, stream=True, timeout=60)
-            if r.status_code != 200:
-                return jsonify({
-                    "success": False,
-                    "error": f"Failed to download from link (status={r.status_code}). Maybe expired?"
-                }), 400
-            pdf_bytes = r.content
-
-        if pdf_bytes is None and openai_file_id:
-            file_metadata = client.files.retrieve(openai_file_id)
-            if getattr(file_metadata, "filename", None):
-                original_name = file_metadata.filename
-            pdf_bytes = client.files.content(openai_file_id).read()
-
-        if pdf_bytes is None:
-            return jsonify({"success": False, "error": "Unable to retrieve PDF bytes"}), 400
-
-        safe = secure_filename(original_name) or "uploaded.pdf"
-        if not safe.lower().endswith(".pdf"):
-            safe += ".pdf"
-
-        temp_filename = f"{uuid.uuid4().hex}_{timestamp}_{safe}"
-        temp_path = TEMP_PDF_FOLDER / temp_filename
-        with open(temp_path, "wb") as f:
-            f.write(pdf_bytes)
-
-        temp_url = f"{request.host_url.rstrip('/')}/temp_files/{temp_filename}"
-
-        material_name = extract_material_name_from_filename(safe)
-
-        cleanup_old_files(OUTPUT_FOLDER)
-        doc = fitz.open(temp_path)
-        total_pages = len(doc)
-        mat = fitz.Matrix(2.0, 2.0)
-
-        processed_pages = []
-        for i, page in enumerate(doc):
-            if i >= max_pages:
-                break
-
-            pix = page.get_pixmap(matrix=mat)
-
-            raw_filename = f"oa_raw_{i+1}_{timestamp}.png"
-            raw_path = OUTPUT_FOLDER / raw_filename
-            pix.save(str(raw_path))
-
-            upright_filename = f"oa_upright_{i+1}_{timestamp}.png"
-            upright_path = OUTPUT_FOLDER / upright_filename
-            angle = save_upright_image(raw_path, upright_path)
-            raw_path.unlink(missing_ok=True)
-
-            ocr_text_list = run_paddle_ocr_on_file(upright_path)
-
-            processed_pages.append({
-                "page": i + 1,
-                "rotation_angle": angle,
-                "ocr_text": ocr_text_list
-            })
-
-        doc.close()
-
-        reference = None
-        if original_name and ("SDS" in original_name.upper() or "MSDS" in original_name.upper()):
-            reference = extract_reference_from_msds_filename(original_name)
-
-        return jsonify({
-            "success": True,
-            "openai_file_id": openai_file_id,
-            "download_link_used": bool(download_link),
-            "material_name": material_name,
-            "reference": reference,
-            "total_pages": total_pages,
-            "converted_pages": len(processed_pages),
-            "truncated": total_pages > max_pages,
-            "pages": processed_pages,
-            "temp_filename": temp_filename,
-            "temp_url": temp_url,
-            "expires_in_seconds": 30 * 60
-        }), 200
-
-    except Exception as e:
-        logging.error(f"Upload+OCR failed: {e}", exc_info=True)
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-def save_upright_image(in_path: Path, out_path: Path) -> int:
-    """
-    Predicts orientation, rotates the image using OpenCV, and saves it.
-    Returns the rotation angle applied (0, 90, 180, 270).
-    """
-    if doc_ori is None:
-        return -1
-
-    out = doc_ori.predict(str(in_path), batch_size=1)
-    if not out:
-        return -1
-
-    res = out[0]
-    d = res.to_dict() if hasattr(res, "to_dict") else {}
-    angle = int((d.get("res", {}).get("label_names") or ["0"])[0])
-
-    img = cv2.imread(str(in_path))
-    if img is None:
-        return -1
-
-    # Rotate manually based on prediction
-    if angle == 90:
-        img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-    elif angle == 180:
-        img = cv2.rotate(img, cv2.ROTATE_180)
-    elif angle == 270:
-        img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    
-    cv2.imwrite(str(out_path), img)
-    return angle
-
-def run_paddle_ocr_on_file(img_path: Path):
-    """Runs PaddleOCR on a specific image file."""
-    if paddle_engine is None:
-        logging.error("PaddleOCR engine not initialized.")
-        return []
-
-    try:
-        result = paddle_engine.predict(
-            str(img_path),
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=True,
-            text_det_limit_side_len=2048,
-            text_det_limit_type="max",
-            text_det_thresh=0.2,
-            text_det_box_thresh=0.2,
-            text_det_unclip_ratio=2.0,
-            text_rec_score_thresh=0.0,
-            return_word_box=True,
-        )
-
-        if not result:
-            return []
-
-        detected_texts = []
-        for res in result:
-            d = res.to_dict() if hasattr(res, "to_dict") else res
-            if not isinstance(d, dict):
+    for file_ref in refs:
+        try:
+            if not isinstance(file_ref, dict):
+                errors.append("Each item in openaiFileIdRefs must be an object.")
                 continue
-            
-            payload = d.get("res", d)
-            texts = payload.get("rec_texts") or []
-            
-            for t in texts:
-                if t:
-                    detected_texts.append(str(t))
 
-        return detected_texts
+            file_id = file_ref.get("id")
+            download_link = file_ref.get("download_link")
+            original_name = file_ref.get("name") or "uploaded_file"
+            mime_type = file_ref.get("mime_type")
 
-    except Exception:
-        logging.exception(f"PaddleOCR failed on {img_path}")
-        return []
+            if not file_id:
+                errors.append("Missing id in file reference.")
+                continue
 
-# ----------------- ENDPOINTS ----------------- #
+            file_bytes = None
 
-@app.route('/images/<filename>', methods=['GET'])
-def serve_image(filename):
-    """Required to view the images returned by the process route."""
-    try:
-        return send_file(str(OUTPUT_FOLDER / secure_filename(filename)), mimetype='image/jpeg')
-    except Exception:
-        return jsonify({"success": False, "error": "Image not found"}), 404
+            # 1) Try direct link if provided
+            if download_link:
+                try:
+                    r = requests.get(download_link, timeout=20)
+                    r.raise_for_status()
+                    file_bytes = r.content
+                except Exception as e:
+                    print(f"⚠️ download_link failed, fallback to file_id: {e}")
 
-@app.route('/download-image/<filename>', methods=['GET'])
-def download_image(filename):
-    """Required to download the images returned by the process route."""
-    try:
-        return send_file(str(OUTPUT_FOLDER / secure_filename(filename)), as_attachment=True)
-    except Exception:
-        return jsonify({"success": False, "error": "Image not found"}), 404
+            # 2) Fallback: OpenAI file content
+            if file_bytes is None:
+                file_bytes = client.files.content(file_id).read()
 
-@app.route('/process-rfq-id-to-images', methods=['POST'])
-def process_rfq_id_to_images():
-    """
-    Main Route:
-    1. Fetches PDF path from DB using RFQ_ID.
-    2. Downloads PDF from GitHub.
-    3. Converts to Images -> Rotates Upright -> Runs OCR.
-    4. Returns JSON with image URLs and Extracted Text.
-    """
-    if not request.is_json:
-        return jsonify({"success": False, "error": "JSON required"}), 400
+            filename_safe = secure_filename(original_name or "uploaded_file") or "uploaded_file"
 
-    data = request.get_json()
-    rfq_id = data.get('rfq_id')
-    if not rfq_id:
-        return jsonify({"success": False, "error": "Missing 'rfq_id'"}), 400
+            if "." not in filename_safe:
+                ext = guess_extension_from_mime(mime_type) or ".png"
+                filename_safe += ext
 
-    mat = fitz.Matrix(2.0, 2.0) # High-res zoom
-    local_pdf_path = None
-    conn = None
-    download_url_page_1 = None
+            if not allowed_file(filename_safe):
+                errors.append(f"{original_name}: File type not allowed (png/jpg/jpeg only).")
+                continue
 
-    try:
-        # 1. DB Fetch & Search for Drawing
-        logging.info(f"Fetching RFQ and searching for drawing: {rfq_id}")
-        conn = psycopg2.connect(**DB_CONFIG)
-        cur = conn.cursor()
-        
-        # We query the file path column. We use ILIKE to find rows where 'drawing' 
-        # exists anywhere in that path string.
-        query = "SELECT rfq_file_path FROM public.main WHERE rfq_id = %s"
-        cur.execute(query, (rfq_id,))
-        result = cur.fetchone()
-        
-        if not result or not result[0]:
-            return jsonify({"success": False, "error": "RFQ ID or File Path not found"}), 404
-        
-        # result[0] looks like: "{/path/file1.pdf,/path/Drawing_abc.pdf}"
-        raw_paths = result[0].strip("{}").split(",")
-        
-        # Logic to prioritize the file containing 'drawing'
-        rfq_path_db = None
-        for path in raw_paths:
-            if 'drawing' in path.lower():
-                rfq_path_db = path.strip()
-                break
-        
-        # Fallback to the first file if no 'drawing' is found
-        if not rfq_path_db and raw_paths:
-            rfq_path_db = raw_paths[0].strip()
-        
-        logging.info(f"Target file identified: {rfq_path_db}")
-        
-        # 2. GitHub Download
-        clean_path = rfq_path_db.strip("/")
-        encoded_path = urllib.parse.quote(clean_path)
-        url = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{encoded_path}"
-        
-        resp = requests.get(url, stream=True, timeout=30)
-        if resp.status_code != 200:
-            return jsonify({"success": False, "error": f"GitHub error: {resp.status_code}"}), 400
-            
-        unique_pdf_name = f"{rfq_id}_{int(time.time())}.pdf"
-        local_pdf_path = UPLOAD_FOLDER / unique_pdf_name
-        
-        with open(local_pdf_path, 'wb') as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-                
-        # 3. Process Pages
-        cleanup_old_files(OUTPUT_FOLDER)
-        doc = fitz.open(local_pdf_path)
-        total_pages = len(doc)
-        max_pages = int(data.get('max_pages', 20))
-        
-        processed_pages = []
-        timestamp = int(time.time())
-        base_url = request.host_url.rstrip('/')
+            # Save to temp
+            unique_filename = f"{uuid.uuid4().hex}_{int(time.time())}_{filename_safe}"
+            file_path = TEMP_UPLOAD_DIR / unique_filename
+            with open(file_path, "wb") as f:
+                f.write(file_bytes)
 
-        for i, page in enumerate(doc):
-            if i >= max_pages:
-                break
+            # Generate local URL
+            file_url = f"{request.host_url.rstrip('/')}/temp_files/{unique_filename}"
+            if file_url.startswith("http://"):
+                file_url = "https://" + file_url[len("http://"):]
 
-            pix = page.get_pixmap(matrix=mat)
+            # --- SEARCH PART ---
+            img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+            query_embedding = compute_embedding_from_pil(img)
+            rows = search_similar_in_db(query_embedding, top_k=top_k)
 
-            # Save initial raw render
-            raw_filename = f"{rfq_id}_page_{i+1}_{timestamp}.png"
-            raw_path = OUTPUT_FOLDER / raw_filename
-            pix.save(str(raw_path))
+            search_results = []
+            for r in rows:
+                search_results.append(
+                    {
+                        "id": r["id"],
+                        "image_url": build_image_url(r["image_path"]),
+                        "matiere_id": r["matiere_id"],
+                        "material_name": r["nom_matiere"],
+                        "reference": r["reference"],
+                        "similarity": float(r["similarity"]) if r["similarity"] is not None else None,
+                    }
+                )
 
-            # Correct Orientation (Save as new file)
-            upright_filename = f"{rfq_id}_page_{i+1}_{timestamp}_upright.png"
-            upright_path = OUTPUT_FOLDER / upright_filename
-            angle = save_upright_image(raw_path, upright_path)
+            final_results.append(
+                {
+                    "original_name": original_name,
+                    "filename": unique_filename,
+                    "url": file_url,
+                    "expires_in": "2 hours",
+                    "search_results": search_results
+                }
+            )
 
-            # Cleanup raw immediately
-            raw_path.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"❌ Error processing file_ref: {e}")
+            errors.append(f"{file_ref}: {str(e)}")
 
-            # OCR on the upright image
-            logging.info(f"Running OCR on page {i+1} (angle={angle})...")
-            ocr_text_list = run_paddle_ocr_on_file(upright_path)
+    if not final_results and errors:
+        return jsonify({"success": False, "message": "All operations failed", "errors": errors}), 500
 
-            # Prepare Response URLs
-            view_url = f"{base_url}/images/{upright_filename}"
-            dl_url   = f"{base_url}/download-image/{upright_filename}"
-
-            processed_pages.append({
-                "page": i + 1,
-                "url": view_url,
-                "lien_pour_telecharger_l_image": dl_url,
-                "filename": upright_filename,
-                "rotation_angle": angle,
-                "ocr_text": ocr_text_list
-            })
-
-            if i == 0:
-                download_url_page_1 = dl_url
-
-        doc.close()
-        
-        if not download_url_page_1 and processed_pages:
-            download_url_page_1 = processed_pages[0]["lien_pour_telecharger_l_image"]
-
-        return jsonify({
+    return jsonify(
+        {
             "success": True,
-            "rfq_id": rfq_id,
-            "source_path": rfq_path_db,
-            "total_pages": total_pages,
-            "converted_pages": len(processed_pages),
-            "truncated": total_pages > max_pages,
-            "download_url_page_1_png": download_url_page_1,
-            "images": processed_pages
-        }), 200
+            "message": f"Processed {len(final_results)} files with search results.",
+            "results": final_results,
+            "errors": errors,
+        }
+    ), 200
+
+
+# -----------------------------------------------------------------------------
+# MATERIAL DETAILS
+# -----------------------------------------------------------------------------
+@app.route("/material_details/<int:matiere_id>", methods=["GET"])
+def get_material_details(matiere_id):
+    """
+    Get complete material information by matiere_id.
+    Returns: matieres + fiches_matieres + specifications + expert_notes
+    """
+    conn = None
+    try:
+        conn = get_db_conn()
+
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM public.matieres WHERE matiere_id = %s", (matiere_id,))
+            material = cur.fetchone()
+
+            if not material:
+                return jsonify(
+                    {"success": False, "error": "material_not_found", "message": f"matiere_id {matiere_id} not found"}
+                ), 404
+
+            material = dict(material)
+
+            cur.execute(
+                """
+                SELECT fiche_id, date_creation_fiche, derniere_modification
+                FROM public.fiches_matieres
+                WHERE matiere_id = %s
+                ORDER BY fiche_id DESC
+                """,
+                (matiere_id,),
+            )
+            fiches = [dict(row) for row in cur.fetchall()]
+
+            specifications = []
+            for fiche in fiches:
+                cur.execute(
+                    """
+                    SELECT spec_id, fiche_id, source_type, donnees, date_creation, derniere_modification
+                    FROM public.specifications
+                    WHERE fiche_id = %s
+                    ORDER BY spec_id
+                    """,
+                    (fiche["fiche_id"],),
+                )
+                specifications.extend([dict(row) for row in cur.fetchall()])
+
+            cur.execute(
+                """
+                SELECT men.id, men.matiere_image_id, men.note_json, men.created_at
+                FROM public.matiere_expert_notes men
+                INNER JOIN public.matiere_images mi ON mi.id = men.matiere_image_id
+                WHERE mi.matiere_id = %s
+                ORDER BY men.created_at DESC
+                """,
+                (matiere_id,),
+            )
+            expert_notes = [dict(row) for row in cur.fetchall()]
+
+            response = {
+                "success": True,
+                "material": material,
+                "fiches_matieres": fiches,
+                "specifications": specifications,
+                "expert_notes": expert_notes,
+                "summary": {
+                    "matiere_id": matiere_id,
+                    "nom_matiere": material.get("nom_matiere"),
+                    "reference": material.get("reference"),
+                    "type_matiere": material.get("type_matiere"),
+                    "num_fiches": len(fiches),
+                    "num_specifications": len(specifications),
+                    "num_expert_notes": len(expert_notes),
+                },
+            }
+
+            return jsonify(response), 200
 
     except Exception as e:
-        logging.error(f"RFQ Process Error: {e}", exc_info=True)
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "retrieval_failed", "message": str(e)}), 500
     finally:
         if conn:
-            with contextlib.suppress(Exception):
-                cur.close()
-                conn.close()
-        if local_pdf_path and local_pdf_path.exists():
-            with contextlib.suppress(Exception):
-                os.remove(local_pdf_path)
-@app.route("/process-pdf-to-ocr", methods=["POST"])
-def process_pdf_to_ocr():
-    if not request.is_json:
-        return jsonify({
-            "success": False,
-            "error": "JSON required. Provide 'openaiFileIdRefs', 'download_link' OR 'openai_file_id'"
-        }), 400
+            conn.close()
 
-    data = request.get_json()
+
+# -----------------------------------------------------------------------------
+# FICHE ADN - MATERIAL DNA SHEET
+# -----------------------------------------------------------------------------
+@app.route("/fiche_adn", methods=["GET"])
+def get_fiche_adn():
+    """
+    Get the complete ADN (DNA) specifications sheet for a material.
     
-    # Handle openaiFileIdRefs array (Claude's format)
-    openai_file_id_refs = data.get("openaiFileIdRefs")
-    download_link = data.get("download_link")
-    openai_file_id = data.get("openai_file_id")
-    max_pages = int(data.get("max_pages", 20))
-    original_filename = None
-
-    # Extract from openaiFileIdRefs if present (priority #1)
-    if openai_file_id_refs and isinstance(openai_file_id_refs, list) and len(openai_file_id_refs) > 0:
-        first_ref = openai_file_id_refs[0]
-        download_link = first_ref.get("download_link")
-        original_filename = first_ref.get("name", "uploaded.pdf")
-        logging.info(f"Using openaiFileIdRefs: {original_filename}")
-
-    if not download_link and not openai_file_id:
-        return jsonify({
-            "success": False,
-            "error": "Missing 'openaiFileIdRefs', 'download_link' or 'openai_file_id'"
-        }), 400
-
-    timestamp = int(time.time())
-    local_pdf_path = None
-
-    try:
-        # -----------------------------
-        # 1) Get PDF bytes
-        # -----------------------------
-        pdf_bytes = None
-
-        # A) preferred: direct download link (temp 30 min)
-        if download_link:
-            logging.info(f"Downloading from link: {download_link[:100]}...")
-            r = requests.get(download_link, stream=True, timeout=60)
-            if r.status_code != 200:
-                return jsonify({
-                    "success": False,
-                    "error": f"Download link failed (status={r.status_code}). Maybe expired?"
-                }), 400
-            pdf_bytes = r.content
-
-            # Use original_filename if already set from openaiFileIdRefs
-            if not original_filename:
-                # Try to infer filename from URL path
-                try:
-                    p = urllib.parse.urlparse(download_link).path
-                    original_filename = Path(p).name or "uploaded.pdf"
-                except Exception:
-                    original_filename = "uploaded.pdf"
-
-        # B) fallback: OpenAI Files API
-        if pdf_bytes is None and openai_file_id:
-            logging.info(f"Using OpenAI file ID: {openai_file_id}")
-            file_metadata = client.files.retrieve(openai_file_id)
-            original_filename = getattr(file_metadata, "filename", None) or "uploaded.pdf"
-            pdf_bytes = client.files.content(openai_file_id).read()
-
-        if pdf_bytes is None:
-            return jsonify({"success": False, "error": "Unable to retrieve PDF bytes"}), 400
-
-        # -----------------------------
-        # 2) Save locally (temp 30 min)
-        # -----------------------------
-        safe_name = secure_filename(original_filename or "uploaded.pdf") or "uploaded.pdf"
-        if not safe_name.lower().endswith(".pdf"):
-            safe_name += ".pdf"
-
-        material_name = extract_material_name_from_filename(safe_name)
-
-        unique_pdf_name = f"{uuid.uuid4().hex}_{timestamp}_{safe_name}"
-        local_pdf_path = TEMP_PDF_FOLDER / unique_pdf_name
-
-        with open(local_pdf_path, "wb") as f:
-            f.write(pdf_bytes)
-
-        logging.info(f"PDF saved to: {local_pdf_path}")
-
-        # -----------------------------
-        # 3) OCR
-        # -----------------------------
-        cleanup_old_files(OUTPUT_FOLDER)
-        doc = fitz.open(local_pdf_path)
-        total_pages = len(doc)
-        mat = fitz.Matrix(2.0, 2.0)
-
-        processed_pages = []
-        for i, page in enumerate(doc):
-            if i >= max_pages:
-                break
-
-            pix = page.get_pixmap(matrix=mat)
-
-            raw_filename = f"oa_raw_{i+1}_{timestamp}.png"
-            raw_path = OUTPUT_FOLDER / raw_filename
-            pix.save(str(raw_path))
-
-            upright_filename = f"oa_upright_{i+1}_{timestamp}.png"
-            upright_path = OUTPUT_FOLDER / upright_filename
-            angle = save_upright_image(raw_path, upright_path)
-            raw_path.unlink(missing_ok=True)
-
-            ocr_text_list = run_paddle_ocr_on_file(upright_path)
-
-            processed_pages.append({
-                "page": i + 1,
-                "rotation_angle": angle,
-                "ocr_text": ocr_text_list
-            })
-
-        doc.close()
-
-        # Detect if this is an MSDS file and extract reference
-        reference = None
-        if original_filename and ('SDS' in original_filename.upper() or 'MSDS' in original_filename.upper()):
-            reference = extract_reference_from_msds_filename(original_filename)
-            logging.info(f"Detected MSDS file. Extracted reference: {reference}")
-
-        return jsonify({
-            "success": True,
-            "openai_file_id": openai_file_id,
-            "download_link_used": bool(download_link),
-            "material_name": material_name,
-            "reference": reference,  # NEW: Include extracted reference for MSDS
-            "total_pages": total_pages,
-            "converted_pages": len(processed_pages),
-            "truncated": total_pages > max_pages,
-            "pages": processed_pages
-        }), 200
-
-    except Exception as e:
-        logging.error(f"PDF Process Error: {e}", exc_info=True)
-        return jsonify({"success": False, "error": str(e)}), 500
-
-    finally:
-        # Temp PDF will be cleaned by background thread after 30 min
-        pass
-
-
-
-
-
-@app.route("/save-ocr-result", methods=["POST"])
-def save_ocr_result():
-    if not request.is_json:
-        return jsonify({
-            "success": False,
-            "error": "JSON required"
-        }), 400
-
-    data = request.get_json(silent=True) or {}
-
-    # --- Required fields ---
-    material_name = data.get("material_name")
-    specifications = data.get("specifications")  # 🔥 AI structured JSON
-    source = data.get("source_type", "datasheet")
-    reference = data.get("reference")
-    type_matiere = data.get("type_matiere") or material_name
-
-    # --- Validation ---
-    if not material_name:
-        return jsonify({
-            "success": False,
-            "error": "Missing material_name"
-        }), 400
-
-    if not specifications:
-        return jsonify({
-            "success": False,
-            "error": "Missing specifications JSON"
-        }), 400
-
-    try:
-        matiere_id, fiche_id = save_material_and_fiche(
-            material_name=material_name,
-            type_matiere=type_matiere,
-            specs_json=specifications,   # ✅ Direct AI JSON
-            source=source,
-            reference=reference
-        )
-
-        return jsonify({
-            "success": True,
-            "matiere_id": matiere_id,
-            "fiche_id": fiche_id,
-            "source": source,
-            "reference": reference
-        }), 200
-
-    except ValueError as ve:
-        # Handle specific business logic errors (e.g., material not found)
-        logging.error(f"Validation error: {ve}")
-        return jsonify({
-            "success": False,
-            "error": str(ve)
-        }), 400
-    except Exception as e:
-        logging.error(f"Save OCR Result Error: {e}", exc_info=True)
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-
-@app.route("/specifications-by-reference", methods=["GET"])
-def get_specifications_by_reference():
-    reference = request.args.get("reference")
+    Query Parameters:
+        - reference (str): Material reference (e.g., "6600135")
+    
+    Returns: Complete JSON specifications aggregating all fiches, specs, and expert notes
+    """
+    reference = request.args.get("reference", "").strip()
+    
     if not reference:
         return jsonify({
-            "success": False,
-            "error": "Missing reference"
+            "success": False, 
+            "error": "missing_parameters",
+            "message": "The 'reference' query parameter is required"
         }), 400
-
-    conn = psycopg2.connect(DB_DSN)
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT s.spec_id, s.fiche_id, s.source_type, s.donnees
-                    FROM public.matieres m
-                    JOIN public.fiches_matieres f ON f.matiere_id = m.matiere_id
-                    JOIN public.specifications s ON s.fiche_id = f.fiche_id
-                    WHERE m.reference = %s
-                    ORDER BY s.spec_id ASC
-                    """,
-                    (reference,)
-                )
-                rows = cur.fetchall()
-
-        specs = [
-            {
-                "spec_id": r[0],
-                "fiche_id": r[1],
-                "source_type": r[2],
-                "donnees": r[3]
-            }
-            for r in rows
-        ]
-
-        return jsonify({
-            "success": True,
-            "reference": reference,
-            "specifications": specs
-        }), 200
-
-    except Exception as e:
-        logging.error(f"Get specifications by reference error: {e}", exc_info=True)
-        return jsonify({"success": False, "error": str(e)}), 500
-    finally:
-        conn.close()
-
-
-@app.route("/update-specification-by-reference", methods=["PUT"])
-def update_specification_by_reference():
-    if not request.is_json:
-        return jsonify({
-            "success": False,
-            "error": "JSON required"
-        }), 400
-
-    data = request.get_json(silent=True) or {}
-    reference = data.get("reference")
-    spec_id = data.get("spec_id")
-    donnees = data.get("donnees")
-
-    if not spec_id:
-        return jsonify({"success": False, "error": "Missing spec_id"}), 400
-    if donnees is None:
-        return jsonify({"success": False, "error": "Missing donnees"}), 400
-
-    conn = psycopg2.connect(DB_DSN)
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                if reference:
-                    cur.execute(
-                        """
-                        SELECT m.matiere_id, f.fiche_id, s.spec_id
-                        FROM public.matieres m
-                        JOIN public.fiches_matieres f ON f.matiere_id = m.matiere_id
-                        JOIN public.specifications s ON s.fiche_id = f.fiche_id
-                        WHERE m.reference = %s AND s.spec_id = %s
-                        LIMIT 1
-                        """,
-                        (reference, spec_id)
-                    )
-                else:
-                    cur.execute(
-                        """
-                        SELECT f.matiere_id, s.fiche_id, s.spec_id
-                        FROM public.specifications s
-                        JOIN public.fiches_matieres f ON f.fiche_id = s.fiche_id
-                        WHERE s.spec_id = %s
-                        LIMIT 1
-                        """,
-                        (spec_id,)
-                    )
-                row = cur.fetchone()
-                if not row:
-                    return jsonify({
-                        "success": False,
-                        "error": "Specification not found for spec_id"
-                    }), 404
-
-                matiere_id, fiche_id, spec_id = row
-                cur.execute(
-                    """
-                    UPDATE public.specifications
-                    SET donnees = %s,
-                        derniere_modification = NOW()
-                    WHERE spec_id = %s
-                    """,
-                    (Json(donnees), spec_id)
-                )
-
-        return jsonify({
-            "success": True,
-            "matiere_id": matiere_id,
-            "fiche_id": fiche_id,
-            "spec_id": spec_id,
-            "reference": reference
-        }), 200
-
-    except Exception as e:
-        logging.error(f"Update specification by reference error: {e}", exc_info=True)
-        return jsonify({"success": False, "error": str(e)}), 500
-    finally:
-        conn.close()
-
-
-def save_material_and_fiche(material_name: str, type_matiere: str, specs_json: dict, source: str, reference: str = None):
-    """
-    Sauvegarde la matière, crée la fiche technique, 
-    puis insère les données dans la table specifications.
     
-    If reference is provided (MSDS case), searches for existing material by reference.
-    Otherwise, searches by material_name (datasheet case).
-    """
-    conn = psycopg2.connect(DB_DSN)
+    conn = None
     try:
-        with conn:
-            with conn.cursor() as cur:
-                matiere_id = None
-                
-                # NEW: Priority search by reference if provided (for MSDS)
-                if reference:
-                    logging.info(f"Searching for material by reference: {reference}")
-                    cur.execute(
-                        "SELECT matiere_id, nom_matiere FROM public.matieres WHERE reference = %s", 
-                        (reference,)
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        matiere_id = row[0]
-                        existing_name = row[1]
-                        logging.info(f"Found existing material '{existing_name}' (ID: {matiere_id}) with reference {reference}")
-                        # ✅ Material exists - DO NOT update, just use existing matiere_id
-                    else:
-                        # For MSDS, material MUST exist
-                        raise ValueError(
-                            f"Material with reference '{reference}' not found in database. "
-                            f"MSDS can only be added to existing materials. Please ensure the material "
-                            f"datasheet has been processed first."
-                        )
-                
-                # Fallback: Search by material_name (datasheet behavior - only if reference not found)
-                if not matiere_id:
-                    logging.info(f"Searching for material by name: {material_name}")
-                    cur.execute(
-                        "SELECT matiere_id FROM public.matieres WHERE nom_matiere = %s",
-                        (material_name,)
-                    )
-                    row = cur.fetchone()
-
-                    if row:
-                        matiere_id = row[0]
-                        logging.info(f"Found existing material by name (ID: {matiere_id})")
-                        # Only update if we have new information to add (reference or type)
-                        if reference or type_matiere:
-                            cur.execute(
-                                """UPDATE public.matieres 
-                                   SET type_matiere = COALESCE(%s, type_matiere),
-                                       reference = COALESCE(%s, reference),
-                                       date_mise_a_jour = NOW()
-                                   WHERE matiere_id = %s""",
-                                (type_matiere, reference, matiere_id)
-                            )
-                            logging.info(f"Updated material {matiere_id} with new info")
-                    else:
-                        # Create NEW material (datasheet case only)
-                        logging.info(f"Creating new material: {material_name}")
-                        cur.execute(
-                            """INSERT INTO public.matieres 
-                               (nom_matiere, type_matiere, reference, date_creation, date_mise_a_jour)
-                               VALUES (%s, %s, %s, NOW(), NOW())
-                               RETURNING matiere_id""",
-                            (material_name, type_matiere, reference)
-                        )
-                        matiere_id = cur.fetchone()[0]
-                        logging.info(f"Created new material with ID: {matiere_id}")
-
-                # 2. Create NEW fiche for the material (supports multiple fiches per material)
-                logging.info(f"Creating new fiche for material {matiere_id} with source_type='{source}'")
-                cur.execute(
-                    """INSERT INTO public.fiches_matieres 
-                       (matiere_id, date_creation_fiche, derniere_modification)
-                       VALUES (%s, NOW(), NOW())
-                       RETURNING fiche_id""",
-                    (matiere_id,)
-                )
-                fiche_id = cur.fetchone()[0]
-                logging.info(f"Created fiche with ID: {fiche_id}")
-
-                # 3. Insert specifications data
-                cur.execute(
-                    """INSERT INTO public.specifications 
-                       (fiche_id, source_type, donnees, date_creation, derniere_modification)
-                       VALUES (%s, %s, %s, NOW(), NOW())""",
-                    (fiche_id, source, Json(specs_json))
-                )
-                logging.info(f"Inserted specifications for fiche {fiche_id}")
-
-        return matiere_id, fiche_id
+        conn = get_db_conn()
+        
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Query the fiches_ADN_matieres table
+            cur.execute("""
+                SELECT 
+                    fiche_adn_id,
+                    matiere_id,
+                    nom_matiere,
+                    reference,
+                    type_matiere,
+                    specifications,
+                    num_specifications,
+                    date_creation,
+                    derniere_modification
+                FROM public.fiches_ADN_matieres
+                WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
+                LIMIT 1
+            """, (reference,))
+            
+            result = cur.fetchone()
+            
+            if not result:
+                return jsonify({
+                    "success": False,
+                    "error": "fiche_adn_not_found",
+                    "message": f"No fiche ADN found for reference: {reference}"
+                }), 404
+            
+            result_dict = dict(result)
+            
+            return jsonify({
+                "success": True,
+                "fiche_adn": {
+                    "fiche_adn_id": result_dict["fiche_adn_id"],
+                    "matiere_id": result_dict["matiere_id"],
+                    "nom_matiere": result_dict["nom_matiere"],
+                    "reference": result_dict["reference"],
+                    "type_matiere": result_dict["type_matiere"],
+                    "num_specifications": result_dict["num_specifications"],
+                    "date_creation": result_dict["date_creation"],
+                    "derniere_modification": result_dict["derniere_modification"],
+                    "specifications": result_dict["specifications"]  # Complete JSON blob
+                }
+            }), 200
+    
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": "retrieval_failed",
+            "message": str(e)
+        }), 500
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
+# Alternative endpoint: Get by matiere_id only (faster)
+@app.route("/fiche_adn/<int:matiere_id>", methods=["GET"])
+def get_fiche_adn_by_id(matiere_id):
+    """
+    Get the complete ADN specifications sheet for a material by matiere_id.
+    
+    Path Parameter:
+        - matiere_id (int): The material ID
+    
+    Returns: Complete JSON specifications aggregating all fiches, specs, and expert notes
+    """
+    conn = None
+    try:
+        conn = get_db_conn()
+        
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT 
+                    fiche_adn_id,
+                    matiere_id,
+                    nom_matiere,
+                    reference,
+                    type_matiere,
+                    specifications,
+                    num_specifications,
+                    date_creation,
+                    derniere_modification
+                FROM public.fiches_ADN_matieres
+                WHERE matiere_id = %s
+                LIMIT 1
+            """, (matiere_id,))
+            
+            result = cur.fetchone()
+            
+            if not result:
+                return jsonify({
+                    "success": False,
+                    "error": "fiche_adn_not_found",
+                    "message": f"No fiche ADN found for matiere_id: {matiere_id}"
+                }), 404
+            
+            result_dict = dict(result)
+            
+            return jsonify({
+                "success": True,
+                "fiche_adn": {
+                    "fiche_adn_id": result_dict["fiche_adn_id"],
+                    "matiere_id": result_dict["matiere_id"],
+                    "nom_matiere": result_dict["nom_matiere"],
+                    "reference": result_dict["reference"],
+                    "type_matiere": result_dict["type_matiere"],
+                    "num_specifications": result_dict["num_specifications"],
+                    "date_creation": result_dict["date_creation"],
+                    "derniere_modification": result_dict["derniere_modification"],
+                    "specifications": result_dict["specifications"]  # Complete JSON blob
+                }
+            }), 200
+    
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": "retrieval_failed",
+            "message": str(e)
+        }), 500
+    finally:
+        if conn:
+            conn.close()
 
 
+# SEARCH (KEEPING FOR BACKWARD COMPATIBILITY)
+# -----------------------------------------------------------------------------
+@app.route("/search", methods=["POST"])
+def search():
+    """
+    Search similar micrographs (pgvector).
+    Accepts ONE of:
+      - download_link (recommended: robust for autoscaling)
+      - temp_filename (fallback: local file)
+      - file_id (fallback: OpenAI Files API)
+    """
+    data = request.get_json(silent=True) or {}
+    if not data:
+        return jsonify({"success": False, "error": "missing_json_body", "message": "Missing JSON body"}), 400
 
+    top_k = int(data.get("top_k", 5))
+    if top_k < 1 or top_k > 50:
+        return jsonify({"success": False, "error": "invalid_top_k", "message": "top_k must be 1..50"}), 400
+
+    temp_filename = data.get("temp_filename")
+    file_id = data.get("file_id")
+    download_link = data.get("download_link")
+
+    provided = [bool(download_link), bool(temp_filename), bool(file_id)]
+    if sum(provided) != 1:
+        return jsonify(
+            {
+                "success": False,
+                "error": "invalid_input",
+                "message": "Provide exactly ONE of: download_link, temp_filename, file_id",
+            }
+        ), 400
+
+    img = None
+
+    # 1) download_link (BEST)
+    if download_link:
+        try:
+            r = requests.get(download_link, timeout=20)
+            r.raise_for_status()
+            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        except Exception as e:
+            return jsonify({"success": False, "error": "download_link_failed", "message": str(e)}), 400
+
+    # 2) temp_filename (fallback)
+    elif temp_filename:
+        file_path = TEMP_UPLOAD_DIR / temp_filename
+        if not file_path.exists():
+            return jsonify(
+                {
+                    "success": False,
+                    "error": "temp_file_not_found",
+                    "message": f"{temp_filename} not found (likely autoscaling issue). Use download_link instead.",
+                }
+            ), 404
+        try:
+            img = Image.open(file_path).convert("RGB")
+        except Exception as e:
+            return jsonify({"success": False, "error": "invalid_image", "message": str(e)}), 400
+
+    # 3) file_id (fallback)
+    elif file_id:
+        try:
+            file_content = client.files.content(file_id).read()
+            img = Image.open(io.BytesIO(file_content)).convert("RGB")
+        except Exception as e:
+            return jsonify({"success": False, "error": "openai_retrieval_failed", "message": str(e)}), 400
+
+    try:
+        query_embedding = compute_embedding_from_pil(img)
+        rows = search_similar_in_db(query_embedding, top_k=top_k)
+
+        results = []
+        for r in rows:
+            results.append(
+                {
+                    "id": r["id"],
+                    "image_url": build_image_url(r["image_path"]),
+                    "matiere_id": r["matiere_id"],
+                    "material_name": r["nom_matiere"],
+                    "reference": r["reference"],
+                    "similarity": float(r["similarity"]) if r["similarity"] is not None else None,
+                }
+            )
+
+        return jsonify({"success": True, "results": results}), 200
+
+    except Exception as e:
+        return jsonify({"success": False, "error": "search_failed", "message": str(e)}), 500
+
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    logging.info("Starting RFQ Processing API on port 5000")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "5000")))
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    app.run(host=args.host, port=args.port, debug=args.debug)
