@@ -18,25 +18,31 @@ from PIL import Image
 from transformers import AutoModel, AutoImageProcessor
 from werkzeug.utils import secure_filename
 
-import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from pgvector.psycopg2 import register_vector
 from pgvector import Vector
 
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
 DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Micrographie_IA"
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # APP
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # PATHS
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 BASE_DIR = Path(__file__).resolve().parent
 
 OUTPUT_BASE_DIR = BASE_DIR / "embeddings_v7"
@@ -48,23 +54,22 @@ IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # OPENAI CLIENT
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 client = OpenAI()
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # DINOv2 (lazy load)
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DINO_MODEL_NAME = "facebook/dinov2-large"
 
-    DINO_MODEL: Optional[AutoModel] = None
-    DINO_PROCESSOR: Optional[AutoImageProcessor] = None
-    # NOTE: In a multi-worker deployment (e.g., Gunicorn), each worker will load its own copy of DINOv2.
-    # This can lead to high memory consumption. Consider a separate microservice for embeddings
-    # or managing worker processes carefully if memory becomes an issue.
+DINO_MODEL: Optional[AutoModel] = None
+DINO_PROCESSOR: Optional[AutoImageProcessor] = None
 
 
 def ensure_dino_loaded():
@@ -93,9 +98,10 @@ def compute_embedding_from_pil(image: Image.Image) -> np.ndarray:
     return embedding.astype("float32")
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # TEMP UPLOAD VALIDATION
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
 
 
@@ -114,9 +120,10 @@ def guess_extension_from_mime(mime_type: Optional[str]) -> Optional[str]:
     return None
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # BACKGROUND CLEANUP TASK
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 def cleanup_old_files(interval: int = 1800, max_age_seconds: int = 2 * 3600):
     """Deletes files in temp_uploads/ older than max_age_seconds."""
     while True:
@@ -140,14 +147,12 @@ def cleanup_old_files(interval: int = 1800, max_age_seconds: int = 2 * 3600):
 
 cleanup_thread = Thread(target=cleanup_old_files, daemon=True)
 cleanup_thread.start()
-# NOTE: In a multi-worker deployment, each worker will start its own cleanup thread.
-# This is generally harmless but redundant. For a more robust solution in production,
-# consider a single, external cron job or a dedicated cleanup service.
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # DB HELPERS
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 def get_db_conn():
     conn = psycopg2.connect(DB_DSN)
     register_vector(conn)
@@ -198,9 +203,10 @@ def build_image_url(image_path: str) -> str:
     return url
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # ROOT / HEALTH
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 @app.route("/", methods=["GET"])
 def root():
     return jsonify(
@@ -219,9 +225,10 @@ def health():
     return jsonify({"status": "ok", "dino_loaded": DINO_MODEL is not None}), 200
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # FILE SERVING
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 @app.route("/images/<path:filename>", methods=["GET"])
 def serve_image(filename):
     """Serve images from embeddings_v7/images"""
@@ -240,9 +247,10 @@ def serve_temp_file(filename):
         return jsonify({"error": "temp_file_not_found"}), 404
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # UPLOAD AND SEARCH (MERGED)
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 @app.route("/upload_and_search", methods=["POST"])
 def upload_and_search():
     """
@@ -253,6 +261,7 @@ def upload_and_search():
     4) Returns both the local file info and the search results.
     """
     data = request.get_json(silent=True) or {}
+
     refs = data.get("openaiFileIdRefs")
     top_k = int(data.get("top_k", 5))
 
@@ -266,7 +275,9 @@ def upload_and_search():
         ), 400
 
     if top_k < 1 or top_k > 50:
-        return jsonify({"success": False, "error": "invalid_top_k", "message": "top_k must be 1..50"}), 400
+        return jsonify(
+            {"success": False, "error": "invalid_top_k", "message": "top_k must be 1..50"}
+        ), 400
 
     final_results = []
     errors = []
@@ -346,7 +357,7 @@ def upload_and_search():
                     "filename": unique_filename,
                     "url": file_url,
                     "expires_in": "2 hours",
-                    "search_results": search_results
+                    "search_results": search_results,
                 }
             )
 
@@ -367,9 +378,10 @@ def upload_and_search():
     ), 200
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # MATERIAL DETAILS
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 @app.route("/material_details/<int:matiere_id>", methods=["GET"])
 def get_material_details(matiere_id):
     """
@@ -453,36 +465,39 @@ def get_material_details(matiere_id):
             conn.close()
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # FICHE ADN - MATERIAL DNA SHEET
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 @app.route("/fiche_adn", methods=["GET"])
 def get_fiche_adn():
     """
     Get the complete ADN (DNA) specifications sheet for a material.
-    
+
     Query Parameters:
         - reference (str): Material reference (e.g., "6600135")
-    
+
     Returns: Complete JSON specifications aggregating all fiches, specs, and expert notes
     """
     reference = request.args.get("reference", "").strip()
-    
+
     if not reference:
-        return jsonify({
-            "success": False, 
-            "error": "missing_parameters",
-            "message": "The 'reference' query parameter is required"
-        }), 400
-    
+        return jsonify(
+            {
+                "success": False,
+                "error": "missing_parameters",
+                "message": "The 'reference' query parameter is required",
+            }
+        ), 400
+
     conn = None
     try:
         conn = get_db_conn()
-        
+
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Query the fiches_ADN_matieres table
-            cur.execute("""
-                SELECT 
+            cur.execute(
+                """
+                SELECT
                     fiche_adn_id,
                     matiere_id,
                     nom_matiere,
@@ -495,63 +510,69 @@ def get_fiche_adn():
                 FROM public.fiches_ADN_matieres
                 WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
                 LIMIT 1
-            """, (reference,))
-            
+                """,
+                (reference,),
+            )
+
             result = cur.fetchone()
-            
+
             if not result:
-                return jsonify({
-                    "success": False,
-                    "error": "fiche_adn_not_found",
-                    "message": f"No fiche ADN found for reference: {reference}"
-                }), 404
-            
+                return jsonify(
+                    {
+                        "success": False,
+                        "error": "fiche_adn_not_found",
+                        "message": f"No fiche ADN found for reference: {reference}",
+                    }
+                ), 404
+
             result_dict = dict(result)
-            
-            return jsonify({
-                "success": True,
-                "fiche_adn": {
-                    "fiche_adn_id": result_dict["fiche_adn_id"],
-                    "matiere_id": result_dict["matiere_id"],
-                    "nom_matiere": result_dict["nom_matiere"],
-                    "reference": result_dict["reference"],
-                    "type_matiere": result_dict["type_matiere"],
-                    "num_specifications": result_dict["num_specifications"],
-                    "date_creation": result_dict["date_creation"],
-                    "derniere_modification": result_dict["derniere_modification"],
-                    "specifications": result_dict["specifications"]  # Complete JSON blob
+
+            return jsonify(
+                {
+                    "success": True,
+                    "fiche_adn": {
+                        "fiche_adn_id": result_dict["fiche_adn_id"],
+                        "matiere_id": result_dict["matiere_id"],
+                        "nom_matiere": result_dict["nom_matiere"],
+                        "reference": result_dict["reference"],
+                        "type_matiere": result_dict["type_matiere"],
+                        "num_specifications": result_dict["num_specifications"],
+                        "date_creation": result_dict["date_creation"],
+                        "derniere_modification": result_dict["derniere_modification"],
+                        "specifications": result_dict["specifications"],
+                    },
                 }
-            }), 200
-    
+            ), 200
+
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": "retrieval_failed",
-            "message": str(e)
-        }), 500
+        return jsonify({"success": False, "error": "retrieval_failed", "message": str(e)}), 500
     finally:
         if conn:
             conn.close()
 
 
-# Alternative endpoint: Get by matiere_id only (faster)
+# =============================================================================
+# FICHE ADN - GET BY ID
+# =============================================================================
+
 @app.route("/fiche_adn/<int:matiere_id>", methods=["GET"])
 def get_fiche_adn_by_id(matiere_id):
     """
     Get the complete ADN specifications sheet for a material by matiere_id.
-    
+
     Path Parameter:
         - matiere_id (int): The material ID
-    
+
     Returns: Complete JSON specifications aggregating all fiches, specs, and expert notes
     """
     conn = None
     try:
         conn = get_db_conn()
-        
+
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT 
+            cur.execute(
+                """
+                SELECT
                     fiche_adn_id,
                     matiere_id,
                     nom_matiere,
@@ -564,47 +585,51 @@ def get_fiche_adn_by_id(matiere_id):
                 FROM public.fiches_ADN_matieres
                 WHERE matiere_id = %s
                 LIMIT 1
-            """, (matiere_id,))
-            
+                """,
+                (matiere_id,),
+            )
+
             result = cur.fetchone()
-            
+
             if not result:
-                return jsonify({
-                    "success": False,
-                    "error": "fiche_adn_not_found",
-                    "message": f"No fiche ADN found for matiere_id: {matiere_id}"
-                }), 404
-            
+                return jsonify(
+                    {
+                        "success": False,
+                        "error": "fiche_adn_not_found",
+                        "message": f"No fiche ADN found for matiere_id: {matiere_id}",
+                    }
+                ), 404
+
             result_dict = dict(result)
-            
-            return jsonify({
-                "success": True,
-                "fiche_adn": {
-                    "fiche_adn_id": result_dict["fiche_adn_id"],
-                    "matiere_id": result_dict["matiere_id"],
-                    "nom_matiere": result_dict["nom_matiere"],
-                    "reference": result_dict["reference"],
-                    "type_matiere": result_dict["type_matiere"],
-                    "num_specifications": result_dict["num_specifications"],
-                    "date_creation": result_dict["date_creation"],
-                    "derniere_modification": result_dict["derniere_modification"],
-                    "specifications": result_dict["specifications"]  # Complete JSON blob
+
+            return jsonify(
+                {
+                    "success": True,
+                    "fiche_adn": {
+                        "fiche_adn_id": result_dict["fiche_adn_id"],
+                        "matiere_id": result_dict["matiere_id"],
+                        "nom_matiere": result_dict["nom_matiere"],
+                        "reference": result_dict["reference"],
+                        "type_matiere": result_dict["type_matiere"],
+                        "num_specifications": result_dict["num_specifications"],
+                        "date_creation": result_dict["date_creation"],
+                        "derniere_modification": result_dict["derniere_modification"],
+                        "specifications": result_dict["specifications"],
+                    },
                 }
-            }), 200
-    
+            ), 200
+
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": "retrieval_failed",
-            "message": str(e)
-        }), 500
+        return jsonify({"success": False, "error": "retrieval_failed", "message": str(e)}), 500
     finally:
         if conn:
             conn.close()
 
 
-# SEARCH (KEEPING FOR BACKWARD COMPATIBILITY)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# SEARCH (BACKWARD COMPATIBILITY)
+# =============================================================================
+
 @app.route("/search", methods=["POST"])
 def search():
     """
@@ -694,205 +719,10 @@ def search():
         return jsonify({"success": False, "error": "search_failed", "message": str(e)}), 500
 
 
-# -------------------------------------------------------
-# APPLICATIONS ANALYSIS (SAVE & RETRIEVE)
-# -------------------------------------------------------
-@app.route("/save_applications_analysis/<int:matiere_id>", methods=["POST"])
-def save_applications_analysis(matiere_id):
-    """
-    Save applications analysis JSON generated by ChatGPT/AI.
-    
-    Path Parameter:
-        - matiere_id (int): The material ID
-    
-    Request Body (JSON):
-        - analysis_data: Dict with applications, processes, market opportunities
-        - fiche_adn_id: Optional, fiche ADN source
-    
-    Returns: Saved fiche_app_id
-    """
-    conn = None
-    try:
-        data = request.get_json(silent=True) or {}
-        analysis_data = data.get("analysis_data")
-        fiche_adn_id = data.get("fiche_adn_id")
-        
-        if not analysis_data:
-            return jsonify({
-                "success": False,
-                "error": "missing_analysis_data",
-                "message": "analysis_data (JSON) is required in POST body"
-            }), 400
-        
-        # Validate JSON structure
-        if not isinstance(analysis_data, dict):
-            return jsonify({
-                "success": False,
-                "error": "invalid_json",
-                "message": "analysis_data must be a JSON object"
-            }), 400
-        
-        conn = get_db_conn()
-        
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Get material info
-            cur.execute("""
-                SELECT matiere_id, nom_matiere, reference, type_matiere
-                FROM public.matieres
-                WHERE matiere_id = %s
-            """, (matiere_id,))
-            material = cur.fetchone()
-            
-            if not material:
-                return jsonify({
-                    "success": False,
-                    "error": "material_not_found",
-                    "message": f"Material {matiere_id} not found"
-                }), 404
-            
-            # If fiche_adn_id not provided, get the latest one
-            if not fiche_adn_id:
-                cur.execute("""
-                    SELECT fiche_adn_id
-                    FROM public.fiches_adn_matieres
-                    WHERE matiere_id = %s
-                    ORDER BY date_creation DESC
-                    LIMIT 1
-                """, (matiere_id,))
-                fiche_result = cur.fetchone()
-                if fiche_result:
-                    fiche_adn_id = fiche_result["fiche_adn_id"]
-            
-            # Count applications in analysis_data
-            num_apps = len(analysis_data.get("applications", []))
-            
-            # Insert or update
-            cur.execute("""
-                INSERT INTO public.fiches_applications_matieres
-                (matiere_id, fiche_adn_id, nom_matiere, reference, type_matiere,
-                 analysis_data, num_applications, date_creation, derniere_modification)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                ON CONFLICT (matiere_id)
-                DO UPDATE SET
-                    analysis_data = EXCLUDED.analysis_data,
-                    num_applications = EXCLUDED.num_applications,
-                    fiche_adn_id = COALESCE(EXCLUDED.fiche_adn_id, fiches_applications_matieres.fiche_adn_id),
-                    derniere_modification = CURRENT_TIMESTAMP
-                RETURNING fiche_app_id;
-            """, (
-                matiere_id,
-                fiche_adn_id,
-                material["nom_matiere"],
-                material["reference"],
-                material["type_matiere"],
-                json.dumps(analysis_data, ensure_ascii=False),
-                num_apps
-            ))
-            
-            result = cur.fetchone()
-            fiche_app_id = result["fiche_app_id"] if result else None
-            
-            conn.commit()
-            
-            return jsonify({
-                "success": True,
-                "message": "Applications analysis saved successfully",
-                "fiche_app_id": fiche_app_id,
-                "matiere_id": matiere_id,
-                "num_applications": num_apps
-            }), 201
-    
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        print(f"❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": "save_failed",
-            "message": str(e)
-        }), 500
-    finally:
-        if conn:
-            conn.close()
-
-
-@app.route("/get_applications_analysis/<int:matiere_id>", methods=["GET"])
-def get_applications_analysis(matiere_id):
-    """
-    Retrieve saved applications analysis for a material.
-    
-    Path Parameter:
-        - matiere_id (int): The material ID
-    
-    Returns: Stored analysis_data from fiches_applications_matieres
-    """
-    conn = None
-    try:
-        conn = get_db_conn()
-        
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT
-                    fiche_app_id,
-                    matiere_id,
-                    fiche_adn_id,
-                    nom_matiere,
-                    reference,
-                    type_matiere,
-                    analysis_data,
-                    num_applications,
-                    date_creation,
-                    derniere_modification
-                FROM public.fiches_applications_matieres
-                WHERE matiere_id = %s
-            """, (matiere_id,))
-            
-            result = cur.fetchone()
-            
-            if not result:
-                return jsonify({
-                    "success": False,
-                    "error": "analysis_not_found",
-                    "message": f"No applications analysis found for matiere_id {matiere_id}"
-                }), 404
-            
-            return jsonify({
-                "success": True,
-                "fiche_app": {
-                    "fiche_app_id": result["fiche_app_id"],
-                    "matiere_id": result["matiere_id"],
-                    "fiche_adn_id": result["fiche_adn_id"],
-                    "nom_matiere": result["nom_matiere"],
-                    "reference": result["reference"],
-                    "type_matiere": result["type_matiere"],
-                    "num_applications": result["num_applications"],
-                    "date_creation": result["date_creation"],
-                    "derniere_modification": result["derniere_modification"],
-                    "analysis_data": result["analysis_data"]
-                }
-            }), 200
-    
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": "retrieval_failed",
-            "message": str(e)
-        }), 500
-    finally:
-        if conn:
-            conn.close()
-
-
-
-
-
+# =============================================================================
 # MAIN
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="0.0.0.0")
