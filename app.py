@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import time
 import uuid
@@ -315,25 +316,16 @@ def upload_and_search():
             filename_safe = secure_filename(original_name or "uploaded_file") or "uploaded_file"
 
             if "." not in filename_safe:
-                ext = guess_extension_from_mime(mime_type) or ".png"
+                ext = guess_extension_from_mime(mime_type) or ".jpg"
                 filename_safe += ext
 
-            if not allowed_file(filename_safe):
-                errors.append(f"{original_name}: File type not allowed (png/jpg/jpeg only).")
-                continue
+            unique_name = f"{uuid.uuid4().hex}_{filename_safe}"
+            save_path = TEMP_UPLOAD_DIR / unique_name
 
-            # Save to temp
-            unique_filename = f"{uuid.uuid4().hex}_{int(time.time())}_{filename_safe}"
-            file_path = TEMP_UPLOAD_DIR / unique_filename
-            with open(file_path, "wb") as f:
+            with open(save_path, "wb") as f:
                 f.write(file_bytes)
 
-            # Generate local URL
-            file_url = f"{request.host_url.rstrip('/')}/temp_files/{unique_filename}"
-            if file_url.startswith("http://"):
-                file_url = "https://" + file_url[len("http://"):]
-
-            # --- SEARCH PART ---
+            # 3) Search
             img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
             query_embedding = compute_embedding_from_pil(img)
             rows = search_similar_in_db(query_embedding, top_k=top_k)
@@ -351,114 +343,183 @@ def upload_and_search():
                     }
                 )
 
+            # 4) Build local URL
+            local_url = f"{request.host_url.rstrip('/')}/temp_files/{unique_name}"
+            if local_url.startswith("http://"):
+                local_url = "https://" + local_url[len("http://"):]
+
             final_results.append(
                 {
+                    "file_id": file_id,
                     "original_name": original_name,
-                    "filename": unique_filename,
-                    "url": file_url,
-                    "expires_in": "2 hours",
+                    "temp_filename": unique_name,
+                    "temp_file_url": local_url,
                     "search_results": search_results,
                 }
             )
 
         except Exception as e:
-            print(f"❌ Error processing file_ref: {e}")
-            errors.append(f"{file_ref}: {str(e)}")
+            errors.append(f"Error processing {file_ref.get('id', 'unknown')}: {str(e)}")
 
-    if not final_results and errors:
-        return jsonify({"success": False, "message": "All operations failed", "errors": errors}), 500
-
-    return jsonify(
-        {
-            "success": True,
-            "message": f"Processed {len(final_results)} files with search results.",
-            "results": final_results,
-            "errors": errors,
-        }
-    ), 200
+    return jsonify({"success": True, "results": final_results, "errors": errors}), 200
 
 
 # =============================================================================
-# MATERIAL DETAILS
+# APPLICATIONS ANALYSIS (NEW)
 # =============================================================================
 
-@app.route("/material_details/<int:matiere_id>", methods=["GET"])
-def get_material_details(matiere_id):
+@app.route("/save_applications_analysis/<int:matiere_id>", methods=["POST"])
+def save_applications_analysis(matiere_id):
     """
-    Get complete material information by matiere_id.
-    Returns: matieres + fiches_matieres + specifications + expert_notes
+    Enregistre l'analyse JSON des applications générée par l'IA.
+    """
+    conn = None
+    try:
+        data = request.get_json(silent=True) or {}
+        analysis_data = data.get("analysis_data")
+        fiche_adn_id = data.get("fiche_adn_id")
+        
+        if not analysis_data:
+            return jsonify({
+                "success": False,
+                "error": "missing_analysis_data",
+                "message": "analysis_data (JSON) est requis dans le corps du POST"
+            }), 400
+        
+        # Validation de la structure JSON
+        if not isinstance(analysis_data, dict):
+            return jsonify({
+                "success": False,
+                "error": "invalid_json",
+                "message": "analysis_data doit être un objet JSON"
+            }), 400
+        
+        conn = get_db_conn()
+        
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Récupération des informations du matériau
+            cur.execute("""
+                SELECT matiere_id, nom_matiere, reference, type_matiere
+                FROM public.matieres
+                WHERE matiere_id = %s
+            """, (matiere_id,))
+            material = cur.fetchone()
+            
+            if not material:
+                return jsonify({
+                    "success": False,
+                    "error": "material_not_found",
+                    "message": f"Matériau {matiere_id} non trouvé"
+                }), 404
+            
+            # Si fiche_adn_id n'est pas fourni, récupérer la plus récente
+            if not fiche_adn_id:
+                cur.execute("""
+                    SELECT fiche_adn_id
+                    FROM public.fiches_adn_matieres
+                    WHERE matiere_id = %s
+                    ORDER BY date_creation DESC
+                    LIMIT 1
+                """, (matiere_id,))
+                fiche_result = cur.fetchone()
+                if fiche_result:
+                    fiche_adn_id = fiche_result["fiche_adn_id"]
+            
+            # Comptage des applications dans analysis_data
+            num_apps = len(analysis_data.get("applications", []))
+            
+            # Insertion ou mise à jour (UPSERT)
+            cur.execute("""
+                INSERT INTO public.fiches_applications_matieres
+                (matiere_id, fiche_adn_id, nom_matiere, reference, type_matiere,
+                 analysis_data, num_applications, date_creation, derniere_modification)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT (matiere_id)
+                DO UPDATE SET
+                    analysis_data = EXCLUDED.analysis_data,
+                    num_applications = EXCLUDED.num_applications,
+                    fiche_adn_id = COALESCE(EXCLUDED.fiche_adn_id, fiches_applications_matieres.fiche_adn_id),
+                    derniere_modification = CURRENT_TIMESTAMP
+                RETURNING fiche_app_id;
+            """, (
+                matiere_id,
+                fiche_adn_id,
+                material["nom_matiere"],
+                material["reference"],
+                material["type_matiere"],
+                json.dumps(analysis_data, ensure_ascii=False),
+                num_apps
+            ))
+            
+            result = cur.fetchone()
+            fiche_app_id = result["fiche_app_id"] if result else None
+            
+            conn.commit()
+            
+            return jsonify({
+                "success": True,
+                "message": "Analyse des applications enregistrée avec succès",
+                "fiche_app_id": fiche_app_id,
+                "matiere_id": matiere_id,
+                "num_applications": num_apps
+            }), 201
+    
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"❌ Erreur: {e}")
+        return jsonify({"success": False, "error": "save_failed", "message": str(e)}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.route("/get_applications_analysis/<int:matiere_id>", methods=["GET"])
+def get_applications_analysis(matiere_id):
+    """
+    Récupère l'analyse des applications enregistrée pour un matériau.
     """
     conn = None
     try:
         conn = get_db_conn()
-
+        
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM public.matieres WHERE matiere_id = %s", (matiere_id,))
-            material = cur.fetchone()
-
-            if not material:
-                return jsonify(
-                    {"success": False, "error": "material_not_found", "message": f"matiere_id {matiere_id} not found"}
-                ), 404
-
-            material = dict(material)
-
-            cur.execute(
-                """
-                SELECT fiche_id, date_creation_fiche, derniere_modification
-                FROM public.fiches_matieres
+            cur.execute("""
+                SELECT
+                    fiche_app_id, matiere_id, fiche_adn_id, nom_matiere,
+                    reference, type_matiere, analysis_data, num_applications,
+                    date_creation, derniere_modification
+                FROM public.fiches_applications_matieres
                 WHERE matiere_id = %s
-                ORDER BY fiche_id DESC
-                """,
-                (matiere_id,),
-            )
-            fiches = [dict(row) for row in cur.fetchall()]
-
-            specifications = []
-            for fiche in fiches:
-                cur.execute(
-                    """
-                    SELECT spec_id, fiche_id, source_type, donnees, date_creation, derniere_modification
-                    FROM public.specifications
-                    WHERE fiche_id = %s
-                    ORDER BY spec_id
-                    """,
-                    (fiche["fiche_id"],),
-                )
-                specifications.extend([dict(row) for row in cur.fetchall()])
-
-            cur.execute(
-                """
-                SELECT men.id, men.matiere_image_id, men.note_json, men.created_at
-                FROM public.matiere_expert_notes men
-                INNER JOIN public.matiere_images mi ON mi.id = men.matiere_image_id
-                WHERE mi.matiere_id = %s
-                ORDER BY men.created_at DESC
-                """,
-                (matiere_id,),
-            )
-            expert_notes = [dict(row) for row in cur.fetchall()]
-
-            response = {
+            """, (matiere_id,))
+            
+            result = cur.fetchone()
+            
+            if not result:
+                return jsonify({
+                    "success": False,
+                    "error": "analysis_not_found",
+                    "message": f"Aucune analyse trouvée pour matiere_id {matiere_id}"
+                }), 404
+            
+            return jsonify({
                 "success": True,
-                "material": material,
-                "fiches_matieres": fiches,
-                "specifications": specifications,
-                "expert_notes": expert_notes,
-                "summary": {
-                    "matiere_id": matiere_id,
-                    "nom_matiere": material.get("nom_matiere"),
-                    "reference": material.get("reference"),
-                    "type_matiere": material.get("type_matiere"),
-                    "num_fiches": len(fiches),
-                    "num_specifications": len(specifications),
-                    "num_expert_notes": len(expert_notes),
-                },
-            }
-
-            return jsonify(response), 200
-
+                "fiche_app": {
+                    "fiche_app_id": result["fiche_app_id"],
+                    "matiere_id": result["matiere_id"],
+                    "fiche_adn_id": result["fiche_adn_id"],
+                    "nom_matiere": result["nom_matiere"],
+                    "reference": result["reference"],
+                    "type_matiere": result["type_matiere"],
+                    "num_applications": result["num_applications"],
+                    "date_creation": result["date_creation"],
+                    "derniere_modification": result["derniere_modification"],
+                    "analysis_data": result["analysis_data"]
+                }
+            }), 200
+    
     except Exception as e:
+        print(f"❌ Erreur: {e}")
         return jsonify({"success": False, "error": "retrieval_failed", "message": str(e)}), 500
     finally:
         if conn:
@@ -466,30 +527,14 @@ def get_material_details(matiere_id):
 
 
 # =============================================================================
-# FICHE ADN - MATERIAL DNA SHEET
+# FICHE ADN - GET BY REFERENCE
 # =============================================================================
 
-@app.route("/fiche_adn", methods=["GET"])
-def get_fiche_adn():
+@app.route("/fiche_adn/reference/<string:reference>", methods=["GET"])
+def get_fiche_adn_by_reference(reference):
     """
-    Get the complete ADN (DNA) specifications sheet for a material.
-
-    Query Parameters:
-        - reference (str): Material reference (e.g., "6600135")
-
-    Returns: Complete JSON specifications aggregating all fiches, specs, and expert notes
+    Get the complete ADN specifications sheet for a material by its reference.
     """
-    reference = request.args.get("reference", "").strip()
-
-    if not reference:
-        return jsonify(
-            {
-                "success": False,
-                "error": "missing_parameters",
-                "message": "The 'reference' query parameter is required",
-            }
-        ), 400
-
     conn = None
     try:
         conn = get_db_conn()
@@ -559,11 +604,6 @@ def get_fiche_adn():
 def get_fiche_adn_by_id(matiere_id):
     """
     Get the complete ADN specifications sheet for a material by matiere_id.
-
-    Path Parameter:
-        - matiere_id (int): The material ID
-
-    Returns: Complete JSON specifications aggregating all fiches, specs, and expert notes
     """
     conn = None
     try:
