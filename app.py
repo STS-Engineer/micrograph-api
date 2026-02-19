@@ -18,12 +18,13 @@ from PIL import Image
 from transformers import AutoModel, AutoImageProcessor
 from werkzeug.utils import secure_filename
 
+import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from pgvector.psycopg2 import register_vector
 from pgvector import Vector
 
-DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Micrographie_IA"
+DB_DSN = os.getenv("DATABASE_URL", "postgresql://user:password@host:port/database") # REMPLACER AVEC UNE VALEUR PAR DÉFAUT SÉCURISÉE OU RETIRER")
 
 
 # -----------------------------------------------------------------------------
@@ -59,8 +60,11 @@ client = OpenAI()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DINO_MODEL_NAME = "facebook/dinov2-large"
 
-DINO_MODEL: Optional[AutoModel] = None
-DINO_PROCESSOR: Optional[AutoImageProcessor] = None
+    DINO_MODEL: Optional[AutoModel] = None
+    DINO_PROCESSOR: Optional[AutoImageProcessor] = None
+    # NOTE: In a multi-worker deployment (e.g., Gunicorn), each worker will load its own copy of DINOv2.
+    # This can lead to high memory consumption. Consider a separate microservice for embeddings
+    # or managing worker processes carefully if memory becomes an issue.
 
 
 def ensure_dino_loaded():
@@ -136,6 +140,9 @@ def cleanup_old_files(interval: int = 1800, max_age_seconds: int = 2 * 3600):
 
 cleanup_thread = Thread(target=cleanup_old_files, daemon=True)
 cleanup_thread.start()
+# NOTE: In a multi-worker deployment, each worker will start its own cleanup thread.
+# This is generally harmless but redundant. For a more robust solution in production,
+# consider a single, external cron job or a dedicated cleanup service.
 
 
 # -----------------------------------------------------------------------------
@@ -881,76 +888,7 @@ def get_applications_analysis(matiere_id):
             conn.close()
 
 
-@app.route("/get_applications_analysis/<int:matiere_id>", methods=["GET"])
-def get_applications_analysis(matiere_id):
-    """
-    Retrieve saved applications analysis for a material.
-    
-    Path Parameter:
-        - matiere_id (int): The material ID
-    
-    Returns: Stored analysis_data from fiches_applications_matieres
-    """
-    conn = None
-    try:
-        conn = get_db_conn()
-        
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT 
-                    fiche_app_id,
-                    matiere_id,
-                    fiche_adn_id,
-                    nom_matiere,
-                    reference,
-                    type_matiere,
-                    analysis_data,
-                    num_applications,
-                    date_creation,
-                    derniere_modification
-                FROM public.fiches_applications_matieres
-                WHERE matiere_id = %s
-            """, (matiere_id,))
-            
-            result = cur.fetchone()
-            
-            if not result:
-                return jsonify({
-                    "success": False,
-                    "error": "analysis_not_found",
-                    "message": f"No applications analysis found for matiere_id {matiere_id}"
-                }), 404
-            
-            result_dict = dict(result)
-            
-            return jsonify({
-                "success": True,
-                "fiche_app": {
-                    "fiche_app_id": result_dict["fiche_app_id"],
-                    "matiere_id": result_dict["matiere_id"],
-                    "fiche_adn_id": result_dict["fiche_adn_id"],
-                    "nom_matiere": result_dict["nom_matiere"],
-                    "reference": result_dict["reference"],
-                    "type_matiere": result_dict["type_matiere"],
-                    "num_applications": result_dict["num_applications"],
-                    "date_creation": result_dict["date_creation"],
-                    "derniere_modification": result_dict["derniere_modification"],
-                    "analysis_data": result_dict["analysis_data"]
-                }
-            }), 200
-    
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": "retrieval_failed",
-            "message": str(e)
-        }), 500
-    finally:
-        if conn:
-            conn.close()
+
 
 
 # MAIN
