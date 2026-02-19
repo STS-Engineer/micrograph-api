@@ -24,7 +24,7 @@ from psycopg2.extras import RealDictCursor
 from pgvector.psycopg2 import register_vector
 from pgvector import Vector
 
-DB_DSN = os.getenv("DATABASE_URL", "postgresql://user:password@host:port/database") # REMPLACER AVEC UNE VALEUR PAR DÉFAUT SÉCURISÉE OU RETIRER")
+DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Micrographie_IA"
 
 
 # -----------------------------------------------------------------------------
