@@ -64,14 +64,16 @@ DOCX_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 # -----------------------------------------------------------------------------
 # OPENAI CLIENT
 # -----------------------------------------------------------------------------
-openai_api_key = os.getenv("OPENAI_API_KEY")
+HARDCODED_OPENAI_API_KEY = ""
+openai_api_key = HARDCODED_OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 
 
 # -----------------------------------------------------------------------------
 # GROQ CLIENT
 # -----------------------------------------------------------------------------
-groq_api_key = os.getenv("GROQ_API_KEY")
+HARDCODED_GROQ_API_KEY = ""
+groq_api_key = HARDCODED_GROQ_API_KEY or os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
 
 
@@ -839,7 +841,32 @@ def root():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "dino_loaded": DINO_MODEL is not None}), 200
+    check_db = request.args.get("check_db", "false").strip().lower() in {"1", "true", "yes"}
+    db_ok = None
+    db_error = None
+
+    if check_db:
+        try:
+            conn = get_db_conn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            conn.close()
+            db_ok = True
+        except Exception as e:
+            db_ok = False
+            db_error = str(e)
+
+    return jsonify(
+        {
+            "status": "ok",
+            "dino_loaded": DINO_MODEL is not None,
+            "groq_configured": groq_client is not None,
+            "openai_configured": client is not None,
+            "db_ok": db_ok,
+            "db_error": db_error,
+        }
+    ), 200
 
 
 # -----------------------------------------------------------------------------
