@@ -16,5 +16,7 @@ gunicorn
 openai 
 python-dotenv
 pgvector
-
+python-dotenv
 psycopg2-binary
+groq
+python-docx

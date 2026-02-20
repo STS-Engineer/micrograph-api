@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Extraction des micrographies depuis PowerPoints + insertion directe dans PostgreSQL.
-Version CORRIGÉE - Liaison correcte images → matieres par référence.
+Version V3 - Améliorée pour la gestion spatiale des grossissements et l'héritage des métadonnées.
+CORRECTION: Amélioration de l'extraction des commentaires
 """
 
 import os
@@ -25,8 +26,9 @@ from pgvector.psycopg2 import register_vector
 from pgvector import Vector
 
 DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Micrographie_IA"
+
 # -------------------- SETUP DINOv2 --------------------
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda" if torch.torch.cuda.is_available() else "cpu"
 print(f"🔧 Loading DINOv2-large on {device}...")
 dinov2_model = AutoModel.from_pretrained("facebook/dinov2-large").to(device).eval()
 dinov2_processor = AutoImageProcessor.from_pretrained("facebook/dinov2-large")
@@ -43,25 +45,11 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 def clean_reference(ref: str) -> str:
-    """
-    Clean and normalize a reference string for database matching.
-    Examples:
-        "ref 6600 135" -> "6600135"
-        "ref 6600135" -> "6600135"
-        "6600 135" -> "6600135"
-        "V494" -> "V494"
-        "ref V 494" -> "V494"
-    """
+    """Clean and normalize a reference string for database matching."""
     if not ref:
         return ""
-    
-    # Remove common prefixes (ref, référence)
     ref = re.sub(r'^(ref|référence)\s*[:\-]?\s*', '', ref, flags=re.IGNORECASE)
-    
-    # Remove ALL whitespace
     ref = re.sub(r'\s+', '', ref)
-    
-    # Convert to uppercase for case-insensitive matching
     return ref.strip().upper()
 
 def compute_embedding_from_pil(image: Image.Image) -> np.ndarray:
@@ -92,66 +80,55 @@ def _extract_nuance_from_text(text: str) -> Optional[str]:
     return None
 
 def extract_detailed_comments(text: str) -> Optional[str]:
-    """Extract detailed comments/description from a slide."""
+    """
+    Extract detailed comments/description from a slide.
+    CORRECTION: Amélioration de la détection des commentaires avec support des lignes vides.
+    """
     if not text:
         return None
+    
+    # Chercher "Commentaires :" et prendre tout ce qui suit jusqu'à la fin
+    # Gérer les lignes vides après "Commentaires :"
     comments_match = re.search(
-        r"Commentaires\s*:(.*?)(?:\n\s*(?:Composition|TABLE|$))",
+        r"Commentaires?\s*:\s*(.+)",
         text,
         re.IGNORECASE | re.DOTALL,
     )
+    
     if comments_match:
         comments = comments_match.group(1).strip()
-        comments = clean_text(comments)
-        if len(comments) > 50:
+        
+        # Retirer les sections qui ne font pas partie des commentaires
+        # Chercher les indicateurs de fin de commentaires
+        for pattern in [r'\bTABLE\b', r'\bComposition\b', r'\bGrossissement\s+x\s*\d+']:
+            match = re.search(pattern, comments, flags=re.IGNORECASE)
+            if match:
+                comments = comments[:match.start()].strip()
+                break
+        
+        # Nettoyer les espaces multiples mais préserver les retours à la ligne
+        comments = re.sub(r'[ \t]+', ' ', comments)  # Espaces horizontaux seulement
+        comments = re.sub(r'\n{3,}', '\n\n', comments)  # Max 2 retours à la ligne consécutifs
+        comments = comments.strip()
+        
+        if len(comments) > 20:  # Seuil raisonnable pour des vrais commentaires
             return comments
-    paragraphs = re.split(r"\n\s*\n", text)
-    for para in paragraphs:
-        para_clean = clean_text(para)
-        if len(para_clean) < 50:
-            continue
-        if re.match(r"^(Graphite|Coke|Nuance|Grossissement|Échelle)", para_clean, re.IGNORECASE):
-            if len(para_clean) < 150:
-                continue
-        return para_clean
+    
     return None
 
-def extract_mag_scale_mapping(text: str) -> Dict[int, str]:
-    """
-    Extract magnification → scale mapping from metadata text.
-    
-    Examples:
-        "x 200 ( échelle 100 µm ) – x 600 ( échelle 50 µm )"
-        → {200: "100 µm", 600: "50 µm"}
-    """
-    if not text:
-        return {}
-    
-    mapping = {}
-    
-    # Pattern: x 200 ( échelle 100 µm ) with flexible spacing
-    pattern = r'[xX×]\s*(\d+)\s*\(\s*[ée]chelle\s*(\d+\s*[µμ]m)\s*\)'
-    matches = re.findall(pattern, text, re.IGNORECASE)
-    
-    for mag_str, scale in matches:
-        mapping[int(mag_str)] = scale.strip()
-    
-    return mapping
-
-def get_slide_magnification(slide) -> Optional[int]:
-    """
-    Extract magnification from slide header/text.
-    
-    Examples:
-        "Grossissement x 200" → 200
-        "Grossissement x600" → 600
-    """
+def extract_magnifications_with_positions(slide) -> List[Dict]:
+    """Extract all magnifications and their vertical positions."""
+    mags = []
     for shape in slide.shapes:
         if hasattr(shape, "text") and shape.text:
             match = re.search(r'[Gg]rossissement\s*[xX×]\s*(\d+)', shape.text)
             if match:
-                return int(match.group(1))
-    return None
+                mags.append({
+                    "value": int(match.group(1)),
+                    "text": shape.text.strip(),
+                    "top": shape.top
+                })
+    return sorted(mags, key=lambda x: x["top"])
 
 def extract_tables_from_slide(slide) -> List[List[List[str]]]:
     """Return all tables as: [table][row][cell_text]."""
@@ -187,10 +164,201 @@ def linearize_tables(tables: List[List[List[str]]]) -> str:
             blocks.append(f"TABLE_PPT_{t_idx}:\n" + "\n".join(lines))
     return "\n\n".join(blocks).strip()
 
-_NUM_TOKEN = re.compile(r"^[<>]?\s*\d+(?:[.,]\d+)?\s*$")
+# -------------------- COKES COMPARATIVE FILE HANDLING --------------------
 
-def _is_number_like(s: str) -> bool:
-    return bool(_NUM_TOKEN.match((s or "").strip()))
+def is_cokes_comparative_file(prs: Presentation) -> bool:
+    """
+    Détecte si le fichier PowerPoint est un fichier de comparaison de Cokes.
+    
+    Critères:
+    - Slide 2 contient plusieurs entrées "Micrographie N°" (>=3)
+    - Slide 1 contient "Coke" dans le titre
+    """
+    if len(prs.slides) < 2:
+        return False
+    
+    # Check Slide 1 for "Coke" in title
+    slide1_text = []
+    for shape in prs.slides[0].shapes:
+        if hasattr(shape, "text") and shape.text.strip():
+            slide1_text.append(shape.text.strip())
+    slide1_full = " ".join(slide1_text)
+    
+    if "Coke" not in slide1_full:
+        return False
+    
+    # Check Slide 2 for multiple "Micrographie N°"
+    slide2_text = []
+    for shape in prs.slides[1].shapes:
+        if hasattr(shape, "text") and shape.text.strip():
+            slide2_text.append(shape.text.strip())
+    slide2_full = "\n".join(slide2_text)
+    
+    micrographie_count = slide2_full.count("Micrographie N°")
+    
+    return micrographie_count >= 3
+
+
+def extract_cokes_comments_dict(prs: Presentation) -> Dict[str, str]:
+    """
+    Extrait tous les commentaires depuis le Slide 2 (commentaires centralisés).
+    
+    Returns:
+        Dict[product_name, comments]
+    """
+    if len(prs.slides) < 2:
+        return {}
+    
+    slide = prs.slides[1]  # Slide 2
+    
+    # Get all text
+    text_blocks = []
+    for shape in slide.shapes:
+        if hasattr(shape, "text") and shape.text.strip():
+            text_blocks.append(shape.text.strip())
+    
+    full_text = "\n".join(text_blocks)
+    
+    # Extract comments for each product
+    comments_dict = {}
+    
+    # List of possible product name patterns
+    products = [
+        "Coke MUCO Cyclam",
+        "Coke FC 250",
+        "Coke PDS 1183",
+        "Coke CBH LPCS60",
+        "Coke CBH LPCS 60",
+        "Coke micronisé",
+        "Coke MUCO 0-75µm",
+        "Coke MUCO 0-75 µm",
+        "Coke CARBOLEG FCB 97",
+        "Coke CARBOLEG FCB97",
+    ]
+    
+    for product in products:
+        # Normalize product pattern for regex
+        product_pattern = re.escape(product).replace(r"\ ", r"\s*")
+        
+        # Match: "Product (...) – Ref ... : \tMicrographie N° XXXX\n[comments]"
+        pattern = rf"{product_pattern}\s*(?:\([^)]+\))?\s*(?:–\s*Ref\s+\d+\s+\d+\s*)?\s*:\s*\tMicrographie N° \d+\s*\n(.+?)(?=\n\n[A-Z]|\Z)"
+        
+        match = re.search(pattern, full_text, re.IGNORECASE | re.DOTALL)
+        
+        if match:
+            comments = match.group(1).strip()
+            # Clean
+            comments = re.sub(r'[ \t]+', ' ', comments)
+            comments = re.sub(r'\n{3,}', '\n\n', comments)
+            comments = comments.strip()
+            
+            # Store with normalized name
+            normalized_product = re.sub(r'\s+', ' ', product)
+            comments_dict[normalized_product] = comments
+    
+    return comments_dict
+
+
+def extract_cokes_references_dict(prs: Presentation) -> Dict[str, str]:
+    """
+    Extrait les références depuis le Slide 1 (page de titre).
+    
+    Returns:
+        Dict[product_name, reference]
+    """
+    if len(prs.slides) < 1:
+        return {}
+    
+    slide = prs.slides[0]  # Slide 1
+    
+    text_blocks = []
+    for shape in slide.shapes:
+        if hasattr(shape, "text") and shape.text.strip():
+            text_blocks.append(shape.text.strip())
+    
+    full_text = "\n".join(text_blocks)
+    
+    # Extract: "Product \tref XXXXXXX"
+    ref_dict = {}
+    refs = re.findall(r'([A-Za-z0-9\s\(\)]+?)\s+ref\s+(\d{7})', full_text, re.IGNORECASE)
+    
+    for product, ref in refs:
+        product = product.strip()
+        ref = ref.strip()
+        ref_dict[product] = ref
+    
+    return ref_dict
+
+
+def match_cokes_product_to_comments(product_name: str, comments_dict: Dict[str, str]) -> Optional[str]:
+    """
+    Match un nom de produit (depuis une slide d'images) aux commentaires.
+    Gère les variations d'espacement et les parenthèses.
+    """
+    product_name = re.sub(r'\s+', ' ', product_name).strip()
+    
+    # Exact match
+    if product_name in comments_dict:
+        return comments_dict[product_name]
+    
+    # Fuzzy matching
+    for comment_product, comments in comments_dict.items():
+        # Remove parentheses and normalize spaces
+        product_base = re.sub(r'\s*\([^)]+\)', '', product_name).strip()
+        comment_base = re.sub(r'\s*\([^)]+\)', '', comment_product).strip()
+        
+        # Compare without spaces
+        product_normalized = re.sub(r'\s+', '', product_base).lower()
+        comment_normalized = re.sub(r'\s+', '', comment_base).lower()
+        
+        if product_normalized == comment_normalized or \
+           comment_base.lower() in product_base.lower() or \
+           product_base.lower() in comment_base.lower():
+            return comments
+    
+    return None
+
+
+def match_cokes_product_to_reference(product_name: str, ref_dict: Dict[str, str]) -> Optional[str]:
+    """
+    Match un nom de produit à sa référence depuis le Slide 1.
+    """
+    product_name = re.sub(r'\s+', ' ', product_name).strip()
+    
+    # Exact match
+    if product_name in ref_dict:
+        return ref_dict[product_name]
+    
+    # Try matching with product short name (remove "Coke " prefix)
+    product_short = product_name.replace("Coke ", "").strip()
+    
+    for ref_product, ref in ref_dict.items():
+        if product_short in ref_product or ref_product in product_short:
+            return ref
+    
+    # Fuzzy matching
+    for ref_product, ref in ref_dict.items():
+        product_base = re.sub(r'\s*\([^)]+\)', '', product_name).strip()
+        ref_base = re.sub(r'\s*\([^)]+\)', '', ref_product).strip()
+        
+        if product_base.lower() in ref_base.lower() or ref_base.lower() in product_base.lower():
+            return ref
+    
+    return None
+
+
+def extract_cokes_product_name_from_slide(slide) -> Optional[str]:
+    """
+    Extrait le nom du produit depuis une slide d'images.
+    Format attendu: "Coke [NOM]"
+    """
+    for shape in slide.shapes:
+        if hasattr(shape, "text") and shape.text.strip():
+            text = shape.text.strip()
+            # Look for text containing "Coke" but not "X " (magnification)
+            if "Coke" in text and "X " not in text and "x " not in text.lower():
+                return text
+    return None
 
 def parse_avo_composition_from_tables(tables: List[List[List[str]]]) -> Optional[Dict[str, Any]]:
     """Extract composition table (AVO format) from real PPT tables."""
@@ -204,7 +372,7 @@ def parse_avo_composition_from_tables(tables: List[List[List[str]]]) -> Optional
             continue
         for idx in range(1, len(rows)):
             value_row = rows[idx]
-            numeric_cells = [c for c in value_row if c and _is_number_like(c)]
+            numeric_cells = [c for c in value_row if c and re.match(r"^[<>]?\s*\d+(?:[.,]\d+)?\s*$", c)]
             if len(numeric_cells) < 2:
                 continue
             header_row = rows[0]
@@ -213,9 +381,7 @@ def parse_avo_composition_from_tables(tables: List[List[List[str]]]) -> Optional
             for j in range(max_cols):
                 h = (header_row[j] or "").strip()
                 v = (value_row[j] or "").strip()
-                if not h:
-                    continue
-                if not v or not _is_number_like(v):
+                if not h or not v or not re.match(r"^[<>]?\s*\d+(?:[.,]\d+)?\s*$", v):
                     continue
                 pairs.append((h, v))
             if len(pairs) >= 2:
@@ -224,312 +390,95 @@ def parse_avo_composition_from_tables(tables: List[List[List[str]]]) -> Optional
                 return {"elements": elements, "values": values, "rows": [elements, values]}
     return None
 
-def extract_composition_table(text: str) -> Optional[Dict]:
-    """Fallback: Extract composition table from plain text."""
-    element_pattern = r"\b([A-Z][a-z]?)\b"
-    lines = text.split("\n")
-    for i, line in enumerate(lines):
-        elements = re.findall(element_pattern, line)
-        if len(elements) >= 3:
-            if i + 1 < len(lines):
-                values_line = lines[i + 1]
-                values = re.findall(r"[<>]?\s*\d+(?:[.,]\d+)?", values_line)
-                if len(values) >= len(elements):
-                    return {
-                        "elements": elements,
-                        "values": [v.strip() for v in values[:len(elements)]],
-                        "rows": [elements, [v.strip() for v in values[:len(elements)]]],
-                    }
-    return None
-
-def composition_table_to_text(comp_table: Optional[Dict]) -> str:
-    """Convert composition_table to readable text."""
-    if not comp_table:
-        return ""
-    rows = comp_table.get("rows") or []
-    if not rows:
-        return ""
-    lines = []
-    for r in rows:
-        lines.append(" | ".join([str(c).strip() for c in r]))
-    return "\n".join(lines).strip()
-
-def group_key(meta: Dict) -> Optional[str]:
-    """Stable group key for entity aggregation."""
-    if not meta:
-        return None
-    if meta.get("entity_type") == "Matière première":
-        ref = (meta.get("reference") or "").strip()
-        if ref:
-            return f"MP|{ref}"
-    return meta.get("entity_id")
-
 def extract_metadata_from_slide(slide, slide_number: int) -> Dict:
-    """Extract metadata from a PowerPoint slide."""
+    """
+    Extract metadata from a PowerPoint slide.
+    CORRECTION: Amélioration de l'extraction des commentaires avec le texte complet de la slide.
+    """
     metadata = {
         "slide_number": slide_number,
         "nuance": None,
         "grade": None,
         "product_name": None,
         "reference": None,
-        "reference_raw": None,  # Original extracted text
-        "magnification": None,
-        "magnification_value": None,  # Numeric value for mapping
-        "scale": None,
-        "mag_scale_mapping": {},  # Magnification → scale mapping
+        "reference_raw": None,
+        "magnifications": extract_magnifications_with_positions(slide),
         "comments": None,
-        "description": None,
         "composition": {},
-        "composition_table": None,
-        "full_text": None,
+        "full_text": "",
         "has_images": False,
-        "entity_type": None,
-        "entity_id": None,
+        "is_title_page": False,  # NOUVEAU: indicateur de page de titre
     }
 
-    full_text_blocks = []
+    text_blocks = []
     for shape in slide.shapes:
         if hasattr(shape, "text") and shape.text:
-            full_text_blocks.append(shape.text)
+            text = shape.text.strip()
+            if text:
+                text_blocks.append(text)
+                # Try to extract reference if not already found
+                if not metadata["reference"]:
+                    ref_match = re.search(r'(?:ref|référence)\s*[:\-]?\s*([A-Z0-9\s]{4,15})', text, re.IGNORECASE)
+                    if ref_match:
+                        metadata["reference_raw"] = ref_match.group(1).strip()
+                        metadata["reference"] = clean_reference(metadata["reference_raw"])
+                
+                # Try to extract nuance
+                nuance = _extract_nuance_from_text(text)
+                if nuance and not metadata["nuance"]:
+                    metadata["nuance"] = nuance
+
         if hasattr(shape, "image"):
             metadata["has_images"] = True
 
-    tables = extract_tables_from_slide(slide)
-    tables_text = linearize_tables(tables)
-    if tables_text:
-        full_text_blocks.append(tables_text)
-
-    raw_text = "\n".join(full_text_blocks)
-    metadata["full_text"] = clean_text(raw_text)
-
-    # Product name
-    product_patterns = [
-        r"Graphite\s+(Timrex|SFG|KS|BNL|Naturel|Artificiel)\s*[A-Z0-9]*",
-        r"Graphite\s+(?:artificiel|naturel)\s+[A-Za-z0-9\s]+",
-        r"Coke\s+[A-Z]{2,}",
-        r"graphite\s+(?:artificiel|naturel)[\s\n]+[A-Za-z0-9\s]+",
-    ]
-    for pattern in product_patterns:
-        match = re.search(pattern, raw_text, re.IGNORECASE)
-        if match:
-            product = re.sub(r"\s+", " ", match.group(0).strip())
-            metadata["product_name"] = product
-            break
-
-    # Reference - IMPROVED EXTRACTION WITH MULTIPLE PATTERNS
-    ref_patterns = [
-        r"(?:ref|référence)\s*[:\-]?\s*(\d{4,}\s*\d{2,})",  # "ref 6600 135" or "ref 6600135"
-        r"(?:ref|référence)\s*[:\-]?\s*([A-Z]\d+)",  # "ref V494"
-        r"(?:ref|référence)\s*[:\-]?\s*([A-Z]\s*\d+)",  # "ref V 494"
-        r"-\s*(\d{4,}\s*\d{2,})",  # "- 6600 135"
-        r"–\s*(\d{4,}\s*\d{2,})",  # "– 6600 135"
-        r"\b(\d{7})\b",  # Direct 7-digit like "6600135"
-        r"\b([A-Z]\d{3,})\b",  # Alphanumeric like "V494"
-    ]
-    for pattern in ref_patterns:
-        match = re.search(pattern, raw_text, re.IGNORECASE)
-        if match:
-            ref_raw = match.group(1).strip()
-            metadata["reference_raw"] = ref_raw
-            # Clean the reference for database matching
-            metadata["reference"] = clean_reference(ref_raw)
-            break
-
-    # Magnification
-    mag_patterns = [
-        r"Grossissement\s*[:\-]?\s*[xX×]?\s*(\d+)",
-        r"[xX×]\s*(\d+)",
-        r"(\d+)\s*[xX×]",
-    ]
-    for pattern in mag_patterns:
-        match = re.search(pattern, raw_text)
-        if match:
-            mag_value = int(match.group(1))
-            metadata["magnification"] = f"x{mag_value}"
-            metadata["magnification_value"] = mag_value
-            break
-
-    # Extract magnification→scale mapping from comments
-    metadata["mag_scale_mapping"] = extract_mag_scale_mapping(raw_text)
-
-    # Scale - Try direct extraction first
-    scale_patterns = [
-        r"[ÉéEe]chelle\s*[:\-]?\s*(\d+\s*[µμ]?m)",
-        r"(\d+\s*[µμ]m)",
-    ]
-    for pattern in scale_patterns:
-        match = re.search(pattern, raw_text, re.IGNORECASE)
-        if match:
-            metadata["scale"] = match.group(1).strip()
-            break
+    metadata["full_text"] = "\n".join(text_blocks)
     
-    # If we have magnification and mapping, resolve scale from mapping
-    if metadata["magnification_value"] and metadata["mag_scale_mapping"]:
-        mapped_scale = metadata["mag_scale_mapping"].get(metadata["magnification_value"])
-        if mapped_scale:
-            metadata["scale"] = mapped_scale
-
-    # Nuance
-    nu = _extract_nuance_from_text(raw_text)
-    if nu:
-        metadata["nuance"] = nu
-
-    # Comments
-    detailed_comments = extract_detailed_comments(raw_text)
-    if detailed_comments:
-        metadata["comments"] = detailed_comments
-        metadata["description"] = detailed_comments
-
-    # Composition
-    comp_table = parse_avo_composition_from_tables(tables)
-    if not comp_table:
-        comp_table = extract_composition_table(raw_text)
-    if comp_table:
-        metadata["composition_table"] = comp_table
-        if "elements" in comp_table and "values" in comp_table:
-            for elem, val in zip(comp_table["elements"], comp_table["values"]):
-                metadata["composition"][elem] = val
-
-    # Entity type / id
-    if metadata.get("nuance"):
-        metadata["entity_type"] = "Nuance"
-        metadata["entity_id"] = metadata["nuance"]
-    elif metadata.get("product_name"):
-        metadata["entity_type"] = "Matière première"
-        ref = (metadata.get("reference") or "").strip()
-        metadata["entity_id"] = f"{metadata['product_name']}|{ref}".strip("|")
-    elif metadata.get("grade"):
-        metadata["entity_type"] = "Grade"
-        metadata["entity_id"] = str(metadata["grade"]).strip()
-    else:
-        metadata["entity_type"] = "Inconnu"
-        metadata["entity_id"] = None
+    # NOUVEAU: Détecter si c'est une page de titre (Slide 1 typiquement)
+    # Une page de titre contient plusieurs références mais pas de commentaires détaillés
+    if slide_number == 1 or (metadata["full_text"].count("ref") > 3 and not "Commentaires" in metadata["full_text"]):
+        metadata["is_title_page"] = True
+        metadata["reference"] = None  # Ne pas utiliser de référence de page de titre
+    
+    # CORRECTION: Extraction des commentaires depuis le texte complet de la slide
+    if not metadata["is_title_page"]:
+        comments = extract_detailed_comments(metadata["full_text"])
+        if comments:
+            metadata["comments"] = comments
+    
+    # Extract tables and composition
+    tables = extract_tables_from_slide(slide)
+    if tables:
+        composition = parse_avo_composition_from_tables(tables)
+        if composition:
+            metadata["composition"] = composition
 
     return metadata
 
-# -------------------- DATABASE FUNCTIONS --------------------
-
-def find_matiere_by_reference(cur, reference: str) -> Optional[int]:
-    """
-    Find a matiere_id by matching reference with flexible cleaning.
-    Uses UPPER() and REPLACE() to handle case and whitespace variations.
-    """
-    if not reference:
-        return None
-    
-    # Clean the reference using our standard function
-    ref_clean = clean_reference(reference)
-    
-    # Query with flexible matching
-    cur.execute("""
-        SELECT matiere_id 
-        FROM public.matieres 
-        WHERE UPPER(REPLACE(REPLACE(reference, ' ', ''), '-', '')) = %s
-        LIMIT 1
-    """, (ref_clean,))
-    row = cur.fetchone()
-    
-    if row:
-        return row[0]
-    
-    return None
-
-def create_new_matiere(cur, conn, entry: Dict) -> Optional[int]:
-    """
-    Create a new matiere entry when reference is not found.
-    """
-    reference = entry.get("reference")  # This is already cleaned
-    reference_raw = entry.get("reference_raw") or reference
-    
-    if not reference:
-        return None
-    
-    product_name = entry.get("product_name") or entry.get("nuance") or f"Material {reference}"
-    material_name = product_name
-    matiere_type = entry.get("entity_type") or "Matière première"
-    
-    try:
-        cur.execute("""
-            INSERT INTO public.matieres (
-                nom_matiere, 
-                material_name, 
-                reference, 
-                type_matiere, 
-                date_creation
-            )
-            VALUES (%s, %s, %s, %s, NOW())
-            RETURNING matiere_id
-        """, (product_name, material_name, reference, matiere_type))
-        
-        row = cur.fetchone()
-        conn.commit()
-        
-        if row:
-            print(f"      ✨ Created new matiere: {product_name} (ref: {reference}) -> matiere_id={row[0]}")
-            return row[0]
-        
-    except psycopg2.IntegrityError as e:
-        conn.rollback()
-        print(f"      ⚠️  IntegrityError: {e}")
-        # Try to find existing by reference
-        existing_id = find_matiere_by_reference(cur, reference)
-        if existing_id:
-            print(f"      ℹ️  Found existing matiere_id={existing_id} for ref={reference}")
-            return existing_id
-    except Exception as e:
-        conn.rollback()
-        print(f"      ❌ Error creating matiere: {e}")
-    
-    return None
-
 def get_or_create_matiere_by_reference(cur, conn, entry: Dict) -> Optional[int]:
-    """
-    Main function: Get matiere_id by reference, or create new if not found.
-    Returns None if no reference available.
-    """
-    reference = entry.get("reference")
-    
-    if not reference:
+    """Get or create a matiere record by reference."""
+    ref = entry.get("reference")
+    if not ref:
         return None
-    
-    # Try to find existing matiere
-    matiere_id = find_matiere_by_reference(cur, reference)
-    
-    if matiere_id:
-        return matiere_id
-    
-    # Create new matiere
-    return create_new_matiere(cur, conn, entry)
-
-def get_or_create_powerpoint_file(cur, conn, ppt_path: Path) -> int:
-    """Get or create PowerPoint file entry."""
-    file_path_str = str(ppt_path.resolve())
-    cur.execute("SELECT id FROM public.powerpoint_files WHERE file_path = %s", (file_path_str,))
+    cur.execute("SELECT matiere_id FROM public.matieres WHERE reference = %s", (ref,))
     row = cur.fetchone()
     if row:
         return row[0]
-
+    # Create new if not found
+    name = entry.get("product_name") or f"Matière {ref}"
+    matiere_type = entry.get("type_matiere") or "Matière"
     cur.execute("""
-        INSERT INTO public.powerpoint_files (file_path, created_at)
-        VALUES (%s, NOW())
-        RETURNING id
-    """, (file_path_str,))
-    row = cur.fetchone()
+        INSERT INTO public.matieres (nom_matiere, type_matiere, reference, date_creation, date_mise_a_jour)
+        VALUES (%s, %s, %s, NOW(), NOW())
+        RETURNING matiere_id
+    """, (name, matiere_type, ref))
+    new_id = cur.fetchone()[0]
     conn.commit()
-    return row[0]
+    return new_id
 
-def insert_image_and_notes(conn, cur, entry: Dict, source_file_id: int, matiere_id: Optional[int], embedding: np.ndarray):
-    """Insert image with embedding and metadata."""
-    if not matiere_id:
-        print(f"      ❌ Cannot insert image: no matiere_id")
-        return False
-    
+def insert_image_and_notes(conn, cur, entry: Dict, source_file_id: int, matiere_id: int, embedding: np.ndarray):
+    """Insert image and its associated notes into the database."""
     try:
-        # Convert numpy array to pgvector Vector
         embedding_vector = Vector(embedding.tolist())
-        
-        # Insert image - ONLY foreign key, path, and embedding
-        # material_name and reference come from matieres table via JOIN
         cur.execute("""
             INSERT INTO public.matiere_images (matiere_id, image_path, embedding)
             VALUES (%s, %s, %s)
@@ -537,34 +486,19 @@ def insert_image_and_notes(conn, cur, entry: Dict, source_file_id: int, matiere_
         """, (matiere_id, entry["image_path"], embedding_vector))
         image_id = cur.fetchone()[0]
 
-        # Build metadata JSON
         note_json = {
-            "expert_notes": entry.get("comments") or entry.get("description") or "",
+            "expert_notes": entry.get("comments") or "",
             "magnification": entry.get("magnification"),
-            "scale": entry.get("scale"),
-            "composition": entry.get("composition"),
-            "composition_table": entry.get("composition_table"),
-            "full_text": entry.get("entity_full_text") or entry.get("full_text"),
             "slide_number": entry.get("slide_number"),
             "source_file_id": source_file_id,
-            "product_name": entry.get("product_name"),
-            "nuance": entry.get("nuance"),
-            "grade": entry.get("grade"),
-            "has_images": entry.get("has_images"),
-            "entity_type": entry.get("entity_type"),
-            "entity_id": entry.get("entity_id"),
             "reference": entry.get("reference"),
-            "reference_raw": entry.get("reference_raw"),
+            "composition": entry.get("composition"),
         }
-        # Clean None values
-        note_json = {k: v for k, v in note_json.items() if v is not None}
-
-        # Insert notes
+        
         cur.execute("""
             INSERT INTO public.matiere_expert_notes (matiere_image_id, note_json, created_at)
             VALUES (%s, %s, NOW())
         """, (image_id, Json(note_json)))
-        
         conn.commit()
         return True
     except Exception as e:
@@ -572,237 +506,326 @@ def insert_image_and_notes(conn, cur, entry: Dict, source_file_id: int, matiere_
         print(f"      ❌ Error inserting image: {e}")
         return False
 
-def extract_images_from_slide(slide, slide_number: int, output_dir: Path, ppt_name: str) -> List[str]:
-    """Extract all images from a slide and save them."""
-    image_paths = []
-    img_count = 0
-    images_dir = output_dir / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
-
-    for shape in slide.shapes:
-        if hasattr(shape, "image"):
-            try:
-                image = shape.image
-                image_bytes = image.blob
-                filename = f"{ppt_name}_slide{slide_number:03d}_img{img_count:02d}.png"
-                filepath = images_dir / filename
-                
-                img = Image.open(io.BytesIO(image_bytes))
-                img.save(filepath, "PNG")
-                
-                # Relative path for database
-                rel_path = str(filepath.relative_to(output_dir.parent))
-                image_paths.append(rel_path)
-                img_count += 1
-            except Exception as e:
-                print(f"      ⚠️  Error extracting image from slide {slide_number}: {e}")
-    return image_paths
-
-def process_powerpoint(ppt_path: Path, output_dir: Path, file_id: int, force_reprocess: bool = False) -> List[Dict]:
-    """Process a PowerPoint file: extract images, metadata, and insert into PostgreSQL."""
-    print(f"\n📊 Processing: {ppt_path.name}")
-
-    conn = psycopg2.connect(DB_DSN)
-    register_vector(conn)  # Register pgvector adapter
-    cur = conn.cursor()
-
+def clear_old_data():
+    """Clear old data from tables before reprocessing."""
     try:
-        source_file_id = file_id
-
-        # Load presentation
-        prs = Presentation(ppt_path)
-        ppt_name = ppt_path.stem
-
-        print(f"   Found {len(prs.slides)} slides")
-
-        # First pass: extract all metadata
-        all_slide_metadata = []
-        for slide_idx, slide in enumerate(prs.slides, start=1):
-            metadata = extract_metadata_from_slide(slide, slide_idx)
-            all_slide_metadata.append(metadata)
-
-        # Entity inheritance (propagate reference backward)
-        last_found_entity = None
-        for i in range(len(all_slide_metadata) - 1, -1, -1):
-            sm = all_slide_metadata[i]
-            gk = group_key(sm)
-            if sm.get("entity_id") and gk:
-                last_found_entity = {
-                    "entity_id": sm["entity_id"],
-                    "entity_type": sm["entity_type"],
-                    "nuance": sm.get("nuance"),
-                    "product_name": sm.get("product_name"),
-                    "reference": sm.get("reference"),
-                    "reference_raw": sm.get("reference_raw"),
-                    "grade": sm.get("grade"),
-                    "mag_scale_mapping": sm.get("mag_scale_mapping", {}),
-                }
-            elif last_found_entity:
-                sm["entity_id"] = last_found_entity["entity_id"]
-                sm["entity_type"] = last_found_entity["entity_type"]
-                sm["nuance"] = last_found_entity.get("nuance")
-                sm["product_name"] = last_found_entity.get("product_name")
-                sm["reference"] = last_found_entity.get("reference")
-                sm["reference_raw"] = last_found_entity.get("reference_raw")
-                sm["grade"] = last_found_entity.get("grade")
-                # Inherit mag_scale_mapping from previous slide
-                if not sm.get("mag_scale_mapping") and last_found_entity.get("mag_scale_mapping"):
-                    sm["mag_scale_mapping"] = last_found_entity["mag_scale_mapping"]
-                # Resolve scale if we have magnification and mapping
-                if sm.get("magnification_value") and sm.get("mag_scale_mapping"):
-                    mapped_scale = sm["mag_scale_mapping"].get(sm["magnification_value"])
-                    if mapped_scale and not sm.get("scale"):
-                        sm["scale"] = mapped_scale
-
-        # Aggregate texts by group
-        entity_text_map = {}
-        for sm in all_slide_metadata:
-            gk = group_key(sm)
-            if not gk:
-                continue
-            chunks = []
-            ft = (sm.get("full_text") or "").strip()
-            if ft:
-                chunks.append(ft)
-            comm = (sm.get("comments") or sm.get("description") or "").strip()
-            if comm and comm not in ft:
-                chunks.append(comm)
-            ct = composition_table_to_text(sm.get("composition_table"))
-            if ct:
-                chunks.append("TABLEAU DE COMPOSITION:\n" + ct)
-            if chunks:
-                prev = entity_text_map.get(gk, "")
-                merged = (prev + "\n\n" + "\n".join(chunks)).strip() if prev else "\n".join(chunks)
-                entity_text_map[gk] = merged
-
-        # Second pass: extract images and insert
-        all_metadata = []
-        skipped_no_reference = 0
+        conn = psycopg2.connect(DB_DSN)
+        cur = conn.cursor()
         
-        for slide_idx, slide in enumerate(prs.slides, start=1):
-            current_metadata = all_slide_metadata[slide_idx - 1]
-            image_paths = extract_images_from_slide(slide, slide_idx, output_dir, ppt_name)
+        print("🗑️  Clearing old data from database...")
+        
+        # Delete in reverse order of dependencies to avoid FK constraints
+        cur.execute("DELETE FROM public.matiere_expert_notes")
+        print("   ✅ Cleared matiere_expert_notes")
+        
+        cur.execute("DELETE FROM public.matiere_images")
+        print("   ✅ Cleared matiere_images")
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("✅ Old data cleared successfully")
+        
+        # Clean old image files from disk
+        images_dir = BASE_DIR / "output_v3" / "images"
+        if images_dir.exists():
+            print("🗑️  Deleting old image files...")
+            try:
+                shutil.rmtree(images_dir)
+                print("   ✅ Old image files deleted")
+            except PermissionError:
+                print("   ⚠️  Could not delete image directory (files may be locked)")
+                print("   ℹ️  Continuing anyway - old files may be overwritten...")
+        
+        print()  # Empty line for readability
+    except Exception as e:
+        print(f"❌ Error clearing data: {e}")
+        import traceback
+        traceback.print_exc()
 
-            if image_paths:
-                # Find best comments
-                best_comments = current_metadata.get("comments")
-                current_gk = group_key(current_metadata)
-                if not best_comments or len(best_comments) < 50:
-                    for lookback in range(1, 4):
-                        prev_idx = slide_idx - 1 - lookback
-                        if prev_idx >= 0:
-                            prev_metadata = all_slide_metadata[prev_idx]
-                            if group_key(prev_metadata) == current_gk:
-                                prev_comm = prev_metadata.get("comments") or ""
-                                if prev_comm and len(prev_comm) > 50:
-                                    best_comments = prev_comm
-                                    break
-
-                # **CRITICAL FIX: Get or create matiere by reference**
-                matiere_id = get_or_create_matiere_by_reference(cur, conn, current_metadata)
-                
-                if not matiere_id:
-                    skipped_no_reference += 1
-                    ref_info = current_metadata.get("reference_raw") or "N/A"
-                    print(f"   ⚠️  Slide {slide_idx}: Skipped - no reference (tried: {ref_info})")
-                    continue
-
-                # Process each image
-                for img_path in image_paths:
-                    # Load image for embedding
-                    full_img_path = output_dir.parent / img_path
-                    img = Image.open(full_img_path)
+def process_cokes_powerpoint(ppt_path: Path, output_dir: Path, file_id: int):
+    """
+    Traitement spécifique pour les fichiers de comparaison Cokes.
+    """
+    print(f"\n📊 Processing (Cokes format): {ppt_path.name}")
+    
+    conn = psycopg2.connect(DB_DSN)
+    register_vector(conn)
+    cur = conn.cursor()
+    
+    try:
+        prs = Presentation(ppt_path)
+        
+        # Phase 1: Extract references from Slide 1
+        print("   Phase 1: Extraction des références...")
+        ref_dict = extract_cokes_references_dict(prs)
+        print(f"   → {len(ref_dict)} références trouvées")
+        
+        # Phase 2: Extract comments from Slide 2
+        print("   Phase 2: Extraction des commentaires...")
+        comments_dict = extract_cokes_comments_dict(prs)
+        print(f"   → {len(comments_dict)} produits avec commentaires")
+        
+        # Phase 3: Process image slides (Slide 3+)
+        print("   Phase 3: Traitement des images...")
+        
+        images_dir = output_dir / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        
+        for i in range(2, len(prs.slides)):  # Start from Slide 3
+            slide = prs.slides[i]
+            
+            # Check if has images
+            has_images = any(hasattr(shape, "image") for shape in slide.shapes)
+            if not has_images:
+                continue
+            
+            # Get product name
+            product_name = extract_cokes_product_name_from_slide(slide)
+            if not product_name:
+                print(f"   ⚠️  Slide {i+1}: Pas de nom de produit trouvé")
+                continue
+            
+            # Match to comments and reference
+            comments = match_cokes_product_to_comments(product_name, comments_dict)
+            reference = match_cokes_product_to_reference(product_name, ref_dict)
+            
+            # Get or create matiere
+            matiere_id = get_or_create_matiere_by_reference(cur, conn, {
+                "reference": reference,
+                "product_name": product_name,
+                "type_matiere": "Coke"
+            })
+            
+            if not matiere_id:
+                print(f"   ⚠️  Slide {i+1}: Could not create or find matiere record")
+                continue
+            
+            # Extract magnifications
+            magnifications = extract_magnifications_with_positions(slide)
+            
+            # Process each image on this slide
+            img_count = 0
+            for shape in slide.shapes:
+                if hasattr(shape, "image"):
+                    # Find closest magnification based on vertical position
+                    best_mag = None
+                    if magnifications:
+                        mags_above = [m for m in magnifications if m["top"] < shape.top]
+                        if mags_above:
+                            best_mag = mags_above[-1]["value"]
+                        else:
+                            best_mag = magnifications[0]["value"]
+                    
+                    # Save image
+                    image_bytes = shape.image.blob
+                    filename = f"{ppt_path.stem}_s{i+1:03d}_i{img_count:02d}.png"
+                    filepath = images_dir / filename
+                    img = Image.open(io.BytesIO(image_bytes))
+                    img.save(filepath, "PNG")
                     
                     # Compute embedding
                     embedding = compute_embedding_from_pil(img)
-
-                    entry = current_metadata.copy()
-                    entry["image_path"] = img_path
-                    entry["source_file"] = ppt_path.name
-                    if best_comments:
-                        entry["comments"] = best_comments
-                        entry["description"] = best_comments
-
-                    gk = group_key(entry)
-                    if gk and gk in entity_text_map:
-                        entry["entity_full_text"] = entity_text_map[gk]
-                    else:
-                        entry["entity_full_text"] = ""
-
-                    # Insert into database
-                    success = insert_image_and_notes(conn, cur, entry, source_file_id, matiere_id, embedding)
-                    if success:
-                        all_metadata.append(entry)
-                        ref_display = entry.get('reference_raw') or entry.get('reference') or 'N/A'
-                        mag_display = entry.get('magnification') or 'N/A'
-                        scale_display = entry.get('scale') or 'N/A'
-                        print(f"   ✅ Slide {slide_idx}: {Path(img_path).name} -> matiere_id={matiere_id} | ref:{ref_display} | mag:{mag_display} | scale:{scale_display}")
-
-        if skipped_no_reference > 0:
-            print(f"   ⚠️  Skipped {skipped_no_reference} slides without valid references")
+                    
+                    # Insert
+                    entry = {
+                        "image_path": str(filepath.relative_to(output_dir.parent)),
+                        "magnification": best_mag,
+                        "comments": comments,
+                        "reference": reference,
+                        "slide_number": i+1,
+                        "composition": {}
+                    }
+                    
+                    if insert_image_and_notes(conn, cur, entry, file_id, matiere_id, embedding):
+                        com_status = f"✓ Com ({len(comments)} chars)" if comments else "✗ No com"
+                        ref_status = f"Ref: {reference}" if reference else "No ref"
+                        print(f"   ✅ Slide {i+1}: {product_name:35s} | {ref_status:15s} | {com_status}")
+                    
+                    img_count += 1
         
-        print(f"✅ Processed {ppt_path.name}: {len(all_metadata)} images inserted")
-        return all_metadata
-
+        print(f"✅ Finished processing {ppt_path.name}")
+    
     except Exception as e:
-        conn.rollback()
-        print(f"❌ Error processing {ppt_path.name}: {e}")
+        print(f"❌ Error: {e}")
         import traceback
         traceback.print_exc()
-        return []
     finally:
         cur.close()
         conn.close()
 
-def main():
-    output_dir = BASE_DIR / "embeddings_v7"
-    
-    # Delete and rebuild embeddings folder if it exists
-    if output_dir.exists():
-        print(f"🗑️  Deleting existing embeddings folder: {output_dir}")
-        shutil.rmtree(output_dir)
-        print("✅ Folder deleted\n")
-    
-    print(f"📁 Creating embeddings folder: {output_dir}")
-    output_dir.mkdir(parents=True, exist_ok=True)
+def process_powerpoint_wrapper(ppt_path: Path, output_dir: Path, file_id: int):
+    """
+    Smart router that detects file type and processes accordingly.
+    """
+    try:
+        prs = Presentation(ppt_path)
+        
+        if is_cokes_comparative_file(prs):
+            process_cokes_powerpoint(ppt_path, output_dir, file_id)
+        else:
+            process_standard_powerpoint(ppt_path, output_dir, file_id)
+    except Exception as e:
+        print(f"❌ Error detecting file type for {ppt_path.name}: {e}")
+        import traceback
+        traceback.print_exc()
 
+def process_standard_powerpoint(ppt_path: Path, output_dir: Path, file_id: int):
+    """
+    Standard processing function for regular PowerPoint files.
+    CORRECTION: Amélioration de la propagation des commentaires.
+    """
+    print(f"\n📊 Processing (Standard format): {ppt_path.name}")
+    
     conn = psycopg2.connect(DB_DSN)
     register_vector(conn)
     cur = conn.cursor()
-
+    
     try:
-        # Get all PowerPoint files from database
-        cur.execute("SELECT id, file_path FROM public.powerpoint_files ORDER BY id ASC")
-        powerpoint_files = cur.fetchall()
+
+        prs = Presentation(ppt_path)
+        all_slides_meta = []
         
-        total_files = len(powerpoint_files)
-        print(f"\n📂 Found {total_files} PowerPoint files to process\n")
-
-        all_metadata = []
-        for idx, (file_id, file_path) in enumerate(powerpoint_files, 1):
-            print(f"[{idx}/{total_files}] {Path(file_path).name}")
+        # 2. First pass: Extract all metadata
+        for i, slide in enumerate(prs.slides, 1):
+            meta = extract_metadata_from_slide(slide, i)
+            all_slides_meta.append(meta)
+            # Log extraction status with more detail
+            comments_found = f"✓ Commentaires ({len(meta['comments'])} chars)" if meta["comments"] else "✗ Pas de commentaires"
+            ref_found = f"Ref: {meta['reference']}" if meta["reference"] else "Aucune référence"
+            print(f"   Slide {i}: {ref_found} [{comments_found}]")
             
-            # Check if file exists
-            if not os.path.exists(file_path):
-                print(f"  ⚠️  File not found: {file_path}")
+        # 3. Second pass: Propagate metadata based on reference matching
+        # CORRECTION: Les commentaires doivent être propagés à TOUTES les slides avec la même référence
+        # Logique: Pour chaque slide avec images, trouver la slide précédente avec la même référence qui a des commentaires
+        for i in range(len(all_slides_meta)):
+            current = all_slides_meta[i]
+            
+            # Si la slide actuelle a des images
+            if current["has_images"]:
+                # Cas 1: Pas de référence du tout -> hériter de la slide précédente
+                if not current["reference"] and i > 0:
+                    prev = all_slides_meta[i-1]
+                    current["reference"] = prev["reference"]
+                    current["reference_raw"] = prev["reference_raw"]
+                    current["nuance"] = prev["nuance"]
+                    if not current["comments"] and prev["comments"]:
+                        current["comments"] = prev["comments"]
+                        print(f"   🔄 Slide {i+1}: Métadonnées héritées de la slide {i}")
+                    if not current["composition"] and prev["composition"]:
+                        current["composition"] = prev["composition"]
+                
+                # Cas 2: A une référence mais pas de commentaires -> chercher les commentaires de cette référence
+                elif current["reference"] and not current["comments"]:
+                    # Chercher en arrière la dernière slide avec la même référence qui a des commentaires
+                    for j in range(i-1, -1, -1):
+                        prev = all_slides_meta[j]
+                        if prev["reference"] == current["reference"] and prev["comments"]:
+                            current["comments"] = prev["comments"]
+                            current["nuance"] = current["nuance"] or prev["nuance"]
+                            current["composition"] = current["composition"] or prev["composition"]
+                            print(f"   🔄 Slide {i+1}: Commentaires de {current['reference']} hérités de la slide {j+1}")
+                            break
+
+        # 4. Third pass: Extract images and associate with correct magnification
+        images_dir = output_dir / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        
+        for i, slide in enumerate(prs.slides):
+            meta = all_slides_meta[i]
+            if not meta["has_images"]:
                 continue
-            
-            ppt_path = Path(file_path)
-            metadata = process_powerpoint(ppt_path, output_dir, file_id=file_id, force_reprocess=False)
-            all_metadata.extend(metadata)
+                
+            matiere_id = get_or_create_matiere_by_reference(cur, conn, meta)
+            if not matiere_id:
+                print(f"   ⚠️ Slide {i+1}: No reference found, skipping images.")
+                continue
 
-        # Save metadata.json
-        if all_metadata:
-            metadata_path = output_dir / "metadata.json"
-            with open(metadata_path, "w", encoding="utf-8") as f:
-                json.dump(all_metadata, f, indent=2, ensure_ascii=False)
-            print(f"\n💾 Metadata saved: {metadata_path}")
+            img_count = 0
+            for shape in slide.shapes:
+                if hasattr(shape, "image"):
+                    # Find closest magnification based on vertical position
+                    best_mag = None
+                    if meta["magnifications"]:
+                        # Find the magnification that is above the image but closest to it
+                        mags_above = [m for m in meta["magnifications"] if m["top"] < shape.top]
+                        if mags_above:
+                            best_mag = mags_above[-1]["value"]
+                        else:
+                            # Fallback to the first one if none are above
+                            best_mag = meta["magnifications"][0]["value"]
 
-        print(f"\n🎉 Complete! Total images processed: {len(all_metadata)}")
+                    # Save image
+                    image_bytes = shape.image.blob
+                    filename = f"{ppt_path.stem}_s{i+1:03d}_i{img_count:02d}.png"
+                    filepath = images_dir / filename
+                    img = Image.open(io.BytesIO(image_bytes))
+                    img.save(filepath, "PNG")
+                    
+                    # Compute embedding
+                    embedding = compute_embedding_from_pil(img)
+                    
+                    # Insert
+                    entry = {
+                        "image_path": str(filepath.relative_to(output_dir.parent)),
+                        "magnification": best_mag,
+                        "comments": meta["comments"],
+                        "reference": meta["reference"],
+                        "slide_number": i+1,
+                        "composition": meta["composition"]
+                    }
+                    
+                    # Log comments extraction status with more detail
+                    if meta["comments"]:
+                        comment_preview = meta["comments"][:50] + "..." if len(meta["comments"]) > 50 else meta["comments"]
+                        comments_status = f"✓ Commentaires: '{comment_preview}'"
+                    else:
+                        comments_status = "✗ Aucun commentaire"
+                    
+                    if insert_image_and_notes(conn, cur, entry, file_id, matiere_id, embedding):
+                        print(f"   ✅ Slide {i+1}: Image {img_count} saved (Mag: x{best_mag}) [{comments_status}]")
+                    
+                    img_count += 1
+                    
+        print(f"✅ Finished processing {ppt_path.name}")
 
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         cur.close()
         conn.close()
 
 if __name__ == "__main__":
-    main()
+    # Example usage
+    output = BASE_DIR / "output_v3"
+    output.mkdir(exist_ok=True)
+    
+    # Clear old data before reprocessing
+    clear_old_data()
+    
+    # Get PowerPoint files from the powerpoint_files table
+    try:
+        conn = psycopg2.connect(DB_DSN)
+        cur = conn.cursor()
+        cur.execute("SELECT id, file_path FROM public.powerpoint_files")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        if rows:
+            print(f"Found {len(rows)} PowerPoint files to process from database\n")
+            for row in rows:
+                file_id = row[0]
+                ppt_path = Path(row[1])
+                if ppt_path.exists():
+                    process_powerpoint_wrapper(ppt_path, output, file_id)
+                else:
+                    print(f"⚠️  File not found: {ppt_path}")
+        else:
+            print("⚠️  No PowerPoint files found in the database")
+    except Exception as e:
+        print(f"❌ Error retrieving files from database: {e}")
+        import traceback
+        traceback.print_exc()
