@@ -792,19 +792,27 @@ def get_all_images_for_material(matiere_id: int, limit: int = 2) -> List[Dict[st
                 # Try to find the image file
                 image_obj = None
                 if image_path:
+                    # Get just the filename from the path
+                    filename = Path(image_path).name
+                    
                     possible_paths = [
                         Path(image_path),  # Absolute or relative path from DB
-                        BASE_DIR / image_path,
-                        IMAGES_DIR / Path(image_path).name,
+                        BASE_DIR / image_path,  # Relative to BASE_DIR (handles output_v3\images\...)
+                        IMAGES_DIR / filename,  # embeddings_v7/images/filename
+                        BASE_DIR / "output_v3" / "images" / filename,  # old output_v3 location
                     ]
                     
                     for file_path in possible_paths:
                         if file_path.exists():
                             try:
                                 image_obj = Image.open(file_path).convert("RGB")
+                                print(f"✅ Loaded image from: {file_path}")
                                 break
                             except Exception as e:
                                 print(f"⚠️ Error loading image {file_path}: {e}")
+                    
+                    if not image_obj:
+                        print(f"⚠️ Image not found for path: {image_path} (tried {len(possible_paths)} locations)")
                 
                 images_data.append({
                     "image_path": image_path,
