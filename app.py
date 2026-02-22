@@ -703,6 +703,7 @@ Pour plus d'informations, veuillez consulter la documentation technique complèt
 def get_first_image_for_material(matiere_id: int) -> Optional[Image.Image]:
     """
     Retrieve the first image associated with a material from the database.
+    Handles cross-platform paths (Windows backslashes vs Linux forward slashes).
     
     Args:
         matiere_id: Material ID
@@ -729,16 +730,24 @@ def get_first_image_for_material(matiere_id: int) -> Optional[Image.Image]:
             if result and result.get("image_path"):
                 image_path = result["image_path"]
                 
+                # Normalize path: convert Windows backslashes to forward slashes
+                normalized_path = image_path.replace("\\", "/")
+                filename = Path(normalized_path).name
+                
                 # Try to find the image file
                 possible_paths = [
-                    Path(image_path),  # Absolute or relative path from DB
-                    BASE_DIR / image_path,
-                    IMAGES_DIR / Path(image_path).name,
+                    Path(normalized_path),  # Absolute or relative path from DB (normalized)
+                    BASE_DIR / normalized_path,  # Relative to BASE_DIR
+                    IMAGES_DIR / filename,  # embeddings_v7/images/filename
+                    BASE_DIR / "output_v3" / "images" / filename,  # output_v3 location
                 ]
                 
                 for file_path in possible_paths:
                     if file_path.exists():
-                        return Image.open(file_path).convert("RGB")
+                        try:
+                            return Image.open(file_path).convert("RGB")
+                        except Exception as e:
+                            print(f"⚠️ Error loading image {file_path}: {e}")
         
         return None
     
@@ -754,6 +763,7 @@ def get_first_image_for_material(matiere_id: int) -> Optional[Image.Image]:
 def get_all_images_for_material(matiere_id: int, limit: int = 2) -> List[Dict[str, Any]]:
     """
     Retrieve images associated with a material from the database with magnification info.
+    Handles cross-platform paths (Windows backslashes vs Linux forward slashes).
     
     Args:
         matiere_id: Material ID
@@ -792,27 +802,31 @@ def get_all_images_for_material(matiere_id: int, limit: int = 2) -> List[Dict[st
                 # Try to find the image file
                 image_obj = None
                 if image_path:
+                    # Normalize path: convert Windows backslashes to forward slashes
+                    normalized_path = image_path.replace("\\", "/")
                     # Get just the filename from the path
-                    filename = Path(image_path).name
+                    filename = Path(normalized_path).name
                     
                     possible_paths = [
-                        Path(image_path),  # Absolute or relative path from DB
-                        BASE_DIR / image_path,  # Relative to BASE_DIR (handles output_v3\images\...)
+                        Path(normalized_path),  # Absolute or relative path from DB (normalized)
+                        BASE_DIR / normalized_path,  # Relative to BASE_DIR (handles output_v3/images/...)
                         IMAGES_DIR / filename,  # embeddings_v7/images/filename
-                        BASE_DIR / "output_v3" / "images" / filename,  # old output_v3 location
+                        BASE_DIR / "output_v3" / "images" / filename,  # output_v3 location (cross-platform)
                     ]
                     
                     for file_path in possible_paths:
-                        if file_path.exists():
-                            try:
+                        try:
+                            if file_path.exists():
                                 image_obj = Image.open(file_path).convert("RGB")
                                 print(f"✅ Loaded image from: {file_path}")
                                 break
-                            except Exception as e:
-                                print(f"⚠️ Error loading image {file_path}: {e}")
+                        except Exception as e:
+                            print(f"⚠️ Error loading image {file_path}: {e}")
                     
                     if not image_obj:
-                        print(f"⚠️ Image not found for path: {image_path} (tried {len(possible_paths)} locations)")
+                        print(f"⚠️ Image not found for: {image_path}")
+                        print(f"   Normalized: {normalized_path}")
+                        print(f"   Tried locations: {[str(p) for p in possible_paths]}")
                 
                 images_data.append({
                     "image_path": image_path,
@@ -824,6 +838,8 @@ def get_all_images_for_material(matiere_id: int, limit: int = 2) -> List[Dict[st
         
     except Exception as e:
         print(f"⚠️ Error retrieving images: {e}")
+        import traceback
+        traceback.print_exc()
         return []
     
     finally:
