@@ -1792,7 +1792,7 @@ Please provide only the JSON response, without any markdown formatting or code b
     try:
         # Call Groq API
         response = groq_client.chat.completions.create(
-            model="llama3-70b-8192",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {
                     "role": "system",
@@ -1815,7 +1815,7 @@ Please provide only the JSON response, without any markdown formatting or code b
         return {
             "success": True,
             "analysis": analysis_data,
-            "model_used": "llama-3.1-70b-versatile",
+            "model_used": "llama-3.3-70b-versatile",
             "prompt_tokens": response.usage.prompt_tokens,
             "completion_tokens": response.usage.completion_tokens
         }
