@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 import json
+from datetime import datetime
 from pathlib import Path
 from threading import Thread
 from typing import Optional, List, Dict, Any
@@ -26,7 +27,7 @@ from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 from pgvector.psycopg2 import register_vector
 from pgvector import Vector
 
@@ -1379,8 +1380,8 @@ def generate_fiche_adn_docx():
         doc.add_heading("CONTENT", level=2)
         add_formatted_markdown_to_docx(doc, content)
         
-        # Try to add images with magnification
-        images = get_all_images_for_material(matiere_id)
+        # Try to add images with magnification (limit to 2 different magnifications)
+        images = get_all_images_for_material(matiere_id, limit=10)  # Get more to find 2 different magnifications
         if images:
             doc.add_page_break()
             
@@ -1390,8 +1391,20 @@ def generate_fiche_adn_docx():
             
             doc.add_paragraph()  # Add spacing
             
-            # Add each image with its magnification
-            for idx, img_data in enumerate(images, 1):
+            # Find 2 images with different magnifications
+            added_magnifications = set()
+            images_to_add = []
+            
+            for img_data in images:
+                if img_data["image_obj"] and len(images_to_add) < 2:
+                    magnification = img_data.get("magnification", "N/A")
+                    # Only add if we haven't added this magnification yet
+                    if magnification not in added_magnifications:
+                        images_to_add.append(img_data)
+                        added_magnifications.add(magnification)
+            
+            # Add each image with its magnification (max 2)
+            for idx, img_data in enumerate(images_to_add, 1):
                 if img_data["image_obj"]:
                     # Add magnification heading
                     magnification = img_data.get("magnification", "N/A")
@@ -1607,6 +1620,453 @@ def search():
 
     except Exception as e:
         return jsonify({"success": False, "error": "search_failed", "message": str(e)}), 500
+
+
+# -----------------------------------------------------------------------------
+# APPLICATION ANALYSIS ENDPOINTS
+# -----------------------------------------------------------------------------
+
+def generate_application_analysis_with_llm(
+    fiche_adn_data: Dict[str, Any],
+    company_context: str = None
+) -> Dict[str, Any]:
+    """
+    Generate comprehensive application analysis using LLM.
+    
+    Args:
+        fiche_adn_data: Complete fiche ADN data (material specifications)
+        company_context: AVOCarbon company context and product scope
+        
+    Returns:
+        Structured analysis with applications, processes, properties, and opportunities
+    """
+    if not groq_client:
+        return {
+            "success": False,
+            "error": "llm_not_configured",
+            "message": "Groq client not initialized"
+        }
+    
+    # Default company context if not provided
+    if not company_context:
+        company_context = """
+AVOCarbon - Company Scope:
+Core Business Areas:
+1. Carbon brushes for electric motors (automotive, power tools, household appliances)
+2. Brush-holder assemblies
+3. Inductors and coils (chokes) for EMI filtering
+4. Dynamic sealing joints (via Cyclam division)
+5. Self-lubricating bearings and bushings
+6. Friction rings, rotors, vanes for motors and pumps
+
+Target Industries:
+- Automotive (electric/hybrid vehicles, alternators, starters, auxiliary motors)
+- Power tools
+- Household appliances
+- Industrial equipment
+- Specific mobility (special vehicles, electric two-wheelers)
+
+Technology Focus:
+- Carbon and graphite composite materials
+- Electrical conduction and EMI suppression
+- Friction and wear management
+- Self-lubrication systems
+- Thermal management
+"""
+    
+    # Extract key material properties
+    material_name = fiche_adn_data.get("nom_matiere", "Unknown Material")
+    reference = fiche_adn_data.get("reference", "N/A")
+    type_matiere = fiche_adn_data.get("type_matiere", "N/A")
+    specifications = fiche_adn_data.get("specifications", {})
+    
+    # Build comprehensive prompt
+    prompt = f"""# Material Application Analysis Request
+
+You are an industrial materials application engineer analyzing potential uses for a material.
+
+## Material Information
+- Name: {material_name}
+- Reference: {reference}
+- Type: {type_matiere}
+
+## Material Specifications (Fiche ADN)
+{json.dumps(specifications, indent=2, ensure_ascii=False)}
+
+## Company Context
+{company_context}
+
+## Analysis Requirements
+
+Please analyze this material and provide a comprehensive structured response with the following information:
+
+1. **Main Application Domains**: List the primary application areas where this material is generally used
+
+2. **Detailed Applications**: For each application, provide:
+   a. Application name and category
+   b. Industry/sector
+   c. Is it within AVOCarbon's current scope? (core_business / strategic_opportunity / outside_scope)
+   d. Priority level for AVOCarbon (1-5, where 5 is highest strategic importance)
+
+3. **Manufacturing Engagement**: For each application, describe:
+   a. Complete manufacturing/engagement process (step-by-step)
+   b. Specific role of the material in this application
+   c. Critical process parameters (temperature, pressure, time, etc.)
+
+4. **Required Properties**: For each application, list:
+   a. Critical material properties needed
+   b. Performance specifications
+   c. Why these properties matter for this application
+
+5. **Strategic Opportunities**: Identify:
+   a. Applications within AVOCarbon's current expertise that could be developed
+   b. New market opportunities adjacent to current business
+   c. Potential partnerships or technology transfers
+
+## Response Format
+
+Provide your response as a valid JSON object with this exact structure:
+
+```json
+{{
+  "material_summary": {{
+    "key_characteristics": ["list", "of", "key", "properties"],
+    "primary_domains": ["domain1", "domain2"]
+  }},
+  "applications": [
+    {{
+      "application_name": "string",
+      "application_category": "string (e.g., 'Carbon Brushes', 'Friction Materials')",
+      "industry_sector": "string",
+      "domain": "core_business | strategic_opportunity | outside_scope",
+      "priority_level": 1-5,
+      "engagement_process": {{
+        "process_description": "detailed string",
+        "steps": [
+          {{
+            "step_number": 1,
+            "step_name": "string",
+            "description": "string",
+            "parameters": {{"temperature": "value", "pressure": "value"}}
+          }}
+        ],
+        "material_role": "string describing the material's function"
+      }},
+      "required_properties": [
+        {{
+          "property_name": "string",
+          "importance": "critical | important | beneficial",
+          "target_value": "string or null",
+          "reason": "why this property matters"
+        }}
+      ],
+      "market_potential": {{
+        "current_market_size": "string estimate or 'unknown'",
+        "growth_trend": "growing | stable | declining | unknown",
+        "competitive_advantage": "string or null"
+      }}
+    }}
+  ],
+  "strategic_recommendations": {{
+    "within_scope": [
+      {{
+        "opportunity": "string",
+        "rationale": "string",
+        "development_effort": "low | medium | high"
+      }}
+    ],
+    "strategic_expansion": [
+      {{
+        "opportunity": "string",
+        "rationale": "string",
+        "requirements": "string"
+      }}
+    ]
+  }}
+}}
+```
+
+Please provide only the JSON response, without any markdown formatting or code blocks.
+"""
+    
+    try:
+        # Call Groq API
+        response = groq_client.chat.completions.create(
+            model="llama-3.1-70b-versatile",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert materials engineer specializing in industrial applications of carbon, graphite, and composite materials. You provide detailed, technically accurate analysis in structured JSON format."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.3,
+            max_tokens=8000,
+            response_format={"type": "json_object"}
+        )
+        
+        # Parse response
+        analysis_text = response.choices[0].message.content
+        analysis_data = json.loads(analysis_text)
+        
+        return {
+            "success": True,
+            "analysis": analysis_data,
+            "model_used": "llama-3.1-70b-versatile",
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": response.usage.completion_tokens
+        }
+        
+    except json.JSONDecodeError as e:
+        print(f"⚠️ JSON parsing error: {e}")
+        print(f"Raw response: {analysis_text[:500]}...")
+        return {
+            "success": False,
+            "error": "json_parse_error",
+            "message": str(e),
+            "raw_response": analysis_text[:1000]
+        }
+    except Exception as e:
+        print(f"⚠️ LLM generation error: {e}")
+        return {
+            "success": False,
+            "error": "llm_generation_failed",
+            "message": str(e)
+        }
+
+
+@app.route("/generate_application_analysis", methods=["POST"])
+def generate_application_analysis():
+    """
+    Generate application analysis for a material using LLM.
+    
+    Request body:
+        {
+            "reference": "material reference",
+            "company_context": "optional custom company context",
+            "save_to_db": true/false (default: true)
+        }
+    
+    Returns:
+        Structured application analysis with manufacturing processes and opportunities
+    """
+    data = request.get_json() or {}
+    reference = data.get("reference", "").strip()
+    company_context = data.get("company_context")
+    save_to_db = data.get("save_to_db", True)
+    
+    if not reference:
+        return jsonify({
+            "success": False,
+            "error": "missing_parameters",
+            "message": "Parameter 'reference' is required"
+        }), 400
+    
+    conn = None
+    try:
+        conn = get_db_conn()
+        
+        # Fetch fiche ADN
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT 
+                    fiche_adn_id,
+                    matiere_id,
+                    nom_matiere,
+                    reference,
+                    type_matiere,
+                    specifications
+                FROM public.fiches_ADN_matieres
+                WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
+                LIMIT 1
+            """, (reference,))
+            
+            fiche_adn = cur.fetchone()
+            
+            if not fiche_adn:
+                return jsonify({
+                    "success": False,
+                    "error": "fiche_adn_not_found",
+                    "message": f"No fiche ADN found for reference: {reference}"
+                }), 404
+            
+            fiche_data = dict(fiche_adn)
+        
+        # Generate analysis using LLM
+        analysis_result = generate_application_analysis_with_llm(fiche_data, company_context)
+        
+        if not analysis_result.get("success"):
+            return jsonify(analysis_result), 500
+        
+        # Save to database if requested
+        if save_to_db:
+            analysis_data = analysis_result["analysis"]
+            
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Get fiche_adn_id from fiches_ADN_matieres
+                cur.execute("""
+                    SELECT fiche_adn_id FROM public.fiches_ADN_matieres
+                    WHERE matiere_id = %s
+                    LIMIT 1
+                """, (fiche_data["matiere_id"],))
+                
+                fiche_adn_row = cur.fetchone()
+                fiche_adn_id = fiche_adn_row["fiche_adn_id"] if fiche_adn_row else None
+                
+                # Insert into fiches_applications_matieres (existing table)
+                cur.execute("""
+                    INSERT INTO public.fiches_applications_matieres
+                    (matiere_id, fiche_adn_id, nom_matiere, reference, type_matiere, 
+                     analysis_data, num_applications, date_creation, derniere_modification)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    RETURNING fiche_app_id
+                """, (
+                    fiche_data["matiere_id"],
+                    fiche_adn_id,
+                    fiche_data["nom_matiere"],
+                    fiche_data["reference"],
+                    fiche_data["type_matiere"],
+                    Json(analysis_data),
+                    len(analysis_data.get("applications", []))
+                ))
+                
+                fiche_app_id = cur.fetchone()["fiche_app_id"]
+                
+                conn.commit()
+                
+                analysis_result["fiche_app_id"] = fiche_app_id
+                analysis_result["saved_to_database"] = True
+        
+        return jsonify(analysis_result), 200
+        
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"⚠️ Error generating application analysis: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": "analysis_generation_failed",
+            "message": str(e)
+        }), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.route("/application_analysis/<int:matiere_id>", methods=["GET"])
+def get_application_analysis(matiere_id):
+    """
+    Retrieve application analysis for a material.
+    
+    Query parameters:
+        - include_sessions: true/false (include all analysis sessions)
+        - include_steps: true/false (include detailed process steps)
+    
+    Returns:
+        Complete application analysis with all applications, processes, and opportunities
+    """
+    include_sessions = request.args.get("include_sessions", "false").lower() == "true"
+    include_steps = request.args.get("include_steps", "true").lower() == "true"
+    
+    conn = None
+    try:
+        conn = get_db_conn()
+        
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Get material info
+            cur.execute("""
+                SELECT matiere_id, nom_matiere, reference, type_matiere
+                FROM public.matieres
+                WHERE matiere_id = %s
+            """, (matiere_id,))
+            
+            material = cur.fetchone()
+            if not material:
+                return jsonify({
+                    "success": False,
+                    "error": "material_not_found",
+                    "message": f"Material ID {matiere_id} not found"
+                }), 404
+            
+            material = dict(material)
+            
+            # Get analyses from fiches_applications_matieres
+            cur.execute("""
+                SELECT 
+                    fiche_app_id,
+                    fiche_adn_id,
+                    analysis_data,
+                    num_applications,
+                    date_creation,
+                    derniere_modification
+                FROM public.fiches_applications_matieres
+                WHERE matiere_id = %s
+                ORDER BY date_creation DESC
+            """, (matiere_id,))
+            
+            fiches = [dict(row) for row in cur.fetchall()]
+            
+            # Get latest analysis
+            latest_analysis = fiches[0] if fiches else None
+            applications = []
+            
+            if latest_analysis:
+                analysis_data = latest_analysis.get("analysis_data", {})
+                applications = analysis_data.get("applications", [])
+            
+            # Process steps are already in the JSON structure
+            if include_steps and applications:
+                for app in applications:
+                    process = app.get("engagement_process", {})
+                    app["process_steps"] = process.get("steps", [])
+            
+            # Include all fiches if requested
+            sessions = fiches if include_sessions else []
+            
+            # Build summary from JSON data
+            summary = {
+                "total_applications": len(applications),
+                "by_domain": {},
+                "by_priority": {"high": 0, "medium": 0, "low": 0},
+                "total_analyses": len(fiches)
+            }
+            
+            # Count by domain and priority from applications
+            for app in applications:
+                domain = app.get("domain", "unknown")
+                summary["by_domain"][domain] = summary["by_domain"].get(domain, 0) + 1
+                
+                priority = app.get("priority_level", 0)
+                if priority >= 4:
+                    summary["by_priority"]["high"] += 1
+                elif priority >= 2:
+                    summary["by_priority"]["medium"] += 1
+                else:
+                    summary["by_priority"]["low"] += 1
+            
+            return jsonify({
+                "success": True,
+                "material": material,
+                "applications": applications,
+                "analysis_sessions": sessions if include_sessions else None,
+                "summary": summary
+            }), 200
+            
+    except Exception as e:
+        print(f"⚠️ Error retrieving application analysis: {e}")
+        return jsonify({
+            "success": False,
+            "error": "retrieval_failed",
+            "message": str(e)
+        }), 500
+    finally:
+        if conn:
+            conn.close()
 
 
 # -----------------------------------------------------------------------------
