@@ -1407,7 +1407,11 @@ def generate_fiche_adn_docx():
         # Build absolute download URL
         # Get the host from request headers (for Azure deployment)
         host = request.host or os.getenv("API_HOST", "localhost:5000")
-        protocol = "https" if request.scheme == "https" else request.scheme
+        # Check X-Forwarded-Proto header first (set by Azure load balancer)
+        protocol = request.headers.get("X-Forwarded-Proto", request.scheme)
+        # Force HTTPS for production domains
+        if ".azurewebsites.net" in host or ".azure" in host:
+            protocol = "https"
         absolute_download_url = f"{protocol}://{host}/download_fiche_adn_docx/{filename}"
         
         # Return JSON response with download URL
