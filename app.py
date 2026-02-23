@@ -1782,23 +1782,55 @@ Follow the requested structure exactly.
 ## Report Structure
 
 ### 1) Lecture rapide du matériau
-- Points clés issus de la fiche
-- Interprétation
 
-### 2) Domaines d'application principaux
-- For each application (A, B, C...):
-  - Engagement du matériau
-  - Rôle du matériau
-  - Propriétés clés recherchées
+**Points clés issus de la fiche :**
+- [Liste des points clés, par exemple : Pureté carbone très élevée : 99,8 %, Faible teneur en cendres : 0,2 %, etc.]
+
+**Interprétation :**
+- [Interprétation détaillée, par exemple : Cela correspond à un graphite naturel de qualité industrielle fine, adapté à...]
+
+### 2) Domaines d’application principaux
+
+Pour chaque application (A, B, C, etc.) :
+
+**A) [Nom de l'application]**
+
+([Indication si l'application est cœur de métier, opportunité stratégique, etc. de votre groupe])
+
+**Engagement du matériau**
+- [Description détaillée du processus d'engagement du matériau, étape par étape]
+
+**Rôle du graphite**
+- [Description du rôle spécifique du matériau dans cette application]
+
+**Propriétés clés recherchées**
+- [Liste des propriétés clés, par exemple : Conductivité électrique, Faible friction, etc.]
+
+[Répéter la structure ci-dessus pour chaque application (B, C, D, etc.)]
 
 ### 3) Tableau de synthèse
-- Markdown table with columns: Application, Process, Rôle, Propriétés
 
-### 4) Applications stratégiques hors cœur de métier
-- List of opportunities
+| Application | Process d’engagement | Rôle du graphite | Propriétés clés |
+|-------------|----------------------|------------------|-----------------|
+| [Application 1] | [Process 1] | [Rôle 1] | [Propriétés 1] |
+| [Application 2] | [Process 2] | [Rôle 2] | [Propriétés 2] |
+| ... | ... | ... | ... |
+
+### 4) Applications stratégiques hors cœur de métier (potentiel de développement)
+
+**Opportunités intéressantes**
+- [Liste des opportunités, par exemple : Plastiques conducteurs pour électronique, Bagues autolubrifiantes pour pompes industrielles, etc.]
 
 ### 5) Lecture stratégique pour votre groupe
-- Summary of material's relevance to AVOCarbon
+
+Ce type de graphite :
+- [Résumé de la pertinence du matériau pour AVOCarbon, par exemple : est un graphite de formulation (pas un graphite structurel massif)]
+- [Est idéal pour : balais carbone, composites autolubrifiants, plastiques techniques conducteurs]
+
+➡️ Il est parfaitement cohérent avec :
+- [Votre activité balais]
+- [Vos projets bushings]
+- [Vos pistes hors automobile]
 
 Please provide only the complete markdown content for the document body.
 """
