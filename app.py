@@ -1908,7 +1908,7 @@ def generate_application_analysis():
                 existing_analysis = existing_dict.get("analysis_data", {})
                 
                 # Generate DOCX if it doesn't exist
-                docx_filename = generate_application_analysis_docx(fiche_data, existing_analysis)
+                docx_filename = generate_application_analysis_docx_with_llm(fiche_data, existing_analysis)
                 download_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True)
                 
                 return jsonify({
@@ -1967,7 +1967,7 @@ def generate_application_analysis():
                 analysis_result["saved_to_database"] = True
         
         # Generate DOCX
-        docx_filename = generate_application_analysis_docx(fiche_data, analysis_result["analysis"])
+        docx_filename = generate_application_analysis_docx_with_llm(fiche_data, analysis_result["analysis"])
         download_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True)
         
         analysis_result["docx_filename"] = docx_filename
@@ -2100,7 +2100,7 @@ def get_application_analysis():
                 fiche_data["nom_matiere"] = material.get("nom_matiere", "")
                 analysis_json = latest_analysis.get("analysis_data", {})
                 
-                docx_filename = generate_application_analysis_docx(fiche_data, analysis_json)
+                docx_filename = generate_application_analysis_docx_with_llm(fiche_data, analysis_json)
                 docx_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True)
             
             return jsonify({
