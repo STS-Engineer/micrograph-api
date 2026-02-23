@@ -1732,7 +1732,7 @@ Please provide only the JSON response, without any markdown formatting or code b
         return {
             "success": True,
             "analysis": analysis_data,
-            "model_used": "llama-3.3-70b-versatile",
+            "model_used": "llama-3.1-70b-versatile",
             "prompt_tokens": response.usage.prompt_tokens,
             "completion_tokens": response.usage.completion_tokens
         }
@@ -1909,7 +1909,11 @@ def generate_application_analysis():
                 
                 # Generate DOCX if it doesn't exist
                 docx_filename = generate_application_analysis_docx_with_llm(fiche_data, existing_analysis)
-                download_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True)
+                # Force HTTPS for Azure deployment
+                protocol = request.headers.get("X-Forwarded-Proto", request.scheme)
+                if ".azurewebsites.net" in request.host or ".azure" in request.host:
+                    protocol = "https"
+                download_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True, _scheme=protocol)
                 
                 return jsonify({
                     "success": True,
@@ -1968,7 +1972,11 @@ def generate_application_analysis():
         
         # Generate DOCX
         docx_filename = generate_application_analysis_docx_with_llm(fiche_data, analysis_result["analysis"])
-        download_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True)
+        # Force HTTPS for Azure deployment
+        protocol = request.headers.get("X-Forwarded-Proto", request.scheme)
+        if ".azurewebsites.net" in request.host or ".azure" in request.host:
+            protocol = "https"
+        download_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True, _scheme=protocol)
         
         analysis_result["docx_filename"] = docx_filename
         analysis_result["download_url"] = download_url
@@ -2101,7 +2109,11 @@ def get_application_analysis():
                 analysis_json = latest_analysis.get("analysis_data", {})
                 
                 docx_filename = generate_application_analysis_docx_with_llm(fiche_data, analysis_json)
-                docx_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True)
+                # Force HTTPS for Azure deployment
+                protocol = request.headers.get("X-Forwarded-Proto", request.scheme)
+                if ".azurewebsites.net" in request.host or ".azure" in request.host:
+                    protocol = "https"
+                docx_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True, _scheme=protocol)
             
             return jsonify({
                 "success": True,
