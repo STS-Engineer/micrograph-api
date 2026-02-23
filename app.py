@@ -1792,7 +1792,7 @@ Please provide only the JSON response, without any markdown formatting or code b
     try:
         # Call Groq API
         response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama3-70b-8192",
             messages=[
                 {
                     "role": "system",
@@ -1815,7 +1815,7 @@ Please provide only the JSON response, without any markdown formatting or code b
         return {
             "success": True,
             "analysis": analysis_data,
-            "model_used": "llama-3.3-70b-versatile",
+            "model_used": "llama-3.1-70b-versatile",
             "prompt_tokens": response.usage.prompt_tokens,
             "completion_tokens": response.usage.completion_tokens
         }
@@ -1838,6 +1838,135 @@ Please provide only the JSON response, without any markdown formatting or code b
         }
 
 
+def generate_application_analysis_docx(fiche_data: Dict[str, Any], analysis_data: Dict[str, Any]) -> str:
+    """
+    Generate a formatted DOCX document with application analysis.
+    
+    Returns the filepath to the generated DOCX file.
+    """
+    from datetime import datetime
+    
+    doc = Document()
+    doc.default_paragraph_style.font.name = 'Arial'
+    doc.default_paragraph_style.font.size = Pt(11)
+    
+    # Title
+    title = doc.add_paragraph()
+    title_run = title.add_run(f"Analyse d'usage du {fiche_data.get('nom_matiere', 'Matière')} {fiche_data.get('reference', 'N/A')}")
+    title_run.font.size = Pt(14)
+    title_run.font.bold = True
+    
+    # Section 1: Quick Reading
+    doc.add_heading("1) Lecture rapide du matériau", level=2)
+    doc.add_paragraph("Points clés issus de la fiche :")
+    
+    key_chars = analysis_data.get("material_summary", {}).get("key_characteristics", [])
+    for char in key_chars:
+        p = doc.add_paragraph(char, style='List Bullet')
+    
+    # Add interpretation
+    doc.add_paragraph("➡️ Cela correspond à un matériau adapté aux applications suivantes :")
+    domains = analysis_data.get("material_summary", {}).get("primary_domains", [])
+    for domain in domains:
+        p = doc.add_paragraph(f"aux {domain}", style='List Bullet')
+    
+    # Section 2: Main Application Domains
+    doc.add_heading("2) Domaines d'application principaux", level=2)
+    
+    applications = analysis_data.get("applications", [])
+    for idx, app in enumerate(applications, 1):
+        letter = chr(64 + idx)  # A, B, C, etc.
+        doc.add_heading(f"{letter}) {app.get('application_name', 'Application')}", level=3)
+        
+        doc.add_paragraph(f"Domain: {app.get('domain', 'N/A')} | Priority: {app.get('priority_level', 0)}")
+        
+        # Engagement process
+        doc.add_heading("Engagement du matériau", level=4)
+        process = app.get("engagement_process", {})
+        process_desc = process.get("process_description", "")
+        doc.add_paragraph(process_desc)
+        
+        steps = process.get("steps", [])
+        if steps:
+            for step in steps:
+                step_text = f"{step.get('step_name', 'Step')}: {step.get('description', '')}"
+                doc.add_paragraph(step_text, style='List Bullet')
+        
+        # Material role
+        doc.add_heading("Rôle du matériau", level=4)
+        material_role = process.get("material_role", "N/A")
+        doc.add_paragraph(material_role)
+        
+        # Required properties
+        doc.add_heading("Propriétés clés recherchées", level=4)
+        props = app.get("required_properties", [])
+        for prop in props:
+            prop_text = f"{prop.get('property_name', 'Propriété')}: {prop.get('reason', '')}"
+            doc.add_paragraph(prop_text, style='List Bullet')
+        
+        doc.add_paragraph()  # spacing
+    
+    # Section 3: Summary Table
+    doc.add_heading("3) Tableau de synthèse", level=2)
+    
+    table = doc.add_table(rows=1, cols=4)
+    table.style = 'Light Grid Accent 1'
+    hdr_cells = table.rows[0].cells
+    hdr_cells[0].text = 'Application'
+    hdr_cells[1].text = "Process d'engagement"
+    hdr_cells[2].text = 'Rôle du matériau'
+    hdr_cells[3].text = 'Propriétés clés'
+    
+    for app in applications:
+        row_cells = table.add_row().cells
+        row_cells[0].text = app.get('application_name', '')
+        
+        process = app.get("engagement_process", {})
+        row_cells[1].text = process.get("process_description", "")[:100] + "..."
+        row_cells[2].text = process.get("material_role", "")
+        
+        props = app.get("required_properties", [])
+        prop_names = ", ".join([p.get('property_name', '') for p in props[:3]])
+        row_cells[3].text = prop_names
+    
+    # Section 4: Strategic Opportunities
+    doc.add_heading("4) Applications stratégiques hors cœur de métier", level=2)
+    
+    recommendations = analysis_data.get("strategic_recommendations", {})
+    strategic = recommendations.get("strategic_expansion", [])
+    
+    doc.add_paragraph("Opportunités intéressantes :")
+    for opp in strategic:
+        text = f"{opp.get('opportunity', '')}: {opp.get('rationale', '')}"
+        doc.add_paragraph(text, style='List Bullet')
+    
+    # Section 5: Strategic Reading
+    doc.add_heading("5) Lecture stratégique pour votre groupe", level=2)
+    
+    doc.add_paragraph("Ce type de matériau :")
+    doc.add_paragraph("est idéal pour :", style='List Bullet')
+    for app in applications[:3]:
+        doc.add_paragraph(app.get('application_name', ''), style='List Bullet 2')
+    
+    doc.add_paragraph("➡️ Il est parfaitement cohérent avec :")
+    doc.add_paragraph("votre activité existante", style='List Bullet')
+    doc.add_paragraph("vos projets de diversification", style='List Bullet')
+    
+    # Save to temp_docx folder
+    from pathlib import Path
+    temp_docx_dir = Path(__file__).resolve().parent / "temp_docx"
+    temp_docx_dir.mkdir(exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ref_safe = fiche_data.get("reference", "material").replace(" ", "_")
+    filename = f"Analyse_{ref_safe}_{timestamp}.docx"
+    filepath = temp_docx_dir / filename
+    
+    doc.save(str(filepath))
+    
+    return filename
+
+
 @app.route("/generate_application_analysis", methods=["POST"])
 def generate_application_analysis():
     """
@@ -1851,7 +1980,7 @@ def generate_application_analysis():
         }
     
     Returns:
-        Structured application analysis with manufacturing processes and opportunities
+        Structured application analysis with DOCX download link
     """
     data = request.get_json() or {}
     reference = data.get("reference", "").strip()
@@ -1894,6 +2023,33 @@ def generate_application_analysis():
                 }), 404
             
             fiche_data = dict(fiche_adn)
+            
+            # Check if analysis already exists for this reference
+            cur.execute("""
+                SELECT fiche_app_id, analysis_data FROM public.fiches_applications_matieres
+                WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
+                LIMIT 1
+            """, (reference,))
+            
+            existing = cur.fetchone()
+            if existing:
+                # Return existing analysis instead of regenerating
+                existing_dict = dict(existing)
+                existing_analysis = existing_dict.get("analysis_data", {})
+                
+                # Generate DOCX if it doesn't exist
+                docx_filename = generate_application_analysis_docx(fiche_data, existing_analysis)
+                download_url = f"/download_fiche_adn_docx/{docx_filename}"
+                
+                return jsonify({
+                    "success": True,
+                    "message": "Analysis already exists for this reference",
+                    "analysis": existing_analysis,
+                    "fiche_app_id": existing_dict.get("fiche_app_id"),
+                    "docx_filename": docx_filename,
+                    "download_url": download_url,
+                    "is_existing": True
+                }), 200
         
         # Generate analysis using LLM
         analysis_result = generate_application_analysis_with_llm(fiche_data, company_context)
@@ -1901,7 +2057,7 @@ def generate_application_analysis():
         if not analysis_result.get("success"):
             return jsonify(analysis_result), 500
         
-        # Save to database if requested
+        # Save to database (only if it was already unique)
         if save_to_db:
             analysis_data = analysis_result["analysis"]
             
@@ -1940,6 +2096,13 @@ def generate_application_analysis():
                 analysis_result["fiche_app_id"] = fiche_app_id
                 analysis_result["saved_to_database"] = True
         
+        # Generate DOCX
+        docx_filename = generate_application_analysis_docx(fiche_data, analysis_result["analysis"])
+        download_url = f"/download_fiche_adn_docx/{docx_filename}"
+        
+        analysis_result["docx_filename"] = docx_filename
+        analysis_result["download_url"] = download_url
+        
         return jsonify(analysis_result), 200
         
     except Exception as e:
@@ -1958,42 +2121,53 @@ def generate_application_analysis():
             conn.close()
 
 
-@app.route("/application_analysis/<int:matiere_id>", methods=["GET"])
-def get_application_analysis(matiere_id):
+@app.route("/application_analysis", methods=["GET"])
+def get_application_analysis():
     """
-    Retrieve application analysis for a material.
+    Retrieve application analysis for a material by reference.
     
     Query parameters:
+        - reference: Material reference code (required)
         - include_sessions: true/false (include all analysis sessions)
         - include_steps: true/false (include detailed process steps)
     
     Returns:
-        Complete application analysis with all applications, processes, and opportunities
+        Complete application analysis with DOCX download link
     """
+    reference = request.args.get("reference", "").strip()
     include_sessions = request.args.get("include_sessions", "false").lower() == "true"
     include_steps = request.args.get("include_steps", "true").lower() == "true"
+    
+    if not reference:
+        return jsonify({
+            "success": False,
+            "error": "missing_parameters",
+            "message": "Query parameter 'reference' is required"
+        }), 400
     
     conn = None
     try:
         conn = get_db_conn()
         
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Get material info
+            # Get material info via reference
             cur.execute("""
-                SELECT matiere_id, nom_matiere, reference, type_matiere
-                FROM public.matieres
-                WHERE matiere_id = %s
-            """, (matiere_id,))
+                SELECT m.matiere_id, m.nom_matiere, m.reference, m.type_matiere
+                FROM public.matieres m
+                WHERE UPPER(REPLACE(TRIM(m.reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
+                LIMIT 1
+            """, (reference,))
             
             material = cur.fetchone()
             if not material:
                 return jsonify({
                     "success": False,
                     "error": "material_not_found",
-                    "message": f"Material ID {matiere_id} not found"
+                    "message": f"Material with reference {reference} not found"
                 }), 404
             
             material = dict(material)
+            matiere_id = material["matiere_id"]
             
             # Get analyses from fiches_applications_matieres
             cur.execute("""
@@ -2049,16 +2223,29 @@ def get_application_analysis(matiere_id):
                 else:
                     summary["by_priority"]["low"] += 1
             
+            # Generate DOCX if analysis exists
+            docx_url = None
+            if latest_analysis:
+                fiche_data = dict(material)
+                fiche_data["nom_matiere"] = material.get("nom_matiere", "")
+                analysis_json = latest_analysis.get("analysis_data", {})
+                
+                docx_filename = generate_application_analysis_docx(fiche_data, analysis_json)
+                docx_url = f"/download_fiche_adn_docx/{docx_filename}"
+            
             return jsonify({
                 "success": True,
                 "material": material,
                 "applications": applications,
                 "analysis_sessions": sessions if include_sessions else None,
-                "summary": summary
+                "summary": summary,
+                "docx_download_url": docx_url
             }), 200
             
     except Exception as e:
         print(f"⚠️ Error retrieving application analysis: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({
             "success": False,
             "error": "retrieval_failed",
