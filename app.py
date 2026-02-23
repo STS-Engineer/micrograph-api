@@ -10,13 +10,14 @@ from datetime import datetime
 from pathlib import Path
 from threading import Thread
 from typing import Optional, List, Dict, Any
+import re
 
 from dotenv import load_dotenv
 
 import numpy as np
 import requests
 import torch
-from flask import Flask, jsonify, request, send_from_directory, send_file
+from flask import Flask, jsonify, request, send_from_directory, send_file, url_for
 from openai import OpenAI
 from PIL import Image
 from transformers import AutoModel, AutoImageProcessor
@@ -30,6 +31,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from pgvector.psycopg2 import register_vector
 from pgvector import Vector
+from flask import url_for
 
 # Load environment variables from .env file
 load_dotenv()
@@ -481,193 +483,108 @@ QUALITY REQUIREMENTS:
 # -------------------------------------------------------
 # MARKDOWN TO DOCX FORMATTING
 # -------------------------------------------------------
-def add_formatted_markdown_to_docx(doc: Document, markdown_content: str):
+def add_formatted_markdown_to_docx(doc: Document, markdown_text):
     """
-    Parse markdown content and add it to the DOCX with proper formatting.
-    Handles: headers, subheaders, tables, bullet lists, and inline formatting.
+    Parses markdown text and adds it to the DOCX document with basic formatting.
+    Supports:
+    - Headings (##, ###, ####)
+    - Bold (**text**)
+    - Unordered lists (* or -)
+    - Simple tables (for the summary)
     """
-    lines = markdown_content.split('\n')
-    i = 0
+    # Normalize line endings
+    lines = markdown_text.strip().replace('\r\n', '\n').split('\n')
     
+    in_table = False
+    table = None
+    
+    i = 0
     while i < len(lines):
-        line = lines[i].rstrip()
+        line = lines[i].strip()
         
-        # Skip empty lines
-        if not line.strip():
+        if not line:
             i += 1
             continue
-        
-        # Handle H2 headers (## title)
-        if line.startswith('## '):
-            title = line[3:].strip()
-            heading = doc.add_heading(title, level=1)
-            heading.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            for run in heading.runs:
-                run.font.size = Pt(13)
-                run.font.bold = True
-            i += 1
-            continue
-        
-        # Handle H3 headers (### title)
-        if line.startswith('### '):
-            title = line[4:].strip()
-            heading = doc.add_heading(title, level=2)
-            heading.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            for run in heading.runs:
-                run.font.size = Pt(11)
-                run.font.bold = True
-            i += 1
-            continue
-        
-        # Handle tables (markdown format: | header | header |)
-        if line.startswith('|'):
-            table_lines = [line]
-            i += 1
-            
-            # Collect all table lines
-            while i < len(lines) and lines[i].strip().startswith('|'):
-                table_lines.append(lines[i].rstrip())
-                i += 1
-            
-            # Parse and create table
-            try:
-                # Extract header and separator
-                if len(table_lines) >= 2:
-                    header_line = table_lines[0]
-                    headers = [h.strip() for h in header_line.split('|')[1:-1]]
+
+        # Table handling
+        if line.startswith('|') and '|' in line[1:]:
+            if not in_table:
+                # Start of a new table
+                in_table = True
+                header_line = line
+                
+                # Check for separator line
+                if i + 1 < len(lines) and lines[i+1].strip().startswith('|--'):
+                    separator_line = lines[i+1].strip()
                     
-                    # Create table with num_cols x num_rows
-                    rows_data = []
-                    for row_line in table_lines[2:]:  # Skip header and separator
-                        row_cells = [cell.strip() for cell in row_line.split('|')[1:-1]]
-                        rows_data.append(row_cells)
+                    # Count columns from header
+                    num_cols = len([h.strip() for h in header_line.split('|') if h.strip()])
                     
-                    # Create table
-                    if rows_data or headers:
-                        table = doc.add_table(rows=len(rows_data) + 1, cols=len(headers))
-                        table.style = 'Light Grid Accent 1'
+                    if num_cols > 0:
+                        table = doc.add_table(rows=1, cols=num_cols)
+                        table.style = 'Table Grid'
                         
-                        # Add headers
-                        header_cells = table.rows[0].cells
-                        for col_idx, header in enumerate(headers):
-                            cell = header_cells[col_idx]
-                            paragraph = cell.paragraphs[0]
-                            run = paragraph.add_run(header)
-                            run.font.bold = True
-                            run.font.size = Pt(10)
+                        # Populate header
+                        hdr_cells = table.rows[0].cells
+                        headers = [h.strip() for h in header_line.split('|') if h.strip()]
+                        for j, header in enumerate(headers):
+                            if j < num_cols:
+                                hdr_cells[j].text = header
                         
-                        # Add rows
-                        for row_idx, row_data in enumerate(rows_data, 1):
-                            row_cells = table.rows[row_idx].cells
-                            for col_idx, cell_data in enumerate(row_data):
-                                if col_idx < len(row_cells):
-                                    cell = row_cells[col_idx]
-                                    paragraph = cell.paragraphs[0]
-                                    paragraph.text = cell_data
-                                    paragraph.paragraph_format.space_before = Pt(6)
-                                    paragraph.paragraph_format.space_after = Pt(6)
-            except Exception as e:
-                print(f"⚠️ Table parsing error: {e}")
-                doc.add_paragraph(line)
-            
-            continue
-        
-        # Handle bullet/list items (*, +, -, followed by space)
-        if line.startswith(('* ', '+ ', '- ')):
-            # Collect consecutive list items
-            list_items = []
-            while i < len(lines):
-                current = lines[i].rstrip()
-                if current.startswith(('* ', '+ ', '- ')):
-                    item_text = current[2:].strip()
-                    # Check indentation level
-                    indent_level = 0
-                    if current.startswith(('  +', '  *', '  -')):
-                        indent_level = 1
-                    list_items.append((indent_level, item_text))
-                    i += 1
+                        i += 2 # Skip header and separator
+                        continue
                 else:
-                    break
-            
-            # Add list items to document
-            for indent_level, item_text in list_items:
-                p = doc.add_paragraph(item_text, style='List Bullet' if indent_level == 0 else 'List Bullet 2')
-                p.paragraph_format.space_before = Pt(3)
-                p.paragraph_format.space_after = Pt(3)
-            
-            continue
-        
-        # Default: add as regular paragraph with formatting
-        paragraph = doc.add_paragraph()
-        
-        # Handle inline formatting: **bold**, *italic*, ***bold italic***
-        text = line
-        # Simple regex-like replacement for bold and italic
-        parts = []
-        last_end = 0
-        
-        # Process text for bold/italic
-        j = 0
-        while j < len(text):
-            if text[j:j+3] == '***':
-                # Add previous text
-                if j > last_end:
-                    run = paragraph.add_run(text[last_end:j])
-                # Find closing ***
-                close_idx = text.find('***', j + 3)
-                if close_idx != -1:
-                    bold_italic = text[j+3:close_idx]
-                    run = paragraph.add_run(bold_italic)
-                    run.bold = True
-                    run.italic = True
-                    j = close_idx + 3
-                    last_end = j
-                else:
-                    j += 1
-            elif text[j:j+2] == '**':
-                # Add previous text
-                if j > last_end:
-                    run = paragraph.add_run(text[last_end:j])
-                # Find closing **
-                close_idx = text.find('**', j + 2)
-                if close_idx != -1:
-                    bold_text = text[j+2:close_idx]
-                    run = paragraph.add_run(bold_text)
-                    run.bold = True
-                    j = close_idx + 2
-                    last_end = j
-                else:
-                    j += 1
-            elif text[j] == '*' or text[j] == '_':
-                # Check if it's italic
-                if (j > 0 and text[j-1] not in (' ', '\t')) or j == 0:
-                    # Add previous text
-                    if j > last_end:
-                        run = paragraph.add_run(text[last_end:j])
-                    # Find closing * or _
-                    close_char = text[j]
-                    close_idx = text.find(close_char, j + 1)
-                    if close_idx != -1 and close_idx > j + 1:
-                        italic_text = text[j+1:close_idx]
-                        run = paragraph.add_run(italic_text)
-                        run.italic = True
-                        j = close_idx + 1
-                        last_end = j
+                    # Not a valid table, treat as plain text
+                    in_table = False
+
+            else: # Already in table
+                if line.startswith('|'):
+                    row_data = [cell.strip() for cell in line.split('|') if cell.strip()]
+                    if table and len(row_data) == table.columns:
+                        row_cells = table.add_row().cells
+                        for j, cell_text in enumerate(row_data):
+                            row_cells[j].text = cell_text
+                        i += 1
+                        continue
                     else:
-                        j += 1
+                        # End of table or malformed row
+                        in_table = False
+                        table = None
                 else:
-                    j += 1
+                    # End of table
+                    in_table = False
+                    table = None
+
+        # If not in a table or table processing is done for the line
+        if not in_table:
+            # Headings
+            if line.startswith('### '):
+                doc.add_heading(line[4:].strip(), level=3)
+            elif line.startswith('## '):
+                doc.add_heading(line[3:].strip(), level=2)
+            elif line.startswith('# '):
+                doc.add_heading(line[2:].strip(), level=1)
+            
+            # Unordered Lists
+            elif line.startswith(('* ', '- ')):
+                # Handle nested lists indicated by indentation
+                indent_level = (len(line) - len(line.lstrip(' '))) // 2
+                style = 'List Bullet'
+                if indent_level > 0:
+                    style = f'List Bullet {indent_level + 1}'
+                
+                p = doc.add_paragraph(line[2:].strip(), style=style)
+
+            # Paragraphs with bold
             else:
-                j += 1
-        
-        # Add remaining text
-        if last_end < len(text):
-            run = paragraph.add_run(text[last_end:])
-        
-        paragraph.paragraph_format.space_before = Pt(6)
-        paragraph.paragraph_format.space_after = Pt(6)
-        
-        i += 1
+                p = doc.add_paragraph()
+                parts = re.split(r'(\*\*.*?\*\*)', line)
+                for part in parts:
+                    if part.startswith('**') and part.endswith('**'):
+                        p.add_run(part[2:-2]).bold = True
+                    elif part:
+                        p.add_run(part)
+            i += 1
 
 
 def generate_fallback_fiche_adn_content(
@@ -1838,9 +1755,92 @@ Please provide only the JSON response, without any markdown formatting or code b
         }
 
 
-def generate_application_analysis_docx(fiche_data: Dict[str, Any], analysis_data: Dict[str, Any]) -> str:
+def generate_application_analysis_docx_with_llm(fiche_data: Dict[str, Any], analysis_data: Dict[str, Any]) -> str:
     """
-    Generate a formatted DOCX document with application analysis.
+    Generate a formatted DOCX document with application analysis using LLM-generated content.
+    
+    Returns the filepath to the generated DOCX file.
+    """
+    if not groq_client:
+        raise Exception("Groq client not initialized")
+
+    # Build prompt for DOCX content generation
+    prompt = f"""
+You are a technical writer creating a professional DOCX report.
+Based on the material data and analysis JSON provided, generate the full markdown content for the report.
+Follow the requested structure exactly.
+
+## Material Data
+- Name: {fiche_data.get('nom_matiere', 'N/A')}
+- Reference: {fiche_data.get('reference', 'N/A')}
+
+## Analysis JSON
+```json
+{json.dumps(analysis_data, indent=2, ensure_ascii=False)}
+```
+
+## Report Structure
+
+### 1) Lecture rapide du matériau
+- Points clés issus de la fiche
+- Interprétation
+
+### 2) Domaines d'application principaux
+- For each application (A, B, C...):
+  - Engagement du matériau
+  - Rôle du matériau
+  - Propriétés clés recherchées
+
+### 3) Tableau de synthèse
+- Markdown table with columns: Application, Process, Rôle, Propriétés
+
+### 4) Applications stratégiques hors cœur de métier
+- List of opportunities
+
+### 5) Lecture stratégique pour votre groupe
+- Summary of material's relevance to AVOCarbon
+
+Please provide only the complete markdown content for the document body.
+"""
+
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama3-70b-8192",
+            messages=[
+                {"role": "system", "content": "You are a technical writer that generates markdown content for reports."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=4000,
+        )
+        
+        markdown_content = response.choices[0].message.content
+        
+        # Create DOCX from markdown
+        doc = Document()
+        doc.add_heading(f"Analyse d'usage du {fiche_data.get('nom_matiere', 'Matière')} {fiche_data.get('reference', 'N/A')}", level=1)
+        
+        add_formatted_markdown_to_docx(doc, markdown_content)
+        
+        # Save to temp_docx folder
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ref_safe = fiche_data.get("reference", "material").replace(" ", "_")
+        filename = f"Analyse_{ref_safe}_{timestamp}.docx"
+        filepath = DOCX_TEMP_DIR / filename
+        
+        doc.save(str(filepath))
+        
+        return filename
+
+    except Exception as e:
+        print(f"⚠️ Error generating DOCX with LLM: {e}")
+        # Fallback to manual generation if LLM fails
+        return generate_application_analysis_docx_manual(fiche_data, analysis_data)
+
+def generate_application_analysis_docx_manual(fiche_data: Dict[str, Any], analysis_data: Dict[str, Any]) -> str:
+    """
+    Manually generate a formatted DOCX document with application analysis.
+    This is a fallback if the LLM-based generation fails.
     
     Returns the filepath to the generated DOCX file.
     """
@@ -1901,31 +1901,31 @@ def generate_application_analysis_docx(fiche_data: Dict[str, Any], analysis_data
         for prop in props:
             prop_text = f"{prop.get('property_name', 'Propriété')}: {prop.get('reason', '')}"
             doc.add_paragraph(prop_text, style='List Bullet')
-        
-        doc.add_paragraph()  # spacing
     
     # Section 3: Summary Table
     doc.add_heading("3) Tableau de synthèse", level=2)
     
-    table = doc.add_table(rows=1, cols=4)
-    table.style = 'Light Grid Accent 1'
-    hdr_cells = table.rows[0].cells
-    hdr_cells[0].text = 'Application'
-    hdr_cells[1].text = "Process d'engagement"
-    hdr_cells[2].text = 'Rôle du matériau'
-    hdr_cells[3].text = 'Propriétés clés'
-    
-    for app in applications:
-        row_cells = table.add_row().cells
-        row_cells[0].text = app.get('application_name', '')
+    if applications:
+        table = doc.add_table(rows=1, cols=4)
+        table.style = 'Table Grid'
+        hdr_cells = table.rows[0].cells
+        hdr_cells[0].text = 'Application'
+        hdr_cells[1].text = "Process d'engagement"
+        hdr_cells[2].text = 'Rôle du matériau'
+        hdr_cells[3].text = 'Propriétés clés'
         
-        process = app.get("engagement_process", {})
-        row_cells[1].text = process.get("process_description", "")[:100] + "..."
-        row_cells[2].text = process.get("material_role", "")
-        
-        props = app.get("required_properties", [])
-        prop_names = ", ".join([p.get('property_name', '') for p in props[:3]])
-        row_cells[3].text = prop_names
+        for app in applications:
+            row_cells = table.add_row().cells
+            row_cells[0].text = app.get('application_name', 'N/A')
+            
+            process = app.get("engagement_process", {})
+            desc = process.get("process_description", "")[:100]
+            row_cells[1].text = desc + "..." if desc else "N/A"
+            row_cells[2].text = process.get("material_role", "N/A")
+            
+            props = app.get("required_properties", [])
+            prop_names = ", ".join([p.get('property_name', '') for p in props[:3]]) if props else "N/A"
+            row_cells[3].text = prop_names
     
     # Section 4: Strategic Opportunities
     doc.add_heading("4) Applications stratégiques hors cœur de métier", level=2)
@@ -1933,18 +1933,24 @@ def generate_application_analysis_docx(fiche_data: Dict[str, Any], analysis_data
     recommendations = analysis_data.get("strategic_recommendations", {})
     strategic = recommendations.get("strategic_expansion", [])
     
-    doc.add_paragraph("Opportunités intéressantes :")
-    for opp in strategic:
-        text = f"{opp.get('opportunity', '')}: {opp.get('rationale', '')}"
-        doc.add_paragraph(text, style='List Bullet')
+    if strategic:
+        doc.add_paragraph("Opportunités intéressantes :")
+        for opp in strategic:
+            text = f"{opp.get('opportunity', 'N/A')}: {opp.get('rationale', '')}"
+            doc.add_paragraph(text, style='List Bullet')
+    else:
+        doc.add_paragraph("Aucune opportunité stratégique identifiée.")
     
     # Section 5: Strategic Reading
     doc.add_heading("5) Lecture stratégique pour votre groupe", level=2)
     
     doc.add_paragraph("Ce type de matériau :")
-    doc.add_paragraph("est idéal pour :", style='List Bullet')
-    for app in applications[:3]:
-        doc.add_paragraph(app.get('application_name', ''), style='List Bullet 2')
+    if applications:
+        doc.add_paragraph("est idéal pour :", style='List Bullet')
+        for app in applications[:3]:
+            app_name = app.get('application_name', '')
+            if app_name:
+                doc.add_paragraph(app_name, style='List Bullet 2')
     
     doc.add_paragraph("➡️ Il est parfaitement cohérent avec :")
     doc.add_paragraph("votre activité existante", style='List Bullet')
@@ -2037,7 +2043,7 @@ def generate_application_analysis():
                 
                 # Generate DOCX if it doesn't exist
                 docx_filename = generate_application_analysis_docx(fiche_data, existing_analysis)
-                download_url = f"/download_fiche_adn_docx/{docx_filename}"
+                download_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True)
                 
                 return jsonify({
                     "success": True,
@@ -2096,7 +2102,7 @@ def generate_application_analysis():
         
         # Generate DOCX
         docx_filename = generate_application_analysis_docx(fiche_data, analysis_result["analysis"])
-        download_url = f"/download_fiche_adn_docx/{docx_filename}"
+        download_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True)
         
         analysis_result["docx_filename"] = docx_filename
         analysis_result["download_url"] = download_url
@@ -2229,7 +2235,7 @@ def get_application_analysis():
                 analysis_json = latest_analysis.get("analysis_data", {})
                 
                 docx_filename = generate_application_analysis_docx(fiche_data, analysis_json)
-                docx_url = f"/download_fiche_adn_docx/{docx_filename}"
+                docx_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True)
             
             return jsonify({
                 "success": True,
