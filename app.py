@@ -1847,8 +1847,6 @@ def generate_application_analysis_docx(fiche_data: Dict[str, Any], analysis_data
     from datetime import datetime
     
     doc = Document()
-    doc.default_paragraph_style.font.name = 'Arial'
-    doc.default_paragraph_style.font.size = Pt(11)
     
     # Title
     title = doc.add_paragraph()
