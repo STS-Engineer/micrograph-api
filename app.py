@@ -76,7 +76,7 @@ client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 # GROQ CLIENT WITH KEY ROTATION
 # -----------------------------------------------------------------------------
 GROQ_API_KEYS = [
-    "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",  # Clé actuelle
+    "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",  # Clé actuelle
     "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",  # Clé 3
     "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",  # Clé 4
     "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",  # Clé 5
