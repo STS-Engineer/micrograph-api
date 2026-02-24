@@ -73,11 +73,99 @@ client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 
 
 # -----------------------------------------------------------------------------
-# GROQ CLIENT
+# GROQ CLIENT WITH KEY ROTATION
 # -----------------------------------------------------------------------------
-HARDCODED_GROQ_API_KEY = "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"
-groq_api_key = HARDCODED_GROQ_API_KEY or os.getenv("GROQ_API_KEY")
+GROQ_API_KEYS = [
+    "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",  # Clé actuelle
+    "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",  # Clé 3
+    "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",  # Clé 4
+    "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",  # Clé 5
+    "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",  # Clé 6
+    "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",  # Clé 7
+    "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",  # Clé 8
+    "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",  # Clé 9
+    "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",  # Clé 10
+]
+
+# Index de la clé actuellement utilisée
+current_groq_key_index = 0
+
+# Initialiser le client avec la première clé
+groq_api_key = GROQ_API_KEYS[current_groq_key_index] if GROQ_API_KEYS else os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
+
+
+def rotate_groq_key():
+    """Passe à la clé Groq suivante en cas d'échec d'authentification."""
+    global current_groq_key_index, groq_client, groq_api_key
+    
+    current_groq_key_index = (current_groq_key_index + 1) % len(GROQ_API_KEYS)
+    new_key = GROQ_API_KEYS[current_groq_key_index]
+    
+    print(f"🔄 Rotation vers la clé Groq #{current_groq_key_index + 1}")
+    
+    groq_api_key = new_key
+    groq_client = Groq(api_key=new_key)
+    
+    return groq_client
+
+
+def call_groq_with_retry(messages, model="llama-3.3-70b-versatile", temperature=0.3, max_tokens=8000, response_format=None):
+    """
+    Appelle l'API Groq avec rotation automatique des clés en cas d'échec d'authentification.
+    
+    Args:
+        messages: Liste des messages pour le chat
+        model: Modèle à utiliser
+        temperature: Température de génération
+        max_tokens: Nombre maximum de tokens
+        response_format: Format de réponse (ex: {"type": "json_object"})
+    
+    Returns:
+        Réponse de l'API Groq
+    
+    Raises:
+        Exception: Si toutes les clés ont échoué
+    """
+    if not groq_client:
+        raise Exception("Groq client not initialized")
+    
+    attempts = 0
+    max_attempts = len(GROQ_API_KEYS)
+    
+    while attempts < max_attempts:
+        try:
+            kwargs = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            
+            if response_format:
+                kwargs["response_format"] = response_format
+            
+            response = groq_client.chat.completions.create(**kwargs)
+            return response
+            
+        except Exception as e:
+            error_message = str(e).lower()
+            
+            # Vérifier si c'est une erreur d'authentification ou de clé invalide
+            if "authentication" in error_message or "invalid" in error_message or "unauthorized" in error_message or "401" in error_message:
+                print(f"⚠️ Erreur d'authentification avec la clé #{current_groq_key_index + 1}: {e}")
+                attempts += 1
+                
+                if attempts < max_attempts:
+                    rotate_groq_key()
+                    print(f"🔄 Tentative {attempts + 1}/{max_attempts} avec une nouvelle clé...")
+                else:
+                    raise Exception(f"❌ Toutes les clés Groq ({max_attempts}) ont échoué. Dernière erreur: {e}")
+            else:
+                # Autre type d'erreur, ne pas faire de rotation
+                raise e
+    
+    raise Exception("Échec de l'appel à Groq après rotation de toutes les clés")
 
 
 # -----------------------------------------------------------------------------
@@ -451,15 +539,15 @@ QUALITY REQUIREMENTS:
 ✓ Preserve technical terms and identifiers (CAS numbers, reference codes)
 ✓ All descriptive content must be in English, never mix languages"""
 
-        message = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            max_tokens=5000,
+        message = call_groq_with_retry(
             messages=[
                 {
                     "role": "user",
                     "content": prompt
                 }
-            ]
+            ],
+            model="llama-3.3-70b-versatile",
+            max_tokens=5000
         )
         
         content = message.choices[0].message.content if message.choices else ""
@@ -1707,9 +1795,8 @@ Please provide only the JSON response, without any markdown formatting or code b
 """
     
     try:
-        # Call Groq API
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        # Call Groq API with retry
+        response = call_groq_with_retry(
             messages=[
                 {
                     "role": "system",
@@ -1720,6 +1807,7 @@ Please provide only the JSON response, without any markdown formatting or code b
                     "content": prompt
                 }
             ],
+            model="llama-3.3-70b-versatile",
             temperature=0.3,
             max_tokens=8000,
             response_format={"type": "json_object"}
@@ -1836,14 +1924,14 @@ Please provide only the complete markdown content for the document body.
 """
 
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        response = call_groq_with_retry(
             messages=[
                 {"role": "system", "content": "You are a technical writer that generates markdown content for reports."},
                 {"role": "user", "content": prompt}
             ],
+            model="llama-3.3-70b-versatile",
             temperature=0.2,
-            max_tokens=4000,
+            max_tokens=4000
         )
         
         markdown_content = response.choices[0].message.content
