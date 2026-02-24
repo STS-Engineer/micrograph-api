@@ -75,7 +75,7 @@ client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 # -----------------------------------------------------------------------------
 # GROQ CLIENT
 # -----------------------------------------------------------------------------
-HARDCODED_GROQ_API_KEY = "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"
+HARDCODED_GROQ_API_KEY = "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"
 groq_api_key = HARDCODED_GROQ_API_KEY or os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
 
