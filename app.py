@@ -1176,7 +1176,7 @@ def get_fiche_adn():
                     num_specifications,
                     date_creation,
                     derniere_modification
-                FROM public.fiches_ADN_matieres
+                FROM public.fiches_adn_matieres
                 WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
                 LIMIT 1
             """, (reference,))
