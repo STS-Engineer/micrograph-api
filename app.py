@@ -2268,6 +2268,16 @@ def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
     Build complete JSON snapshot (ADN) of Black Mix for archiving/export/PDF generation.
     Uses existing database cursor to gather all related data.
     """
+    
+    # ── Black Mix header + revision history ──
+    cur.execute(
+        "SELECT document_revision_history FROM public.black_mixes WHERE id = %s",
+        (black_mix_id,)
+    )
+    bm_row = cur.fetchone()
+    revision_history = bm_row[0] if bm_row and bm_row[0] else None
+
+    # ── Components ──
     cur.execute(
         """SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit,
                   m.reference, m.nom_matiere, c.metadata
@@ -2290,6 +2300,7 @@ def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
         for r in cur.fetchall()
     ]
 
+    # ── Process steps + step materials ──
     cur.execute(
         """SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters,
                   ARRAY_AGG(m.reference ORDER BY m.reference) AS materials
@@ -2316,6 +2327,7 @@ def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
     for step in process_steps:
         step_materials[str(step["step_order"])] = step["materials"]
 
+    # ── Control plan ──
     cur.execute(
         """SELECT parameter_name, target_value, min_value, max_value, unit
            FROM public.black_mix_control_plan
@@ -2339,6 +2351,7 @@ def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
         "product_reference": product_reference,
         "mix_name": mix_name,
         "status": "draft",
+        "document_revision_history": revision_history,  # ← ajouté
         "created_at": datetime.now().isoformat(),
         "composition": components,
         "process_steps": process_steps,
