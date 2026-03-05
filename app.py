@@ -1245,7 +1245,7 @@ def get_fiche_adn_by_id(matiere_id):
                     num_specifications,
                     date_creation,
                     derniere_modification
-                FROM public.fiches_ADN_matieres
+                FROM public.fiches_adn_matieres
                 WHERE matiere_id = %s
                 LIMIT 1
             """, (matiere_id,))
@@ -1325,7 +1325,7 @@ def generate_fiche_adn_docx():
                     num_specifications,
                     date_creation,
                     derniere_modification
-                FROM public.fiches_ADN_matieres
+                FROM public.fiches_adn_matieres
                 WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
                 LIMIT 1
             """, (reference,))
@@ -1999,7 +1999,7 @@ def generate_application_analysis():
                     reference,
                     type_matiere,
                     specifications
-                FROM public.fiches_ADN_matieres
+                FROM public.fiches_adn_matieres
                 WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
                 LIMIT 1
             """, (reference,))
@@ -2059,7 +2059,7 @@ def generate_application_analysis():
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 # Get fiche_adn_id from fiches_ADN_matieres
                 cur.execute("""
-                    SELECT fiche_adn_id FROM public.fiches_ADN_matieres
+                    SELECT fiche_adn_id FROM public.fiches_adn_matieres
                     WHERE matiere_id = %s
                     LIMIT 1
                 """, (fiche_data["matiere_id"],))
