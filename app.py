@@ -1535,6 +1535,306 @@ def download_fiche_adn_docx(filename):
             "message": str(e)
         }), 500
 
+# POPULATE FICHES ADN TABLE
+# -----------------------------------------------------------------------------
+@app.route("/populate_fiches_adn_table", methods=["POST"])
+def populate_fiches_adn_table():
+    """
+    Populate/Update the fiches_adn_matieres table by aggregating data from:
+    - matieres (main materials table)
+    - fiches_matieres (technical sheets)
+    - specifications (linked specifications)
+    - matiere_expert_notes (expert notes with images)
+    
+    Process:
+    1. Fetch all materials from database
+    2. For each material, aggregate all related data into JSON
+    3. Insert or update record in fiches_adn_matieres
+    
+    Returns: Summary of processed records
+    """
+    try:
+        conn = get_db_conn()
+        
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Fetch all materials
+            cur.execute("""
+                SELECT matiere_id, nom_matiere, reference, type_matiere, 
+                       date_creation, date_mise_a_jour
+                FROM public.matieres
+                ORDER BY matiere_id
+            """)
+            materials = cur.fetchall()
+            
+            if not materials:
+                return jsonify({
+                    "success": False,
+                    "message": "No materials found in database"
+                }), 404
+            
+            processed_count = 0
+            updated_count = 0
+            inserted_count = 0
+            error_count = 0
+            
+            for material in materials:
+                try:
+                    matiere_id = material["matiere_id"]
+                    nom_matiere = material["nom_matiere"]
+                    reference = material["reference"]
+                    type_matiere = material["type_matiere"]
+                    
+                    # Fetch fiches for this material
+                    cur.execute("""
+                        SELECT fiche_id, date_creation_fiche, derniere_modification
+                        FROM public.fiches_matieres
+                        WHERE matiere_id = %s
+                        ORDER BY fiche_id DESC
+                    """, (matiere_id,))
+                    fiches = [dict(row) for row in cur.fetchall()]
+                    
+                    # Fetch all specifications for these fiches
+                    specifications_list = []
+                    for fiche in fiches:
+                        cur.execute("""
+                            SELECT spec_id, fiche_id, source_type, donnees, 
+                                   date_creation, derniere_modification
+                            FROM public.specifications
+                            WHERE fiche_id = %s
+                            ORDER BY spec_id
+                        """, (fiche["fiche_id"],))
+                        specifications_list.extend([dict(row) for row in cur.fetchall()])
+                    
+                    # Fetch expert notes with images
+                    cur.execute("""
+                        SELECT men.id, men.matiere_image_id, men.note_json, men.created_at,
+                               mi.image_path
+                        FROM public.matiere_expert_notes men
+                        INNER JOIN public.matiere_images mi ON mi.id = men.matiere_image_id
+                        WHERE mi.matiere_id = %s
+                        ORDER BY men.created_at DESC
+                    """, (matiere_id,))
+                    expert_notes = [dict(row) for row in cur.fetchall()]
+                    
+                    # Aggregate everything into JSON structure
+                    aggregated_data = {
+                        "fiches": fiches,
+                        "specifications": specifications_list,
+                        "expert_notes": expert_notes,
+                        "summary": {
+                            "num_fiches": len(fiches),
+                            "num_specifications": len(specifications_list),
+                            "num_expert_notes": len(expert_notes)
+                        }
+                    }
+                    
+                    # Check if record already exists
+                    cur.execute("""
+                        SELECT fiche_adn_id FROM public.fiches_adn_matieres
+                        WHERE matiere_id = %s
+                    """, (matiere_id,))
+                    existing = cur.fetchone()
+                    
+                    if existing:
+                        # Update existing record
+                        cur.execute("""
+                            UPDATE public.fiches_adn_matieres
+                            SET nom_matiere = %s,
+                                reference = %s,
+                                type_matiere = %s,
+                                specifications = %s,
+                                num_specifications = %s,
+                                derniere_modification = CURRENT_TIMESTAMP
+                            WHERE matiere_id = %s
+                        """, (
+                            nom_matiere,
+                            reference,
+                            type_matiere,
+                            Json(aggregated_data),
+                            len(specifications_list),
+                            matiere_id
+                        ))
+                        updated_count += 1
+                    else:
+                        # Insert new record
+                        cur.execute("""
+                            INSERT INTO public.fiches_adn_matieres
+                            (matiere_id, nom_matiere, reference, type_matiere, 
+                             specifications, num_specifications, date_creation, derniere_modification)
+                            VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        """, (
+                            matiere_id,
+                            nom_matiere,
+                            reference,
+                            type_matiere,
+                            Json(aggregated_data),
+                            len(specifications_list)
+                        ))
+                        inserted_count += 1
+                    
+                    processed_count += 1
+                    
+                    # Commit after each material to ensure partial success
+                    conn.commit()
+                    
+                except Exception as mat_error:
+                    print(f"❌ Error processing material {material.get('matiere_id')}: {mat_error}")
+                    error_count += 1
+                    conn.rollback()
+                    continue
+            
+            return jsonify({
+                "success": True,
+                "message": "Fiches ADN table populated successfully",
+                "summary": {
+                    "total_materials": len(materials),
+                    "processed": processed_count,
+                    "inserted": inserted_count,
+                    "updated": updated_count,
+                    "errors": error_count
+                }
+            }), 200
+            
+    except Exception as e:
+        print(f"❌ Error populating fiches_adn_matieres: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": "population_failed",
+            "message": str(e)
+        }), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+# VERIFY FICHES ADN TABLE
+# -----------------------------------------------------------------------------
+@app.route("/verify_fiches_adn_table", methods=["GET"])
+def verify_fiches_adn_table():
+    """
+    Verify and analyze the fiches_adn_matieres table.
+    
+    Returns:
+    - Total record count
+    - Specifications statistics (total, average per material)
+    - Sample records
+    - Data quality metrics
+    
+    Returns: JSON with verification results
+    """
+    try:
+        conn = get_db_conn()
+        
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Count total records
+            cur.execute("SELECT COUNT(*) as total FROM public.fiches_adn_matieres")
+            total_count = cur.fetchone()["total"]
+            
+            if total_count == 0:
+                return jsonify({
+                    "success": True,
+                    "message": "Table is empty",
+                    "total_records": 0,
+                    "statistics": {},
+                    "samples": []
+                }), 200
+            
+            # Get statistics
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total_records,
+                    SUM(num_specifications) as total_specifications,
+                    AVG(num_specifications) as avg_specifications_per_material,
+                    MIN(num_specifications) as min_specifications,
+                    MAX(num_specifications) as max_specifications,
+                    COUNT(CASE WHEN num_specifications = 0 THEN 1 END) as materials_without_specs,
+                    COUNT(CASE WHEN specifications IS NOT NULL THEN 1 END) as materials_with_data
+                FROM public.fiches_adn_matieres
+            """)
+            stats = dict(cur.fetchone())
+            
+            # Get sample records (first 5)
+            cur.execute("""
+                SELECT 
+                    fiche_adn_id,
+                    matiere_id,
+                    nom_matiere,
+                    reference,
+                    type_matiere,
+                    num_specifications,
+                    date_creation,
+                    derniere_modification,
+                    specifications
+                FROM public.fiches_adn_matieres
+                ORDER BY derniere_modification DESC
+                LIMIT 5
+            """)
+            samples = []
+            for row in cur.fetchall():
+                sample = dict(row)
+                # Parse specifications JSON to show summary
+                specs_data = sample.get("specifications", {})
+                if isinstance(specs_data, str):
+                    try:
+                        specs_data = json.loads(specs_data)
+                    except:
+                        specs_data = {}
+                
+                sample["specifications_summary"] = {
+                    "num_fiches": specs_data.get("summary", {}).get("num_fiches", 0) if isinstance(specs_data, dict) else 0,
+                    "num_specifications": specs_data.get("summary", {}).get("num_specifications", 0) if isinstance(specs_data, dict) else 0,
+                    "num_expert_notes": specs_data.get("summary", {}).get("num_expert_notes", 0) if isinstance(specs_data, dict) else 0
+                }
+                # Remove full specifications data from sample for brevity
+                del sample["specifications"]
+                samples.append(sample)
+            
+            # Get recent updates
+            cur.execute("""
+                SELECT 
+                    fiche_adn_id,
+                    nom_matiere,
+                    reference,
+                    derniere_modification
+                FROM public.fiches_adn_matieres
+                ORDER BY derniere_modification DESC
+                LIMIT 10
+            """)
+            recent_updates = [dict(row) for row in cur.fetchall()]
+            
+            return jsonify({
+                "success": True,
+                "message": "Verification completed successfully",
+                "total_records": total_count,
+                "statistics": {
+                    "total_records": int(stats["total_records"]),
+                    "total_specifications": int(stats["total_specifications"] or 0),
+                    "avg_specifications_per_material": float(stats["avg_specifications_per_material"] or 0),
+                    "min_specifications": int(stats["min_specifications"] or 0),
+                    "max_specifications": int(stats["max_specifications"] or 0),
+                    "materials_without_specs": int(stats["materials_without_specs"] or 0),
+                    "materials_with_data": int(stats["materials_with_data"] or 0)
+                },
+                "samples": samples,
+                "recent_updates": recent_updates
+            }), 200
+            
+    except Exception as e:
+        print(f"❌ Error verifying fiches_adn_matieres: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": "verification_failed",
+            "message": str(e)
+        }), 500
+    finally:
+        if conn:
+            conn.close()
+
+
 # GENERATE APPLICATIONS ANALYSIS
 # -----------------------------------------------------------------------------
 @app.route("/search", methods=["POST"])
