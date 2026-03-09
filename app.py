@@ -273,6 +273,23 @@ cleanup_thread.start()
 # -----------------------------------------------------------------------------
 # DB HELPERS
 # -----------------------------------------------------------------------------
+def serialize_to_json_compatible(obj):
+    """
+    Convert datetime and other non-JSON-serializable objects to JSON-compatible format.
+    Recursively processes dicts and lists.
+    """
+    from datetime import datetime, date, time
+    
+    if isinstance(obj, dict):
+        return {k: serialize_to_json_compatible(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [serialize_to_json_compatible(item) for item in obj]
+    elif isinstance(obj, (datetime, date, time)):
+        return obj.isoformat()
+    else:
+        return obj
+
+
 def get_db_conn():
     conn = psycopg2.connect(DB_DSN)
     register_vector(conn)
@@ -1537,80 +1554,6 @@ def download_fiche_adn_docx(filename):
 
 # POPULATE FICHES ADN TABLE
 # -----------------------------------------------------------------------------
-@app.route("/create_fiches_adn_table", methods=["POST"])
-def create_fiches_adn_table():
-    """
-    Create the fiches_adn_matieres table if it doesn't exist.
-    
-    This should be called once before using populate_fiches_adn_table.
-    
-    Returns: Success message or error
-    """
-    try:
-        conn = get_db_conn()
-        
-        with conn.cursor() as cur:
-            # Create the table
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.fiches_adn_matieres (
-                    fiche_adn_id SERIAL PRIMARY KEY,
-                    matiere_id INTEGER NOT NULL,
-                    nom_matiere VARCHAR(255),
-                    reference VARCHAR(100),
-                    type_matiere VARCHAR(100),
-                    specifications JSONB,
-                    num_specifications INTEGER DEFAULT 0,
-                    date_creation TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    derniere_modification TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT fk_matiere FOREIGN KEY (matiere_id) 
-                        REFERENCES public.matieres(matiere_id) ON DELETE CASCADE,
-                    CONSTRAINT unique_matiere_id UNIQUE (matiere_id)
-                )
-            """)
-            
-            # Create index on matiere_id for faster lookups
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_fiches_adn_matiere_id 
-                ON public.fiches_adn_matieres(matiere_id)
-            """)
-            
-            # Create index on reference for faster searches
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_fiches_adn_reference 
-                ON public.fiches_adn_matieres(reference)
-            """)
-            
-            conn.commit()
-            
-            # Check if table was created
-            cur.execute("""
-                SELECT COUNT(*) as count 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public' 
-                AND table_name = 'fiches_adn_matieres'
-            """)
-            table_exists = cur.fetchone()[0] > 0
-            
-            return jsonify({
-                "success": True,
-                "message": "Table fiches_adn_matieres created successfully" if table_exists else "Table creation completed",
-                "table_exists": table_exists
-            }), 200
-            
-    except Exception as e:
-        print(f"❌ Error creating fiches_adn_matieres table: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": "table_creation_failed",
-            "message": str(e)
-        }), 500
-    finally:
-        if conn:
-            conn.close()
-
-
 @app.route("/populate_fiches_adn_table", methods=["POST"])
 def populate_fiches_adn_table():
     """
@@ -1702,6 +1645,9 @@ def populate_fiches_adn_table():
                             "num_expert_notes": len(expert_notes)
                         }
                     }
+                    
+                    # Convert datetime objects to ISO format strings for JSON serialization
+                    aggregated_data = serialize_to_json_compatible(aggregated_data)
                     
                     # Check if record already exists
                     cur.execute("""

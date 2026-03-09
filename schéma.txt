@@ -188,52 +188,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BlackMixAdnEnriched"
-  /create_fiches_adn_table:
-    post:
-      tags: [Fiches ADN Management]
-      summary: Create fiches ADN table
-      operationId: createFichesAdnTable
-      description: |
-        Creates the fiches_adn_matieres table if it doesn't exist.
-        This should be called once before using populate_fiches_adn_table.
-        
-        Creates:
-        - Main table with all necessary columns
-        - Foreign key constraint to matieres table
-        - Unique constraint on matiere_id
-        - Indexes for performance (matiere_id, reference)
-      responses:
-        "200":
-          description: Table created successfully
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: true
-                  message:
-                    type: string
-                    example: "Table fiches_adn_matieres created successfully"
-                  table_exists:
-                    type: boolean
-                    example: true
-        "500":
-          description: Table creation failed
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: false
-                  error:
-                    type: string
-                    example: "table_creation_failed"
-                  message:
-                    type: string
   /populate_fiches_adn_table:
     post:
       tags: [Fiches ADN Management]
@@ -241,13 +195,7 @@ paths:
       operationId: populateFichesAdnTable
       description: |
         Re-aggregates all ADN information from source tables into fiches_adn_matieres.
-        This endpoint should be called whenever new fiches, specifications, or expert notes are added.
-        
-        Process:
-        - Fetches all materials from database
-        - For each material, gathers all related fiches, specifications, and expert notes
-        - Aggregates everything into a JSON structure
-        - Inserts new records or updates existing records in fiches_adn_matieres
+        Updates existing records or inserts new materials with aggregated fiches, specifications, and expert notes.
       responses:
         "200":
           description: Fiches ADN table populated successfully
