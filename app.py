@@ -1537,6 +1537,80 @@ def download_fiche_adn_docx(filename):
 
 # POPULATE FICHES ADN TABLE
 # -----------------------------------------------------------------------------
+@app.route("/create_fiches_adn_table", methods=["POST"])
+def create_fiches_adn_table():
+    """
+    Create the fiches_adn_matieres table if it doesn't exist.
+    
+    This should be called once before using populate_fiches_adn_table.
+    
+    Returns: Success message or error
+    """
+    try:
+        conn = get_db_conn()
+        
+        with conn.cursor() as cur:
+            # Create the table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.fiches_adn_matieres (
+                    fiche_adn_id SERIAL PRIMARY KEY,
+                    matiere_id INTEGER NOT NULL,
+                    nom_matiere VARCHAR(255),
+                    reference VARCHAR(100),
+                    type_matiere VARCHAR(100),
+                    specifications JSONB,
+                    num_specifications INTEGER DEFAULT 0,
+                    date_creation TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    derniere_modification TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT fk_matiere FOREIGN KEY (matiere_id) 
+                        REFERENCES public.matieres(matiere_id) ON DELETE CASCADE,
+                    CONSTRAINT unique_matiere_id UNIQUE (matiere_id)
+                )
+            """)
+            
+            # Create index on matiere_id for faster lookups
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_fiches_adn_matiere_id 
+                ON public.fiches_adn_matieres(matiere_id)
+            """)
+            
+            # Create index on reference for faster searches
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_fiches_adn_reference 
+                ON public.fiches_adn_matieres(reference)
+            """)
+            
+            conn.commit()
+            
+            # Check if table was created
+            cur.execute("""
+                SELECT COUNT(*) as count 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_name = 'fiches_adn_matieres'
+            """)
+            table_exists = cur.fetchone()[0] > 0
+            
+            return jsonify({
+                "success": True,
+                "message": "Table fiches_adn_matieres created successfully" if table_exists else "Table creation completed",
+                "table_exists": table_exists
+            }), 200
+            
+    except Exception as e:
+        print(f"❌ Error creating fiches_adn_matieres table: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": "table_creation_failed",
+            "message": str(e)
+        }), 500
+    finally:
+        if conn:
+            conn.close()
+
+
 @app.route("/populate_fiches_adn_table", methods=["POST"])
 def populate_fiches_adn_table():
     """
@@ -1576,6 +1650,7 @@ def populate_fiches_adn_table():
             updated_count = 0
             inserted_count = 0
             error_count = 0
+            errors_details = []
             
             for material in materials:
                 try:
@@ -1678,21 +1753,31 @@ def populate_fiches_adn_table():
                     conn.commit()
                     
                 except Exception as mat_error:
-                    print(f"❌ Error processing material {material.get('matiere_id')}: {mat_error}")
+                    error_msg = str(mat_error)
+                    print(f"❌ Error processing material {material.get('matiere_id')}: {error_msg}")
+                    import traceback
+                    traceback.print_exc()
                     error_count += 1
+                    errors_details.append({
+                        "matiere_id": material.get('matiere_id'),
+                        "reference": material.get('reference'),
+                        "nom_matiere": material.get('nom_matiere'),
+                        "error": error_msg
+                    })
                     conn.rollback()
                     continue
             
             return jsonify({
-                "success": True,
-                "message": "Fiches ADN table populated successfully",
+                "success": True if error_count == 0 else False,
+                "message": "Fiches ADN table populated successfully" if error_count == 0 else f"Population completed with {error_count} errors",
                 "summary": {
                     "total_materials": len(materials),
                     "processed": processed_count,
                     "inserted": inserted_count,
                     "updated": updated_count,
                     "errors": error_count
-                }
+                },
+                "errors_details": errors_details[:10] if errors_details else []  # Return first 10 errors
             }), 200
             
     except Exception as e:

@@ -1,0 +1,685 @@
+openapi: 3.1.0
+info:
+  title: Black Mix DB Agent API
+  version: "2.1.0"
+  description: |
+    API for managing Black Mix formulations and ADN analysis.
+servers:
+  - url: https://micrographie-ia.azurewebsites.net
+    description: Azure production server
+tags:
+  - name: System
+  - name: Black Mix CRUD
+  - name: Black Mix ADN
+  - name: Fiches ADN Management
+paths:
+  /health:
+    get:
+      tags: [System]
+      summary: Health check
+      operationId: healthCheck
+      responses:
+        "200":
+          description: API health status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  database:
+                    type: string
+  /black-mix/validate-material/{reference}:
+    get:
+      tags: [Black Mix CRUD]
+      summary: Validate if a material reference exists
+      operationId: validateBlackMixMaterial
+      parameters:
+        - name: reference
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Validation result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reference:
+                    type: string
+                  exists:
+                    type: boolean
+                  material_name:
+                    type: ["string", "null"]
+                  matiere_id:
+                    type: ["integer", "null"]
+  /black-mix/submit:
+    post:
+      tags: [Black Mix CRUD]
+      summary: Submit a complete Black Mix
+      operationId: submitBlackMix
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BlackMixSubmission"
+      responses:
+        "200":
+          description: Black Mix created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  black_mix_id:
+                    type: integer
+                  product_reference:
+                    type: string
+                  adn:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                      version:
+                        type: integer
+                      snapshot_created_at:
+                        type: string
+                        format: date-time
+  /black-mix/list:
+    get:
+      tags: [Black Mix CRUD]
+      summary: List all Black Mixes
+      operationId: listBlackMixes
+      responses:
+        "200":
+          description: List of Black Mixes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  black_mixes:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/BlackMixSummary"
+  /black-mix/{mix_id}:
+    get:
+      tags: [Black Mix CRUD]
+      summary: Get full details of a Black Mix
+      operationId: getBlackMixDetails
+      parameters:
+        - name: mix_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Black Mix details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  black_mix:
+                    $ref: "#/components/schemas/BlackMixDetail"
+  /black-mix/{mix_id}/adn:
+    get:
+      tags: [Black Mix ADN]
+      summary: Get ADN snapshot
+      operationId: getBlackMixAdn
+      parameters:
+        - name: mix_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: ADN snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlackMixAdnSnapshot"
+  /black-mix/{mix_id}/adn-combined:
+    get:
+      tags: [Black Mix ADN]
+      summary: Get combined ADN
+      operationId: getBlackMixAdnCombined
+      parameters:
+        - name: mix_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Combined ADN payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlackMixAdnCombined"
+  /black-mix/{mix_id}/adn-enriched:
+    get:
+      tags: [Black Mix ADN]
+      summary: Get AI enriched ADN
+      operationId: getBlackMixAdnEnriched
+      parameters:
+        - name: mix_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Enriched ADN payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BlackMixAdnEnriched"
+  /create_fiches_adn_table:
+    post:
+      tags: [Fiches ADN Management]
+      summary: Create fiches ADN table
+      operationId: createFichesAdnTable
+      description: |
+        Creates the fiches_adn_matieres table if it doesn't exist.
+        This should be called once before using populate_fiches_adn_table.
+        
+        Creates:
+        - Main table with all necessary columns
+        - Foreign key constraint to matieres table
+        - Unique constraint on matiere_id
+        - Indexes for performance (matiere_id, reference)
+      responses:
+        "200":
+          description: Table created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "Table fiches_adn_matieres created successfully"
+                  table_exists:
+                    type: boolean
+                    example: true
+        "500":
+          description: Table creation failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  error:
+                    type: string
+                    example: "table_creation_failed"
+                  message:
+                    type: string
+  /populate_fiches_adn_table:
+    post:
+      tags: [Fiches ADN Management]
+      summary: Populate/update fiches ADN table
+      operationId: populateFichesAdnTable
+      description: |
+        Re-aggregates all ADN information from source tables into fiches_adn_matieres.
+        This endpoint should be called whenever new fiches, specifications, or expert notes are added.
+        
+        Process:
+        - Fetches all materials from database
+        - For each material, gathers all related fiches, specifications, and expert notes
+        - Aggregates everything into a JSON structure
+        - Inserts new records or updates existing records in fiches_adn_matieres
+      responses:
+        "200":
+          description: Fiches ADN table populated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "Fiches ADN table populated successfully"
+                  summary:
+                    type: object
+                    properties:
+                      total_materials:
+                        type: integer
+                        example: 150
+                      processed:
+                        type: integer
+                        example: 148
+                      inserted:
+                        type: integer
+                        example: 30
+                      updated:
+                        type: integer
+                        example: 118
+                      errors:
+                        type: integer
+                        example: 2
+                  errors_details:
+                    type: array
+                    description: Details of first 10 errors encountered (if any)
+                    items:
+                      type: object
+                      properties:
+                        matiere_id:
+                          type: integer
+                        reference:
+                          type: string
+                        nom_matiere:
+                          type: string
+                        error:
+                          type: string
+        "404":
+          description: No materials found in database
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  message:
+                    type: string
+                    example: "No materials found in database"
+        "500":
+          description: Population failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  error:
+                    type: string
+                    example: "population_failed"
+                  message:
+                    type: string
+  /verify_fiches_adn_table:
+    get:
+      tags: [Fiches ADN Management]
+      summary: Verify and analyze fiches ADN table
+      operationId: verifyFichesAdnTable
+      description: |
+        Verifies and analyzes the fiches_adn_matieres table.
+        
+        Returns:
+        - Total record count
+        - Specifications statistics (total, average per material)
+        - Sample records
+        - Data quality metrics
+        - Recent updates
+      responses:
+        "200":
+          description: Verification completed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "Verification completed successfully"
+                  total_records:
+                    type: integer
+                    example: 148
+                  statistics:
+                    type: object
+                    properties:
+                      total_records:
+                        type: integer
+                        example: 148
+                      total_specifications:
+                        type: integer
+                        example: 1256
+                      avg_specifications_per_material:
+                        type: number
+                        example: 8.5
+                      min_specifications:
+                        type: integer
+                        example: 0
+                      max_specifications:
+                        type: integer
+                        example: 45
+                      materials_without_specs:
+                        type: integer
+                        example: 12
+                      materials_with_data:
+                        type: integer
+                        example: 148
+                  samples:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/FicheAdnSample"
+                  recent_updates:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        fiche_adn_id:
+                          type: integer
+                        nom_matiere:
+                          type: string
+                        reference:
+                          type: string
+                        derniere_modification:
+                          type: string
+                          format: date-time
+        "500":
+          description: Verification failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  error:
+                    type: string
+                    example: "verification_failed"
+                  message:
+                    type: string
+
+components:
+  schemas:
+    BlackMixSummary:
+      type: object
+      properties:
+        id:
+          type: integer
+        product_reference:
+          type: string
+        mix_name:
+          type: string
+        status:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    BlackMixComponent:
+      type: object
+      properties:
+        reference:
+          type: string
+        material_name:
+          type: string
+        quantity:
+          type: number
+        unit:
+          type: string
+        metadata:
+          type: ["object", "null"]
+
+    ProcessStep:
+      type: object
+      properties:
+        step_order:
+          type: integer
+        step_name:
+          type: string
+        machine:
+          type: string
+        parameters:
+          type: object
+        materials:
+          type: array
+          items:
+            type: string
+
+    ControlPlanParam:
+      type: object
+      properties:
+        parameter_name:
+          type: string
+        target_value:
+          type: ["number", "null"]
+        min_value:
+          type: ["number", "null"]
+        max_value:
+          type: ["number", "null"]
+        unit:
+          type: string
+
+    FicheAdnMatiere:
+      type: object
+      properties:
+        fiche_adn_id:
+          type: integer
+        matiere_id:
+          type: integer
+        reference:
+          type: string
+        nom_matiere:
+          type: string
+        material_name:
+          type: string
+        type_matiere:
+          type: string
+        specifications:
+          type: object
+        num_specifications:
+          type: integer
+
+    FicheAdnSample:
+      type: object
+      properties:
+        fiche_adn_id:
+          type: integer
+          example: 42
+        matiere_id:
+          type: integer
+          example: 123
+        nom_matiere:
+          type: string
+          example: "Carbon Black N330"
+        reference:
+          type: string
+          example: "6600323"
+        type_matiere:
+          type: string
+          example: "Noir de carbone"
+        num_specifications:
+          type: integer
+          example: 15
+        date_creation:
+          type: string
+          format: date-time
+        derniere_modification:
+          type: string
+          format: date-time
+        specifications_summary:
+          type: object
+          properties:
+            num_fiches:
+              type: integer
+              example: 3
+            num_specifications:
+              type: integer
+              example: 15
+            num_expert_notes:
+              type: integer
+              example: 8
+
+    BlackMixDetail:
+      type: object
+      properties:
+        id:
+          type: integer
+        product_reference:
+          type: string
+        mix_name:
+          type: string
+        status:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        components:
+          type: array
+          items:
+            $ref: "#/components/schemas/BlackMixComponent"
+        process_steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProcessStep"
+        control_plan:
+          type: array
+          items:
+            $ref: "#/components/schemas/ControlPlanParam"
+
+    BlackMixAdnSnapshot:
+      type: object
+      properties:
+        id:
+          type: integer
+        black_mix_id:
+          type: integer
+        version:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        snapshot:
+          type: object
+          properties:
+            product_reference:
+              type: string
+            mix_name:
+              type: string
+            composition:
+              type: array
+              items:
+                $ref: "#/components/schemas/BlackMixComponent"
+            process_steps:
+              type: array
+              items:
+                $ref: "#/components/schemas/ProcessStep"
+            control_plan:
+              type: array
+              items:
+                $ref: "#/components/schemas/ControlPlanParam"
+
+    BlackMixAdnCombined:
+      type: object
+      properties:
+        success:
+          type: boolean
+        black_mix:
+          $ref: "#/components/schemas/BlackMixSummary"
+        adn_version:
+          type: integer
+        adn_created_at:
+          type: string
+          format: date-time
+        composition:
+          type: array
+          items:
+            type: object
+            properties:
+              reference:
+                type: string
+              material_name:
+                type: string
+              quantity:
+                type: number
+              unit:
+                type: string
+              metadata:
+                type: ["object", "null"]
+              adn_matiere:
+                $ref: "#/components/schemas/FicheAdnMatiere"
+        process_steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProcessStep"
+        control_plan:
+          type: array
+          items:
+            $ref: "#/components/schemas/ControlPlanParam"
+
+    AiAnalysis:
+      type: object
+      properties:
+        description_generale:
+          type: string
+        analyse_composants:
+          type: array
+          items:
+            type: object
+        analyse_processus:
+          type: array
+          items:
+            type: object
+
+    BlackMixAdnEnriched:
+      type: object
+      properties:
+        base_adn:
+          $ref: "#/components/schemas/BlackMixAdnSnapshot"
+        component_adns:
+          type: array
+          items:
+            $ref: "#/components/schemas/FicheAdnMatiere"
+        ai_analysis:
+          $ref: "#/components/schemas/AiAnalysis"
+        version:
+          type: integer
+        enriched_at:
+          type: string
+          format: date-time
+
+    BlackMixSubmission:
+      type: object
+      required:
+        - product_reference
+        - mix_name
+        - components
+      properties:
+        product_reference:
+          type: string
+        mix_name:
+          type: string
+        components:
+          type: array
+          items:
+            $ref: "#/components/schemas/BlackMixComponent"
+        process_steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProcessStep"
+        control_plan:
+          type: array
+          items:
+            $ref: "#/components/schemas/ControlPlanParam"
