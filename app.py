@@ -2395,11 +2395,16 @@ def validate_black_mix_material(reference):
 
 @app.route("/black-mix/submit", methods=["POST"])
 def submit_black_mix():
-    """Submit a complete Black Mix with components, process steps, control plan."""
-    if not request.is_json:
-        return jsonify({"success": False, "error": "JSON required"}), 400
+    """Submit a complete Black Mix with components, process steps, and control plan."""
 
-    data = request.get_json(silent=True) or {}
+    if not request.is_json:
+        return jsonify({
+            "success": False,
+            "error": "Request body must be JSON"
+        }), 400
+
+    data = request.get_json()
+
     product_reference = data.get("product_reference")
     mix_name = data.get("mix_name")
     components = data.get("components", [])
@@ -2407,80 +2412,116 @@ def submit_black_mix():
     control_plan = data.get("control_plan", [])
     document_revision_history = data.get("document_revision_history")
 
+    # ------------------------------
+    # Basic validation
+    # ------------------------------
     if not product_reference or not mix_name:
         return jsonify({
             "success": False,
-            "error": "Missing required fields: product_reference, mix_name"
+            "error": "product_reference and mix_name are required"
+        }), 400
+
+    if not process_steps:
+        return jsonify({
+            "success": False,
+            "error": "At least one process_step is required"
         }), 400
 
     conn = psycopg2.connect(DB_DSN)
+
     try:
         with conn:
             with conn.cursor() as cur:
-                # Validate all material references first
+
+                # ------------------------------
+                # Validate materials references
+                # ------------------------------
                 validation_errors = []
+
                 for component in components:
                     ref = component.get("reference")
                     if not ref:
-                        validation_errors.append("A component is missing its reference")
+                        validation_errors.append("Component missing reference")
                         continue
+
                     cur.execute(
                         "SELECT matiere_id FROM public.matieres WHERE reference = %s",
                         (ref,)
                     )
+
                     if not cur.fetchone():
                         validation_errors.append(f"Invalid material reference: {ref}")
 
                 if validation_errors:
                     return jsonify({
                         "success": False,
-                        "message": "Validation errors found",
                         "validation_errors": validation_errors
                     }), 400
 
+                # ------------------------------
                 # Create Black Mix
+                # ------------------------------
                 cur.execute(
-                    """INSERT INTO public.black_mixes
-                       (reference, name, status, created_at, document_revision_history)
-                       VALUES (%s, %s, 'draft', NOW(), %s)
-                       RETURNING id""",
+                    """
+                    INSERT INTO public.black_mixes
+                    (reference, name, status, created_at, document_revision_history)
+                    VALUES (%s, %s, 'draft', NOW(), %s)
+                    RETURNING id
+                    """,
                     (
                         product_reference,
                         mix_name,
                         Json(document_revision_history) if document_revision_history else None
                     )
                 )
-                black_mix_id = cur.fetchone()[0]
-                logging.info(f"Created Black Mix ID={black_mix_id} ref={product_reference}")
 
+                black_mix_id = cur.fetchone()[0]
+
+                # ------------------------------
                 # Insert components
+                # ------------------------------
                 for component in components:
+
                     cur.execute(
                         "SELECT matiere_id FROM public.matieres WHERE reference = %s",
                         (component["reference"],)
                     )
+
                     matiere_id = cur.fetchone()[0]
+
                     cur.execute(
-                        """INSERT INTO public.black_mix_components
-                           (black_mix_id, matiere_id, component_name, quantity_value, quantity_unit, metadata)
-                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        """
+                        INSERT INTO public.black_mix_components
+                        (black_mix_id, matiere_id, component_name, quantity_value, quantity_unit, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
                         (
                             black_mix_id,
                             matiere_id,
-                            component.get("component_name") or component.get("reference"),
+                            component.get("component_name") or component["reference"],
                             component.get("quantity"),
                             component.get("unit", "phr"),
                             Json(component.get("metadata", {}))
                         )
                     )
 
-                # Insert process steps + step-materials
+                # ------------------------------
+                # Insert process steps
+                # ------------------------------
                 for step in process_steps:
+
+                    if not step.get("materials"):
+                        raise ValueError(
+                            f"Process step '{step.get('step_name')}' must contain at least one material"
+                        )
+
                     cur.execute(
-                        """INSERT INTO public.black_mix_process_steps
-                           (black_mix_id, step_order, step_name, machine_name, parameters)
-                           VALUES (%s, %s, %s, %s, %s)
-                           RETURNING id""",
+                        """
+                        INSERT INTO public.black_mix_process_steps
+                        (black_mix_id, step_order, step_name, machine_name, parameters)
+                        VALUES (%s, %s, %s, %s, %s)
+                        RETURNING id
+                        """,
                         (
                             black_mix_id,
                             step.get("step_order"),
@@ -2489,29 +2530,47 @@ def submit_black_mix():
                             Json(step.get("parameters", {}))
                         )
                     )
+
                     process_step_id = cur.fetchone()[0]
-                    for ref in step.get("materials", []):
+
+                    # ------------------------------
+                    # Insert step-material relations
+                    # ------------------------------
+                    for ref in step.get("materials"):
+
                         cur.execute(
                             "SELECT matiere_id FROM public.matieres WHERE reference = %s",
                             (ref,)
                         )
+
                         mat_row = cur.fetchone()
+
                         if not mat_row:
                             raise ValueError(f"Invalid material reference in step: {ref}")
+
                         cur.execute(
-                            """INSERT INTO public.black_mix_step_materials
-                               (process_step_id, matiere_id)
-                               VALUES (%s, %s)
-                               ON CONFLICT DO NOTHING""",
-                            (process_step_id, mat_row[0])
+                            """
+                            INSERT INTO public.black_mix_step_materials
+                            (process_step_id, matiere_id, created_at)
+                            VALUES (%s, %s, NOW())
+                            """,
+                            (
+                                process_step_id,
+                                mat_row[0]
+                            )
                         )
 
+                # ------------------------------
                 # Insert control plan
+                # ------------------------------
                 for param in control_plan:
+
                     cur.execute(
-                        """INSERT INTO public.black_mix_control_plan
-                           (black_mix_id, parameter_name, target_value, min_value, max_value, unit)
-                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        """
+                        INSERT INTO public.black_mix_control_plan
+                        (black_mix_id, parameter_name, target_value, min_value, max_value, unit)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
                         (
                             black_mix_id,
                             param.get("parameter_name"),
@@ -2522,51 +2581,52 @@ def submit_black_mix():
                         )
                     )
 
-                # Build and save Black Mix ADN
-                adn_snapshot = build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
-                cur.execute(
-                    """SELECT id, version FROM public.black_mix_adn
-                       WHERE black_mix_id = %s ORDER BY id DESC LIMIT 1""",
-                    (black_mix_id,)
+                # ------------------------------
+                # Build ADN snapshot
+                # ------------------------------
+                adn_snapshot = build_black_mix_adn_snapshot(
+                    cur,
+                    black_mix_id,
+                    product_reference,
+                    mix_name
                 )
-                existing_adn = cur.fetchone()
-                if existing_adn:
-                    cur.execute(
-                        """UPDATE public.black_mix_adn
-                           SET adn_text = %s, version = %s, created_at = NOW()
-                           WHERE id = %s RETURNING id, version""",
-                        (Json(adn_snapshot), (existing_adn[1] or 0) + 1, existing_adn[0])
+
+                cur.execute(
+                    """
+                    INSERT INTO public.black_mix_adn
+                    (black_mix_id, adn_text, version, created_at)
+                    VALUES (%s, %s, 1, NOW())
+                    RETURNING id
+                    """,
+                    (
+                        black_mix_id,
+                        Json(adn_snapshot)
                     )
-                else:
-                    cur.execute(
-                        """INSERT INTO public.black_mix_adn
-                           (black_mix_id, adn_text, version, created_at)
-                           VALUES (%s, %s, 1, NOW()) RETURNING id, version""",
-                        (black_mix_id, Json(adn_snapshot))
-                    )
-                adn_result = cur.fetchone()
-                adn_id, adn_version = (adn_result[0], adn_result[1]) if adn_result else (None, None)
-                logging.info(f"✅ Black Mix ADN saved (ID={adn_id}, version={adn_version})")
+                )
+
+                adn_id = cur.fetchone()[0]
 
                 return jsonify({
                     "success": True,
                     "message": f"Black Mix '{mix_name}' created successfully",
                     "black_mix_id": black_mix_id,
                     "product_reference": product_reference,
-                    "validation_errors": [],
                     "adn": {
                         "id": adn_id,
-                        "version": adn_version,
-                        "snapshot_created_at": datetime.now().isoformat()
+                        "version": 1
                     }
                 }), 200
 
     except Exception as e:
-        logging.error(f"Submit Black Mix error: {e}", exc_info=True)
-        return jsonify({"success": False, "error": str(e)}), 500
+        conn.rollback()
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
     finally:
         conn.close()
-
 
 @app.route("/black-mix/list", methods=["GET"])
 def list_black_mixes():
@@ -2742,282 +2802,210 @@ def get_black_mix_adn(mix_id):
             conn.close()
 
 
+import json
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from flask import jsonify
+
 @app.route("/black-mix/<int:mix_id>/adn-enriched", methods=["GET"])
 def get_black_mix_adn_enriched(mix_id):
-    """
-    Generate enriched ADN with AI analysis.
-    Uses fiches_adn_matieres for pre-aggregated component ADNs.
-    """
+
     conn = psycopg2.connect(DB_DSN)
+
     try:
-        with conn.cursor() as cur:
-            # ── Get base Black Mix ADN ──
-            cur.execute(
-                """SELECT id, black_mix_id, adn_text, version, created_at
-                   FROM public.black_mix_adn
-                   WHERE black_mix_id = %s
-                   ORDER BY version DESC LIMIT 1""",
-                (mix_id,)
-            )
-            row = cur.fetchone()
-            if not row:
-                return jsonify({"success": False, "error": "ADN not found for this Black Mix"}), 404
+        with conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
-            adn_id, black_mix_id, adn_text, version, created_at = row
-            base_adn = adn_text
+                # ---------------------------------------------------
+                # 1. Black Mix identity
+                # ---------------------------------------------------
+                cur.execute("""
+                    SELECT id, reference, name, status, document_revision_history
+                    FROM black_mixes
+                    WHERE id = %s
+                """, (mix_id,))
 
-            # ── Get document revision history ──
-            cur.execute(
-                "SELECT document_revision_history FROM public.black_mixes WHERE id = %s",
-                (mix_id,)
-            )
-            rev_row = cur.fetchone()
-            revision_history = rev_row[0] if rev_row and rev_row[0] else None
+                black_mix = cur.fetchone()
 
-            # ── Fetch component ADNs from fiches_adn_matieres ──
-            components_with_adn = []
-            seen_refs = set()
-            for component in base_adn.get("composition", []):
-                material_ref = component.get("reference")
-                if not material_ref or material_ref in seen_refs:
-                    continue
-                seen_refs.add(material_ref)
+                if not black_mix:
+                    return jsonify({"error": "Black mix not found"}), 404
 
-                cur.execute(
-                    """SELECT fiche_adn_id, nom_matiere, material_name, reference,
-                              type_matiere, specifications, num_specifications
-                       FROM public.fiches_adn_matieres
-                       WHERE reference = %s
-                       LIMIT 1""",
-                    (material_ref,)
-                )
-                adn_row = cur.fetchone()
 
-                component_adn = {
-                    "reference": material_ref,
-                    "component_name": component.get("component_name", ""),
-                    "material_name": component.get("material_name", ""),
-                    "quantity": component.get("quantity"),
-                    "unit": component.get("unit", ""),
-                    "metadata": component.get("metadata", {}),
+                # ---------------------------------------------------
+                # 2. Components + ADN specifications
+                # ---------------------------------------------------
+                cur.execute("""
+                    SELECT
+                        c.matiere_id,
+                        c.component_name,
+                        c.quantity_value,
+                        c.quantity_unit,
+                        m.reference,
+                        m.nom_matiere,
+                        m.type_matiere,
+                        f.specifications
+                    FROM black_mix_components c
+                    JOIN matieres m
+                        ON m.matiere_id = c.matiere_id
+                    LEFT JOIN fiches_adn_matieres f
+                        ON f.matiere_id = c.matiere_id
+                    WHERE c.black_mix_id = %s
+                """, (mix_id,))
+
+                components = cur.fetchall()
+
+                for c in components:
+                    if not c["specifications"]:
+                        c["specifications"] = "Information non disponible"
+
+
+                # ---------------------------------------------------
+                # 3. Process steps
+                # ---------------------------------------------------
+                cur.execute("""
+                    SELECT
+                        ps.id,
+                        ps.step_order,
+                        ps.step_name,
+                        ps.machine_name,
+                        ps.parameters
+                    FROM black_mix_process_steps ps
+                    WHERE ps.black_mix_id = %s
+                    ORDER BY ps.step_order
+                """, (mix_id,))
+
+                process_steps = cur.fetchall()
+
+
+                # ---------------------------------------------------
+                # 4. Materials per step
+                # ---------------------------------------------------
+                cur.execute("""
+                    SELECT
+                        sm.process_step_id,
+                        m.reference,
+                        m.nom_matiere
+                    FROM black_mix_step_materials sm
+                    JOIN black_mix_process_steps ps
+                        ON ps.id = sm.process_step_id
+                    JOIN matieres m
+                        ON m.matiere_id = sm.matiere_id
+                    WHERE ps.black_mix_id = %s
+                """, (mix_id,))
+
+                step_materials = cur.fetchall()
+
+                materials_by_step = {}
+
+                for row in step_materials:
+                    step_id = row["process_step_id"]
+
+                    materials_by_step.setdefault(step_id, []).append({
+                        "reference": row["reference"],
+                        "nom_matiere": row["nom_matiere"]
+                    })
+
+                for step in process_steps:
+                    step["materials"] = materials_by_step.get(step["id"], [])
+
+
+                # ---------------------------------------------------
+                # 5. Control plan
+                # ---------------------------------------------------
+                cur.execute("""
+                    SELECT
+                        parameter_name,
+                        target_value,
+                        min_value,
+                        max_value,
+                        unit
+                    FROM black_mix_control_plan
+                    WHERE black_mix_id = %s
+                """, (mix_id,))
+
+                control_plan = cur.fetchall()
+
+
+                # ---------------------------------------------------
+                # 6. Structured data for AI
+                # ---------------------------------------------------
+                data_for_ai = {
+                    "black_mix_identity": {
+                        "reference": black_mix["reference"],
+                        "name": black_mix["name"],
+                        "status": black_mix["status"],
+                        "revision_history": black_mix["document_revision_history"]
+                    },
+                    "components": components,
+                    "process_steps": process_steps,
+                    "step_materials": step_materials,
+                    "control_plan": control_plan
                 }
 
-                if adn_row:
-                    specs_json = adn_row[5] or {}
-                    component_adn.update({
-                        "fiche_adn_id": adn_row[0],
-                        "nom_matiere": adn_row[1],
-                        "material_name_adn": adn_row[2],
-                        "type_matiere": adn_row[4],
-                        "num_specifications": adn_row[6],
-                        "adn_matieres": specs_json,
-                    })
-                else:
-                    component_adn.update({
-                        "fiche_adn_id": None,
-                        "type_matiere": None,
-                        "num_specifications": 0,
-                        "adn_matieres": None,
-                    })
 
-                components_with_adn.append(component_adn)
+                # ---------------------------------------------------
+                # 7. YOUR PROMPT (unchanged)
+                # ---------------------------------------------------
+                prompt = f"""
+Tu es un expert en formulation industrielle de matériaux carbone et graphite. 
+Ton objectif est de générer un "Rapport Technique BLACK MIX ADN" en suivant STRICTEMENT la structure et le style du document de référence fourni, tout en intégrant une analyse approfondie de l'impact du processus de transformation.
 
-            # ── Build AI prompt using fiches_adn_matieres data ──
-            comp_summaries = []
-            for c in components_with_adn:
-                summary = {
-                    "reference": c["reference"],
-                    "name": c["material_name"] or c["component_name"],
-                    "type": c.get("type_matiere", ""),
-                    "quantity": c["quantity"],
-                    "unit": c["unit"],
-                    "role": c["metadata"].get("role", ""),
-                    "process_phase": c["metadata"].get("process_phase", ""),
-                    "introduced_in_step": c["metadata"].get("introduced_in_step"),
-                    "notes": c["metadata"].get("notes", ""),
-                    "tolerance": c["metadata"].get("tolerance", {}),
-                }
-                adn_mat = c.get("adn_matieres")
-                if adn_mat and isinstance(adn_mat, dict):
-                    specs_list = adn_mat.get("specifications", [])
-                    for spec in specs_list:
-                        src = spec.get("source_type", "")
-                        donnees = spec.get("donnees", {})
-                        if src == "datasheet":
-                            summary["datasheet"] = {
-                                "material_identification": donnees.get("material_identification", {}),
-                                "physical_properties": donnees.get("physical_properties", []),
-                                "mechanical_properties": donnees.get("mechanical_properties", []),
-                                "thermal_properties": donnees.get("thermal_properties", []),
-                                "chemical_resistance": donnees.get("chemical_resistance", []),
-                                "electrical_properties": donnees.get("electrical_properties", []),
-                                "composition": donnees.get("composition", {}),
-                                "processing_notes": donnees.get("processing_and_notes", ""),
-                                "standards": donnees.get("standards_and_certifications", []),
-                            }
-                        elif src == "msds":
-                            summary["msds"] = {
-                                "hazard_statements": donnees.get("hazard_statements", []),
-                                "composition": donnees.get("composition", []),
-                                "physical_properties": donnees.get("physical_properties", {}),
-                                "toxicological_info": donnees.get("toxicological_information", {}),
-                                "classification": donnees.get("classification", {}),
-                                "stability": donnees.get("stability_and_reactivity", {}),
-                                "ecological_info": donnees.get("ecological_information", {}),
-                            }
-                        elif "controle" in src or "control" in src or "excel" in src:
-                            summary["control_sheet"] = donnees
-                comp_summaries.append(summary)
+### CONSIGNES DE RÉDACTION :
+1. **AUCUNE HALLUCINATION** : N'invente aucune donnée, valeur numérique ou propriété. Si une information est manquante, indique "Information non disponible".
+2. **STYLE PROFESSIONNEL** : Utilise un ton technique, précis et structuré (tableaux, listes à puces, sections numérotées).
+3. **LANGUE** : Le rapport doit être rédigé en Français.
 
-            # ── Compress summaries to fit token limits ──
-            def _trim(obj, max_list=5):
-                """Recursively trim lists to max_list items and remove empty values."""
-                if isinstance(obj, dict):
-                    return {k: _trim(v, max_list) for k, v in obj.items() if v not in (None, "", [], {})}
-                elif isinstance(obj, list):
-                    return [_trim(i, max_list) for i in obj[:max_list]]
-                return obj
+### STRUCTURE DU RAPPORT À RESPECTER :
 
-            compact_summaries = _trim(comp_summaries, max_list=5)
-            compact_steps = _trim(base_adn.get('process_steps', []), max_list=10)
-            compact_control = _trim(base_adn.get('control_plan', []), max_list=10)
+#### 1. Introduction
+Présente brièvement le rapport comme une référence de prompt structurée pour le mélange spécifique, garantissant la précision technique et la traçabilité.
 
-            prompt = f"""Tu es un expert en formulation de Black Mix (mélanges industriels pour pièces carbone/graphite).
+#### 2. Identité et Vue d'ensemble du Black Mix
+*   **2.1. Informations Générales** : Crée un tableau avec les paramètres : Référence Produit, Nom du Mix, Version ADN (si dispo), Statut, Système d'Origine (si dispo), Type de Document, Révision Actuelle.
+*   **2.2. Historique des Révisions Clés** : Utilise les données de `revision_history` pour créer un tableau (Version, Date, Auteur, Description de la Modification). Analyse brièvement l'évolution si les données le permettent.
 
-Analyse en profondeur ce Black Mix et génère un rapport technique TRÈS DÉTAILLÉ incluant :
+#### 3. Architecture et Processus du Black Mix
+*   **3.1. Composition Structurelle et Phases** : Crée un tableau détaillé des composants (Code/Référence, Matériau, Quantité, Tolérance/Spécifications, Fonction, Phase). *Note : Déduis la phase (Sec, Humide, Final) selon la nature du composant et l'ordre d'introduction.*
+*   **3.2. Gamme de Fabrication Détaillée** : Crée un tableau des étapes du processus (`process_steps`) incluant : Étape, Opération, Paramètres, Références Impliquées (via `step_materials`), Objectif.
+*   **3.3. ANALYSE DE L'IMPACT DU PROCESSUS (NOUVEAU)** : 
+    *   Analyse comment les paramètres de chaque étape influencent la qualité finale.
+    *   Explique l'interaction entre machines et matériaux.
+*   **3.4. Spécifications de Contrôle Final (Plan de Contrôle)** : Tableau basé sur `control_plan`.
 
-1. **Description générale** : fonction, application industrielle, famille de produits, contexte d'utilisation
-2. **ADN du Black Mix** : caractéristiques identitaires uniques (ratios critiques, architecture du mélange, signature process)
-3. **Analyse détaillée de chaque composant** (en utilisant les données ADN matière fournies) :
-   - Rôle fonctionnel précis dans le mélange
-   - Propriétés clés (datasheet) : physiques, mécaniques, thermiques, électriques
-   - Composition chimique détaillée
-   - Sécurité/manipulation (MSDS) : dangers, toxicologie, précautions
-   - Paramètres de contrôle qualité
-   - Interactions avec les autres composants
-   - Impact de la quantité sur les propriétés finales
-4. **Analyse du processus de fabrication** :
-   - Impact de chaque étape sur la transformation des matières
-   - Paramètres critiques (température, temps, pression)
-   - Points de contrôle qualité en cours de process
-5. **Propriétés résultantes attendues** : mécaniques, thermiques, chimiques, électriques
-6. **Analyse du plan de contrôle** : justification de chaque paramètre contrôlé
-7. **Recommandations** : optimisations, points de vigilance, contrôles suggérés
+#### 4. ADN Détaillé des Composants
+Pour CHAQUE matière première listée dans les composants :
+* Nom et Référence
+* Type et Fonction
+* Tableau des spécifications provenant de `specifications`.
 
-**Black Mix :** {base_adn.get('product_reference')} - {base_adn.get('mix_name')}
+#### 5. Synthèse de l'Identité Structurelle
+Analyse finale + Note d'Expert.
 
-**Composition détaillée avec ADN matières :**
-{json.dumps(compact_summaries, indent=1, ensure_ascii=False)}
-
-**Étapes de processus :**
-{json.dumps(compact_steps, indent=1, ensure_ascii=False)}
-
-**Plan de contrôle :**
-{json.dumps(compact_control, indent=1, ensure_ascii=False)}
-
-**Historique de révision :**
-{json.dumps(revision_history, ensure_ascii=False) if revision_history else "Non disponible"}
-
-Réponds en JSON structuré :
-{{
-  "description_generale": "Description complète (5-10 phrases)...",
-  "adn_black_mix": {{
-    "identite": "Signature unique de ce mélange...",
-    "ratios_critiques": ["ratio graphite/liant = X", ...],
-    "architecture_melange": "Description de l'architecture...",
-    "famille_produit": "...",
-    "application_cible": "..."
-  }},
-  "analyse_composants": [
-    {{
-      "reference": "6600xxx",
-      "nom": "...",
-      "type_matiere": "...",
-      "role_fonctionnel": "Explication détaillée du rôle...",
-      "quantite": "X %",
-      "proprietes_cles": [
-        {{"propriete": "...", "valeur": "...", "unite": "...", "condition": "..."}}
-      ],
-      "composition_chimique": "...",
-      "securite_manipulation": "Points clés MSDS...",
-      "parametres_controle": ["..."],
-      "interactions_composants": "Comment ce composant interagit avec les autres...",
-      "impact_quantite": "Effet de la quantité sur le produit final..."
-    }}
-  ],
-  "analyse_processus": [
-    {{
-      "etape": "Étape N - Nom",
-      "description_detaillee": "Ce qui se passe physiquement/chimiquement...",
-      "parametres_critiques": [{{"parametre": "...", "valeur": "...", "impact": "..."}}],
-      "matieres_impliquees": ["..."],
-      "transformations": "Transformations physico-chimiques...",
-      "proprietes_affectees": ["..."],
-      "points_vigilance": ["..."]
-    }}
-  ],
-  "proprietes_resultantes": {{
-    "mecaniques": {{"resistance_compression": "...", "durete": "...", "flexion": "..."}},
-    "thermiques": {{"conductivite_thermique": "...", "resistance_temperature": "...", "dilatation": "..."}},
-    "chimiques": {{"resistance_corrosion": "...", "stabilite": "..."}},
-    "electriques": {{"resistivite": "...", "conductivite": "..."}}
-  }},
-  "plan_controle_analyse": [
-    {{
-      "parametre": "...",
-      "justification": "Pourquoi ce paramètre est contrôlé...",
-      "impact_qualite": "Conséquence si hors tolérance..."
-    }}
-  ],
-  "recommandations": [
-    {{
-      "type": "optimisation|vigilance|controle",
-      "description": "..."
-    }}
-  ]
-}}
+### DONNÉES SOURCE (JSON) :
+{json.dumps(data_for_ai, indent=2, ensure_ascii=False)}
 """
 
-            print(f"🤖 Requesting deep AI analysis for Black Mix {mix_id}...")
+                # ---------------------------------------------------
+                # 8. Call LLM
+                # ---------------------------------------------------
+                ai_response = call_groq_with_retry(prompt)
 
-            response = call_groq_with_retry(
-                messages=[
-                    {"role": "system", "content": "Tu es un expert en formulation de Black Mix industriels (carbone/graphite). Tu fournis des analyses techniques très détaillées. Tu réponds uniquement en JSON valide."},
-                    {"role": "user", "content": prompt}
-                ],
-                model="llama-3.3-70b-versatile",
-                temperature=0.3,
-                max_tokens=8000,
-                response_format={"type": "json_object"}
-            )
 
-            ai_analysis = json.loads(response.choices[0].message.content)
+                # ---------------------------------------------------
+                # 9. Return response
+                # ---------------------------------------------------
+                return jsonify({
+                    "black_mix": black_mix,
+                    "source_data": data_for_ai,
+                    "ai_analysis": ai_response
+                })
 
-            # ── Build enriched ADN ──
-            enriched_adn = {
-                "base_adn": base_adn,
-                "revision_history": revision_history,
-                "component_adns": components_with_adn,
-                "ai_analysis": ai_analysis,
-                "version": version,
-                "enriched_at": datetime.now().isoformat()
-            }
-
-            return jsonify({
-                "success": True,
-                "black_mix_id": black_mix_id,
-                "adn_enriched": enriched_adn
-            }), 200
 
     except Exception as e:
-        print(f"⚠️ Error getting enriched ADN: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
-    finally:
-        if conn:
-            conn.close()
+        return jsonify({"error": str(e)}), 500
 
+    finally:
+        conn.close()
 
 # -----------------------------------------------------------------------------
 # BLACK MIX COMBINED ADN (Black Mix ADN + Component fiches_adn_matieres)
@@ -3140,200 +3128,6 @@ def get_black_mix_adn_combined(mix_id):
 
     except Exception as e:
         logging.error(f"Combined ADN error: {e}", exc_info=True)
-        return jsonify({"success": False, "error": str(e)}), 500
-    finally:
-        conn.close()
-
-
-@app.route("/black-mix/<int:mix_id>/adn-combined/chatgpt-prompt", methods=["GET"])
-def get_chatgpt_docx_prompt(mix_id):
-    """
-    Return a ready-to-paste ChatGPT prompt that will generate the full DOCX report.
-    Includes all Black Mix data + component ADN summaries in a structured text
-    that ChatGPT can use to produce the document.
-    """
-    conn = psycopg2.connect(DB_DSN)
-    try:
-        with conn.cursor() as cur:
-            # ── Gather same data as combined ──
-            cur.execute(
-                """SELECT id, reference, name, status, created_at, document_revision_history
-                   FROM public.black_mixes WHERE id = %s""",
-                (mix_id,)
-            )
-            bm = cur.fetchone()
-            if not bm:
-                return jsonify({"success": False, "error": "Black Mix not found"}), 404
-
-            cur.execute(
-                """SELECT adn_text, version FROM public.black_mix_adn
-                   WHERE black_mix_id = %s ORDER BY version DESC LIMIT 1""",
-                (mix_id,)
-            )
-            adn_row = cur.fetchone()
-            if not adn_row:
-                return jsonify({"success": False, "error": "ADN not found"}), 404
-
-            base_adn = adn_row[0]
-
-            # Build component summaries with ADN matières
-            comp_sections = []
-            for comp in base_adn.get("composition", []):
-                ref = comp.get("reference", "")
-                name = comp.get("material_name", comp.get("component_name", ""))
-                qty = comp.get("quantity", "")
-                unit = comp.get("unit", "")
-                meta = comp.get("metadata", {})
-
-                section = f"### {ref} — {name}\n"
-                section += f"- Quantité: {qty} {unit}\n"
-                section += f"- Rôle: {meta.get('role', 'N/A')}\n"
-                section += f"- Phase process: {meta.get('process_phase', 'N/A')}\n"
-                section += f"- Introduit à l'étape: {meta.get('introduced_in_step', 'N/A')}\n"
-                if meta.get("tolerance"):
-                    tol = meta["tolerance"]
-                    section += f"- Tolérance: min={tol.get('min','')}, max={tol.get('max','')}\n"
-                if meta.get("notes"):
-                    section += f"- Notes: {meta['notes']}\n"
-
-                # Fetch fiches_adn_matieres
-                if ref:
-                    cur.execute(
-                        """SELECT type_matiere, specifications, num_specifications
-                           FROM public.fiches_adn_matieres WHERE reference = %s LIMIT 1""",
-                        (ref,)
-                    )
-                    am = cur.fetchone()
-                    if am:
-                        section += f"- Type matière: {am[0]}\n"
-                        section += f"- Nombre de fiches: {am[2]}\n"
-                        specs = am[1] or {}
-                        for spec in specs.get("specifications", []):
-                            src = spec.get("source_type", "")
-                            donnees = spec.get("donnees", {})
-                            section += f"\n#### {src.upper()}\n"
-                            if src == "datasheet":
-                                mat_id_d = donnees.get("material_identification", {})
-                                if mat_id_d:
-                                    section += f"Identification: {json.dumps(mat_id_d, ensure_ascii=False)}\n"
-                                for prop_cat in ["physical_properties", "mechanical_properties", "thermal_properties"]:
-                                    props = donnees.get(prop_cat, [])
-                                    if props and isinstance(props, list):
-                                        section += f"{prop_cat.replace('_',' ').title()}:\n"
-                                        for pp in props[:8]:
-                                            if isinstance(pp, dict):
-                                                section += f"  - {pp.get('property','')}: {pp.get('value','')} {pp.get('unit','')} ({pp.get('condition','')})\n"
-                                chem = donnees.get("composition", {})
-                                if chem:
-                                    section += f"Composition: {json.dumps(chem, ensure_ascii=False)[:300]}\n"
-                            elif src == "msds":
-                                hz = donnees.get("hazard_statements", [])
-                                if hz:
-                                    section += f"Dangers: {', '.join(str(h) for h in hz[:5])}\n"
-                                msds_comp = donnees.get("composition", [])
-                                if msds_comp and isinstance(msds_comp, list):
-                                    for cc in msds_comp[:5]:
-                                        if isinstance(cc, dict):
-                                            section += f"  - {cc.get('component','')}: CAS={cc.get('cas','')}, {cc.get('concentration_percent','')}%\n"
-                                tox = donnees.get("toxicological_information", {})
-                                if tox:
-                                    section += f"Toxicologie: {json.dumps(tox, ensure_ascii=False)[:300]}\n"
-                            else:
-                                section += f"Données: {json.dumps(donnees, ensure_ascii=False)[:300]}\n"
-
-                comp_sections.append(section)
-
-            # Build process steps text
-            steps_text = ""
-            for step in base_adn.get("process_steps", []):
-                mat_refs = step.get("materials", [])
-                # Resolve material names
-                mat_names = []
-                for mref in mat_refs:
-                    for comp in base_adn.get("composition", []):
-                        if comp.get("reference") == mref:
-                            mat_names.append(f"{mref} ({comp.get('material_name', '')} — {comp.get('quantity','')} {comp.get('unit','')})")
-                            break
-                    else:
-                        mat_names.append(mref)
-                steps_text += f"\nÉtape {step.get('step_order')} — {step.get('step_name')}\n"
-                steps_text += f"  Machine: {step.get('machine', 'N/A')}\n"
-                if mat_names:
-                    steps_text += f"  Matières introduites: {'; '.join(mat_names)}\n"
-                params = step.get("parameters", {})
-                if params and isinstance(params, dict):
-                    for k, v in params.items():
-                        steps_text += f"  {k}: {v}\n"
-
-            # Build control plan text
-            ctrl_text = ""
-            for p in base_adn.get("control_plan", []):
-                ctrl_text += f"- {p.get('parameter_name','')}: cible={p.get('target_value','')}, min={p.get('min_value','')}, max={p.get('max_value','')}, unité={p.get('unit','')}\n"
-
-            # Revision history
-            rev_hist = bm[5]
-            rev_text = json.dumps(rev_hist, ensure_ascii=False, indent=1) if rev_hist else "Non disponible"
-
-            # ── Assemble the ChatGPT prompt ──
-            prompt = f"""Tu es un expert en formulation de Black Mix industriels (mélanges pour pièces carbone/graphite).
-
-Génère un document DOCX professionnel et TRÈS DÉTAILLÉ pour le Black Mix suivant.
-Le document doit contenir les sections suivantes, numérotées :
-
-1. **Page de garde** : référence produit, nom du mélange, date
-2. **Description générale** : fonction, application, famille produit
-3. **ADN du Black Mix** : identité unique, ratios critiques, architecture mélange, signature process
-4. **Composition** : tableau avec référence, nom, type, quantité, unité, rôle, phase process, tolérances
-5. **ADN détaillé de chaque composant** : pour chaque matière, afficher les données issues de la Fiche Technique (datasheet), de la Fiche de Sécurité (MSDS), et de la Feuille de Contrôle si disponible. Inclure les propriétés physiques, mécaniques, thermiques, la composition chimique, les mentions de danger, la toxicologie.
-6. **Processus de fabrication** : tableau des étapes avec les matières introduites à chaque étape (référence ET nom ET quantité), la machine utilisée, et les paramètres détaillés
-7. **Analyse du processus** : pour chaque étape, décrire les transformations physico-chimiques, les paramètres critiques, les points de vigilance
-8. **Plan de contrôle** : tableau avec paramètre, cible, min, max, unité, justification, impact qualité
-9. **Propriétés résultantes attendues** : mécaniques, thermiques, chimiques, électriques
-10. **Historique de révision**
-11. **Recommandations** : optimisations, vigilance, contrôles suggérés
-
----
-
-## BLACK MIX: {bm[1]} — {bm[2]}
-Statut: {bm[3]} | Créé le: {bm[4].isoformat() if bm[4] else 'N/A'}
-
----
-
-## COMPOSITION ET ADN DES COMPOSANTS
-
-{''.join(comp_sections)}
-
----
-
-## PROCESSUS DE FABRICATION
-{steps_text}
-
----
-
-## PLAN DE CONTRÔLE
-{ctrl_text}
-
----
-
-## HISTORIQUE DE RÉVISION
-{rev_text}
-
----
-
-Génère le document DOCX complet maintenant. Utilise des tableaux, des listes à puces, des titres hiérarchisés. Le document doit être professionnel, prêt pour un audit qualité.
-"""
-
-            return jsonify({
-                "success": True,
-                "black_mix_id": mix_id,
-                "product_reference": bm[1],
-                "mix_name": bm[2],
-                "chatgpt_prompt": prompt,
-                "instructions": "Copiez le contenu du champ 'chatgpt_prompt' et collez-le dans ChatGPT pour générer le document DOCX.",
-            }), 200
-
-    except Exception as e:
-        logging.error(f"ChatGPT prompt error: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
         conn.close()
