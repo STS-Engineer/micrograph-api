@@ -803,13 +803,13 @@ if __name__ == "__main__":
     output.mkdir(exist_ok=True)
     
     # Clear old data before reprocessing
-    clear_old_data()
+    #clear_old_data()
     
     # Get PowerPoint files from the powerpoint_files table
     try:
         conn = psycopg2.connect(DB_DSN)
         cur = conn.cursor()
-        cur.execute("SELECT id, file_path FROM public.powerpoint_files")
+        cur.execute("SELECT id, file_path FROM public.powerpoint_files ORDER BY id DESC LIMIT 2")
         rows = cur.fetchall()
         cur.close()
         conn.close()
