@@ -3,7 +3,10 @@
 """
 Extraction des micrographies depuis PowerPoints + insertion directe dans PostgreSQL.
 Version V3 - Améliorée pour la gestion spatiale des grossissements et l'héritage des métadonnées.
-CORRECTION: Amélioration de l'extraction des commentaires
+CORRECTION V3.1:
+  - Fix 1: extract_cokes_references_dict() — parsing ligne par ligne pour capturer les refs ( Vxxx )
+  - Fix 2: extract_metadata_from_slide() — détection des refs de type "– RSxxx" (sans mot-clé "ref")
+  - Fix 3: match_cokes_product_to_reference() — matching sans espaces pour CBH LPCS 60 / LPCS60
 """
 
 import os
@@ -82,13 +85,10 @@ def _extract_nuance_from_text(text: str) -> Optional[str]:
 def extract_detailed_comments(text: str) -> Optional[str]:
     """
     Extract detailed comments/description from a slide.
-    CORRECTION: Amélioration de la détection des commentaires avec support des lignes vides.
     """
     if not text:
         return None
     
-    # Chercher "Commentaires :" et prendre tout ce qui suit jusqu'à la fin
-    # Gérer les lignes vides après "Commentaires :"
     comments_match = re.search(
         r"Commentaires?\s*:\s*(.+)",
         text,
@@ -98,20 +98,17 @@ def extract_detailed_comments(text: str) -> Optional[str]:
     if comments_match:
         comments = comments_match.group(1).strip()
         
-        # Retirer les sections qui ne font pas partie des commentaires
-        # Chercher les indicateurs de fin de commentaires
         for pattern in [r'\bTABLE\b', r'\bComposition\b', r'\bGrossissement\s+x\s*\d+']:
             match = re.search(pattern, comments, flags=re.IGNORECASE)
             if match:
                 comments = comments[:match.start()].strip()
                 break
         
-        # Nettoyer les espaces multiples mais préserver les retours à la ligne
-        comments = re.sub(r'[ \t]+', ' ', comments)  # Espaces horizontaux seulement
-        comments = re.sub(r'\n{3,}', '\n\n', comments)  # Max 2 retours à la ligne consécutifs
+        comments = re.sub(r'[ \t]+', ' ', comments)
+        comments = re.sub(r'\n{3,}', '\n\n', comments)
         comments = comments.strip()
         
-        if len(comments) > 20:  # Seuil raisonnable pour des vrais commentaires
+        if len(comments) > 20:
             return comments
     
     return None
@@ -169,15 +166,10 @@ def linearize_tables(tables: List[List[List[str]]]) -> str:
 def is_cokes_comparative_file(prs: Presentation) -> bool:
     """
     Détecte si le fichier PowerPoint est un fichier de comparaison de Cokes.
-    
-    Critères:
-    - Slide 2 contient plusieurs entrées "Micrographie N°" (>=3)
-    - Slide 1 contient "Coke" dans le titre
     """
     if len(prs.slides) < 2:
         return False
     
-    # Check Slide 1 for "Coke" in title
     slide1_text = []
     for shape in prs.slides[0].shapes:
         if hasattr(shape, "text") and shape.text.strip():
@@ -187,7 +179,6 @@ def is_cokes_comparative_file(prs: Presentation) -> bool:
     if "Coke" not in slide1_full:
         return False
     
-    # Check Slide 2 for multiple "Micrographie N°"
     slide2_text = []
     for shape in prs.slides[1].shapes:
         if hasattr(shape, "text") and shape.text.strip():
@@ -202,16 +193,12 @@ def is_cokes_comparative_file(prs: Presentation) -> bool:
 def extract_cokes_comments_dict(prs: Presentation) -> Dict[str, str]:
     """
     Extrait tous les commentaires depuis le Slide 2 (commentaires centralisés).
-    
-    Returns:
-        Dict[product_name, comments]
     """
     if len(prs.slides) < 2:
         return {}
     
-    slide = prs.slides[1]  # Slide 2
+    slide = prs.slides[1]
     
-    # Get all text
     text_blocks = []
     for shape in slide.shapes:
         if hasattr(shape, "text") and shape.text.strip():
@@ -219,10 +206,8 @@ def extract_cokes_comments_dict(prs: Presentation) -> Dict[str, str]:
     
     full_text = "\n".join(text_blocks)
     
-    # Extract comments for each product
     comments_dict = {}
     
-    # List of possible product name patterns
     products = [
         "Coke MUCO Cyclam",
         "Coke FC 250",
@@ -237,31 +222,35 @@ def extract_cokes_comments_dict(prs: Presentation) -> Dict[str, str]:
     ]
     
     for product in products:
-        # Normalize product pattern for regex
         product_pattern = re.escape(product).replace(r"\ ", r"\s*")
         
-        # Match: "Product (...) – Ref ... : \tMicrographie N° XXXX\n[comments]"
         pattern = rf"{product_pattern}\s*(?:\([^)]+\))?\s*(?:–\s*Ref\s+\d+\s+\d+\s*)?\s*:\s*\tMicrographie N° \d+\s*\n(.+?)(?=\n\n[A-Z]|\Z)"
         
         match = re.search(pattern, full_text, re.IGNORECASE | re.DOTALL)
         
         if match:
             comments = match.group(1).strip()
-            # Clean
             comments = re.sub(r'[ \t]+', ' ', comments)
             comments = re.sub(r'\n{3,}', '\n\n', comments)
             comments = comments.strip()
             
-            # Store with normalized name
             normalized_product = re.sub(r'\s+', ' ', product)
             comments_dict[normalized_product] = comments
     
     return comments_dict
 
 
+# ==================== FIX 1 ====================
 def extract_cokes_references_dict(prs: Presentation) -> Dict[str, str]:
     """
     Extrait les références depuis le Slide 1 (page de titre).
+
+    FIX: Parsing ligne par ligne pour capturer à la fois:
+      - "Product  \\tref XXXXXXX"  (référence numérique)
+      - "Product  \\t( Vxxx )"     (code interne V679, V680, V681...)
+      - "ProductSansRef\\nProductAvecRef  ref XXXXXXX"  (produit groupé sur la ligne précédente)
+        → ex: "MUCO Cyclam" seul sur une ligne, "FC 250  ref 6600733" sur la suivante
+        → les deux reçoivent 6600733 (look-ahead)
     
     Returns:
         Dict[product_name, reference]
@@ -269,7 +258,7 @@ def extract_cokes_references_dict(prs: Presentation) -> Dict[str, str]:
     if len(prs.slides) < 1:
         return {}
     
-    slide = prs.slides[0]  # Slide 1
+    slide = prs.slides[0]
     
     text_blocks = []
     for shape in slide.shapes:
@@ -278,36 +267,109 @@ def extract_cokes_references_dict(prs: Presentation) -> Dict[str, str]:
     
     full_text = "\n".join(text_blocks)
     
-    # Extract: "Product \tref XXXXXXX"
     ref_dict = {}
-    refs = re.findall(r'([A-Za-z0-9\s\(\)]+?)\s+ref\s+(\d{7})', full_text, re.IGNORECASE)
     
-    for product, ref in refs:
-        product = product.strip()
-        ref = ref.strip()
-        ref_dict[product] = ref
+    # First pass: parse each line into (product, ref_or_None)
+    parsed = []
+    for line in full_text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Pattern 1: "Product  [tab] ref 6600xxx"
+        m = re.match(r'^(.+?)\s+ref\s+(\d{5,7})\s*$', line, re.IGNORECASE)
+        if m:
+            product = m.group(1).strip()
+            ref = m.group(2).strip()
+            if not re.match(r'^coke\b', product, re.IGNORECASE):
+                product = 'Coke ' + product
+            parsed.append((product, ref))
+            continue
+        
+        # Pattern 2: "Product  [tab] ( Vxxx )"  — internal vendor code
+        m = re.match(r'^(.+?)\s+\(\s*(V\d+)\s*\)\s*$', line)
+        if m:
+            product = m.group(1).strip()
+            ref = m.group(2).strip()
+            if not re.match(r'^coke\b', product, re.IGNORECASE):
+                product = 'Coke ' + product
+            parsed.append((product, ref))
+            continue
+        
+        # Pattern 3: Bare product name (no ref on this line) — skip headers/footers
+        if re.search(r'(Micrographies|R&D|Date|\d{2}/\d{2}/\d{4})', line, re.IGNORECASE):
+            continue
+        parsed.append((line, None))
+    
+    # Second pass: fill ref_dict; if a line has no ref, inherit from the NEXT line's ref
+    # (handles grouped products like "MUCO Cyclam" sharing "FC 250  ref 6600733")
+    for i, (product, ref) in enumerate(parsed):
+        if ref is None:
+            # Look ahead for the next ref
+            lookahead_ref = None
+            for j in range(i + 1, len(parsed)):
+                if parsed[j][1] is not None:
+                    lookahead_ref = parsed[j][1]
+                    break
+            if lookahead_ref:
+                if not re.match(r'^coke\b', product, re.IGNORECASE):
+                    product = 'Coke ' + product
+                ref_dict[product] = lookahead_ref
+        else:
+            ref_dict[product] = ref
     
     return ref_dict
+# ==================== END FIX 1 ====================
+
+
+# ==================== FIX 3 (part of Fix 1) ====================
+def match_cokes_product_to_reference(product_name: str, ref_dict: Dict[str, str]) -> Optional[str]:
+    """
+    Match un nom de produit (depuis une slide d'images) aux références.
+
+    FIX: Comparaison sans espaces pour gérer "LPCS 60" vs "LPCS60", et
+         strip des suffixes ( Vxxx ) avant la comparaison.
+    """
+    product_name = re.sub(r'\s+', ' ', product_name).strip()
+    
+    # Exact match
+    if product_name in ref_dict:
+        return ref_dict[product_name]
+    
+    # Strip parenthetical suffixes (e.g. "( V679 )", "(0-75µm)")
+    product_base = re.sub(r'\s*\([^)]+\)', '', product_name).strip()
+    
+    for ref_product, ref in ref_dict.items():
+        ref_base = re.sub(r'\s*\([^)]+\)', '', ref_product).strip()
+        
+        # Compare without any whitespace, case-insensitive
+        prod_norm = re.sub(r'\s+', '', product_base).lower()
+        ref_norm  = re.sub(r'\s+', '', ref_base).lower()
+        
+        if prod_norm == ref_norm:
+            return ref
+        
+        # Substring match (handles partial names)
+        if ref_norm and (ref_norm in prod_norm or prod_norm in ref_norm):
+            return ref
+    
+    return None
+# ==================== END FIX 3 ====================
 
 
 def match_cokes_product_to_comments(product_name: str, comments_dict: Dict[str, str]) -> Optional[str]:
     """
     Match un nom de produit (depuis une slide d'images) aux commentaires.
-    Gère les variations d'espacement et les parenthèses.
     """
     product_name = re.sub(r'\s+', ' ', product_name).strip()
     
-    # Exact match
     if product_name in comments_dict:
         return comments_dict[product_name]
     
-    # Fuzzy matching
     for comment_product, comments in comments_dict.items():
-        # Remove parentheses and normalize spaces
         product_base = re.sub(r'\s*\([^)]+\)', '', product_name).strip()
         comment_base = re.sub(r'\s*\([^)]+\)', '', comment_product).strip()
         
-        # Compare without spaces
         product_normalized = re.sub(r'\s+', '', product_base).lower()
         comment_normalized = re.sub(r'\s+', '', comment_base).lower()
         
@@ -319,43 +381,13 @@ def match_cokes_product_to_comments(product_name: str, comments_dict: Dict[str, 
     return None
 
 
-def match_cokes_product_to_reference(product_name: str, ref_dict: Dict[str, str]) -> Optional[str]:
-    """
-    Match un nom de produit à sa référence depuis le Slide 1.
-    """
-    product_name = re.sub(r'\s+', ' ', product_name).strip()
-    
-    # Exact match
-    if product_name in ref_dict:
-        return ref_dict[product_name]
-    
-    # Try matching with product short name (remove "Coke " prefix)
-    product_short = product_name.replace("Coke ", "").strip()
-    
-    for ref_product, ref in ref_dict.items():
-        if product_short in ref_product or ref_product in product_short:
-            return ref
-    
-    # Fuzzy matching
-    for ref_product, ref in ref_dict.items():
-        product_base = re.sub(r'\s*\([^)]+\)', '', product_name).strip()
-        ref_base = re.sub(r'\s*\([^)]+\)', '', ref_product).strip()
-        
-        if product_base.lower() in ref_base.lower() or ref_base.lower() in product_base.lower():
-            return ref
-    
-    return None
-
-
 def extract_cokes_product_name_from_slide(slide) -> Optional[str]:
     """
     Extrait le nom du produit depuis une slide d'images.
-    Format attendu: "Coke [NOM]"
     """
     for shape in slide.shapes:
         if hasattr(shape, "text") and shape.text.strip():
             text = shape.text.strip()
-            # Look for text containing "Coke" but not "X " (magnification)
             if "Coke" in text and "X " not in text and "x " not in text.lower():
                 return text
     return None
@@ -390,10 +422,14 @@ def parse_avo_composition_from_tables(tables: List[List[List[str]]]) -> Optional
                 return {"elements": elements, "values": values, "rows": [elements, values]}
     return None
 
+
+# ==================== FIX 2 ====================
 def extract_metadata_from_slide(slide, slide_number: int) -> Dict:
     """
     Extract metadata from a PowerPoint slide.
-    CORRECTION: Amélioration de l'extraction des commentaires avec le texte complet de la slide.
+
+    FIX: Ajout d'un pattern de détection pour les références de type "– RSxxx"
+         (sans mot-clé "ref"), utilisées dans graphite série 3.
     """
     metadata = {
         "slide_number": slide_number,
@@ -407,7 +443,7 @@ def extract_metadata_from_slide(slide, slide_number: int) -> Dict:
         "composition": {},
         "full_text": "",
         "has_images": False,
-        "is_title_page": False,  # NOUVEAU: indicateur de page de titre
+        "is_title_page": False,
     }
 
     text_blocks = []
@@ -416,14 +452,24 @@ def extract_metadata_from_slide(slide, slide_number: int) -> Dict:
             text = shape.text.strip()
             if text:
                 text_blocks.append(text)
-                # Try to extract reference if not already found
                 if not metadata["reference"]:
-                    ref_match = re.search(r'(?:ref|référence)\s*[:\-]?\s*([A-Z0-9\s]{4,15})', text, re.IGNORECASE)
+                    # Pattern 1: "ref XXXXX" or "référence XXXXX"
+                    ref_match = re.search(
+                        r'(?:ref|référence)\s*[:\-]?\s*([A-Z0-9\s]{4,15})',
+                        text, re.IGNORECASE
+                    )
                     if ref_match:
                         metadata["reference_raw"] = ref_match.group(1).strip()
                         metadata["reference"] = clean_reference(metadata["reference_raw"])
+                    
+                    # Pattern 2 (NEW): "– RSxxx" em-dash separated reference
+                    # Handles "Graphite naturel Asbury #3478 – RS018" style
+                    if not metadata["reference"]:
+                        dash_ref = re.search(r'[–\-]\s*(RS\d+)\s*$', text)
+                        if dash_ref:
+                            metadata["reference_raw"] = dash_ref.group(1).strip()
+                            metadata["reference"] = clean_reference(metadata["reference_raw"])
                 
-                # Try to extract nuance
                 nuance = _extract_nuance_from_text(text)
                 if nuance and not metadata["nuance"]:
                     metadata["nuance"] = nuance
@@ -433,19 +479,15 @@ def extract_metadata_from_slide(slide, slide_number: int) -> Dict:
 
     metadata["full_text"] = "\n".join(text_blocks)
     
-    # NOUVEAU: Détecter si c'est une page de titre (Slide 1 typiquement)
-    # Une page de titre contient plusieurs références mais pas de commentaires détaillés
     if slide_number == 1 or (metadata["full_text"].count("ref") > 3 and not "Commentaires" in metadata["full_text"]):
         metadata["is_title_page"] = True
-        metadata["reference"] = None  # Ne pas utiliser de référence de page de titre
+        metadata["reference"] = None
     
-    # CORRECTION: Extraction des commentaires depuis le texte complet de la slide
     if not metadata["is_title_page"]:
         comments = extract_detailed_comments(metadata["full_text"])
         if comments:
             metadata["comments"] = comments
     
-    # Extract tables and composition
     tables = extract_tables_from_slide(slide)
     if tables:
         composition = parse_avo_composition_from_tables(tables)
@@ -453,6 +495,8 @@ def extract_metadata_from_slide(slide, slide_number: int) -> Dict:
             metadata["composition"] = composition
 
     return metadata
+# ==================== END FIX 2 ====================
+
 
 def get_or_create_matiere_by_reference(cur, conn, entry: Dict) -> Optional[int]:
     """Get or create a matiere record by reference."""
@@ -463,7 +507,6 @@ def get_or_create_matiere_by_reference(cur, conn, entry: Dict) -> Optional[int]:
     row = cur.fetchone()
     if row:
         return row[0]
-    # Create new if not found
     name = entry.get("product_name") or f"Matière {ref}"
     matiere_type = entry.get("type_matiere") or "Matière"
     cur.execute("""
@@ -514,7 +557,6 @@ def clear_old_data():
         
         print("🗑️  Clearing old data from database...")
         
-        # Delete in reverse order of dependencies to avoid FK constraints
         cur.execute("DELETE FROM public.matiere_expert_notes")
         print("   ✅ Cleared matiere_expert_notes")
         
@@ -526,7 +568,6 @@ def clear_old_data():
         conn.close()
         print("✅ Old data cleared successfully")
         
-        # Clean old image files from disk
         images_dir = BASE_DIR / "output_v3" / "images"
         if images_dir.exists():
             print("🗑️  Deleting old image files...")
@@ -537,7 +578,7 @@ def clear_old_data():
                 print("   ⚠️  Could not delete image directory (files may be locked)")
                 print("   ℹ️  Continuing anyway - old files may be overwritten...")
         
-        print()  # Empty line for readability
+        print()
     except Exception as e:
         print(f"❌ Error clearing data: {e}")
         import traceback
@@ -556,41 +597,34 @@ def process_cokes_powerpoint(ppt_path: Path, output_dir: Path, file_id: int):
     try:
         prs = Presentation(ppt_path)
         
-        # Phase 1: Extract references from Slide 1
         print("   Phase 1: Extraction des références...")
         ref_dict = extract_cokes_references_dict(prs)
-        print(f"   → {len(ref_dict)} références trouvées")
+        print(f"   → {len(ref_dict)} références trouvées: {list(ref_dict.items())}")
         
-        # Phase 2: Extract comments from Slide 2
         print("   Phase 2: Extraction des commentaires...")
         comments_dict = extract_cokes_comments_dict(prs)
         print(f"   → {len(comments_dict)} produits avec commentaires")
         
-        # Phase 3: Process image slides (Slide 3+)
         print("   Phase 3: Traitement des images...")
         
         images_dir = output_dir / "images"
         images_dir.mkdir(parents=True, exist_ok=True)
         
-        for i in range(2, len(prs.slides)):  # Start from Slide 3
+        for i in range(2, len(prs.slides)):
             slide = prs.slides[i]
             
-            # Check if has images
             has_images = any(hasattr(shape, "image") for shape in slide.shapes)
             if not has_images:
                 continue
             
-            # Get product name
             product_name = extract_cokes_product_name_from_slide(slide)
             if not product_name:
                 print(f"   ⚠️  Slide {i+1}: Pas de nom de produit trouvé")
                 continue
             
-            # Match to comments and reference
             comments = match_cokes_product_to_comments(product_name, comments_dict)
             reference = match_cokes_product_to_reference(product_name, ref_dict)
             
-            # Get or create matiere
             matiere_id = get_or_create_matiere_by_reference(cur, conn, {
                 "reference": reference,
                 "product_name": product_name,
@@ -598,17 +632,14 @@ def process_cokes_powerpoint(ppt_path: Path, output_dir: Path, file_id: int):
             })
             
             if not matiere_id:
-                print(f"   ⚠️  Slide {i+1}: Could not create or find matiere record")
+                print(f"   ⚠️  Slide {i+1}: Could not create or find matiere record for '{product_name}' (ref={reference})")
                 continue
             
-            # Extract magnifications
             magnifications = extract_magnifications_with_positions(slide)
             
-            # Process each image on this slide
             img_count = 0
             for shape in slide.shapes:
                 if hasattr(shape, "image"):
-                    # Find closest magnification based on vertical position
                     best_mag = None
                     if magnifications:
                         mags_above = [m for m in magnifications if m["top"] < shape.top]
@@ -617,17 +648,14 @@ def process_cokes_powerpoint(ppt_path: Path, output_dir: Path, file_id: int):
                         else:
                             best_mag = magnifications[0]["value"]
                     
-                    # Save image
                     image_bytes = shape.image.blob
                     filename = f"{ppt_path.stem}_s{i+1:03d}_i{img_count:02d}.png"
                     filepath = images_dir / filename
                     img = Image.open(io.BytesIO(image_bytes))
                     img.save(filepath, "PNG")
                     
-                    # Compute embedding
                     embedding = compute_embedding_from_pil(img)
                     
-                    # Insert
                     entry = {
                         "image_path": str(filepath.relative_to(output_dir.parent)),
                         "magnification": best_mag,
@@ -673,7 +701,6 @@ def process_powerpoint_wrapper(ppt_path: Path, output_dir: Path, file_id: int):
 def process_standard_powerpoint(ppt_path: Path, output_dir: Path, file_id: int):
     """
     Standard processing function for regular PowerPoint files.
-    CORRECTION: Amélioration de la propagation des commentaires.
     """
     print(f"\n📊 Processing (Standard format): {ppt_path.name}")
     
@@ -686,24 +713,17 @@ def process_standard_powerpoint(ppt_path: Path, output_dir: Path, file_id: int):
         prs = Presentation(ppt_path)
         all_slides_meta = []
         
-        # 2. First pass: Extract all metadata
         for i, slide in enumerate(prs.slides, 1):
             meta = extract_metadata_from_slide(slide, i)
             all_slides_meta.append(meta)
-            # Log extraction status with more detail
             comments_found = f"✓ Commentaires ({len(meta['comments'])} chars)" if meta["comments"] else "✗ Pas de commentaires"
             ref_found = f"Ref: {meta['reference']}" if meta["reference"] else "Aucune référence"
             print(f"   Slide {i}: {ref_found} [{comments_found}]")
             
-        # 3. Second pass: Propagate metadata based on reference matching
-        # CORRECTION: Les commentaires doivent être propagés à TOUTES les slides avec la même référence
-        # Logique: Pour chaque slide avec images, trouver la slide précédente avec la même référence qui a des commentaires
         for i in range(len(all_slides_meta)):
             current = all_slides_meta[i]
             
-            # Si la slide actuelle a des images
             if current["has_images"]:
-                # Cas 1: Pas de référence du tout -> hériter de la slide précédente
                 if not current["reference"] and i > 0:
                     prev = all_slides_meta[i-1]
                     current["reference"] = prev["reference"]
@@ -715,9 +735,7 @@ def process_standard_powerpoint(ppt_path: Path, output_dir: Path, file_id: int):
                     if not current["composition"] and prev["composition"]:
                         current["composition"] = prev["composition"]
                 
-                # Cas 2: A une référence mais pas de commentaires -> chercher les commentaires de cette référence
                 elif current["reference"] and not current["comments"]:
-                    # Chercher en arrière la dernière slide avec la même référence qui a des commentaires
                     for j in range(i-1, -1, -1):
                         prev = all_slides_meta[j]
                         if prev["reference"] == current["reference"] and prev["comments"]:
@@ -727,7 +745,6 @@ def process_standard_powerpoint(ppt_path: Path, output_dir: Path, file_id: int):
                             print(f"   🔄 Slide {i+1}: Commentaires de {current['reference']} hérités de la slide {j+1}")
                             break
 
-        # 4. Third pass: Extract images and associate with correct magnification
         images_dir = output_dir / "images"
         images_dir.mkdir(parents=True, exist_ok=True)
         
@@ -744,28 +761,22 @@ def process_standard_powerpoint(ppt_path: Path, output_dir: Path, file_id: int):
             img_count = 0
             for shape in slide.shapes:
                 if hasattr(shape, "image"):
-                    # Find closest magnification based on vertical position
                     best_mag = None
                     if meta["magnifications"]:
-                        # Find the magnification that is above the image but closest to it
                         mags_above = [m for m in meta["magnifications"] if m["top"] < shape.top]
                         if mags_above:
                             best_mag = mags_above[-1]["value"]
                         else:
-                            # Fallback to the first one if none are above
                             best_mag = meta["magnifications"][0]["value"]
 
-                    # Save image
                     image_bytes = shape.image.blob
                     filename = f"{ppt_path.stem}_s{i+1:03d}_i{img_count:02d}.png"
                     filepath = images_dir / filename
                     img = Image.open(io.BytesIO(image_bytes))
                     img.save(filepath, "PNG")
                     
-                    # Compute embedding
                     embedding = compute_embedding_from_pil(img)
                     
-                    # Insert
                     entry = {
                         "image_path": str(filepath.relative_to(output_dir.parent)),
                         "magnification": best_mag,
@@ -775,7 +786,6 @@ def process_standard_powerpoint(ppt_path: Path, output_dir: Path, file_id: int):
                         "composition": meta["composition"]
                     }
                     
-                    # Log comments extraction status with more detail
                     if meta["comments"]:
                         comment_preview = meta["comments"][:50] + "..." if len(meta["comments"]) > 50 else meta["comments"]
                         comments_status = f"✓ Commentaires: '{comment_preview}'"
@@ -798,14 +808,11 @@ def process_standard_powerpoint(ppt_path: Path, output_dir: Path, file_id: int):
         conn.close()
 
 if __name__ == "__main__":
-    # Example usage
     output = BASE_DIR / "output_v3"
     output.mkdir(exist_ok=True)
     
-    # Clear old data before reprocessing
     clear_old_data()
     
-    # Get PowerPoint files from the powerpoint_files table
     try:
         conn = psycopg2.connect(DB_DSN)
         cur = conn.cursor()
