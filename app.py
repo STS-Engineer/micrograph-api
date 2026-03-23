@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import argparse
@@ -12,7 +11,7 @@ from pathlib import Path
 from threading import Thread
 from typing import Optional, List, Dict, Any
 import re
-
+import logging
 from dotenv import load_dotenv
 
 import numpy as np
@@ -33,29 +32,17 @@ from psycopg2.extras import RealDictCursor, Json
 from pgvector.psycopg2 import register_vector
 from flask import url_for
 
-# Load environment variables from .env file
 load_dotenv()
-
+logging.basicConfig(level=logging.INFO)
 DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Micrographie_IA"
 
-
-# -----------------------------------------------------------------------------
-# APP
-# -----------------------------------------------------------------------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
-
-# -----------------------------------------------------------------------------
-# PATHS
-# -----------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-
 OUTPUT_BASE_DIR = BASE_DIR / "embeddings_v7"
 IMAGES_DIR = OUTPUT_BASE_DIR / "images"
 TEMP_UPLOAD_DIR = BASE_DIR / "temp_uploads"
-
-# Temporary DOCX files directory (cleaned every 1 hour)
 DOCX_TEMP_DIR = BASE_DIR / "temp_docx"
 
 OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -63,118 +50,58 @@ IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 DOCX_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# -----------------------------------------------------------------------------
-# OPENAI CLIENT
-# -----------------------------------------------------------------------------
 HARDCODED_OPENAI_API_KEY = ""
 openai_api_key = HARDCODED_OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 
-
-# -----------------------------------------------------------------------------
-# GROQ CLIENT WITH KEY ROTATION
-# -----------------------------------------------------------------------------
 GROQ_API_KEYS = [
-    "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",  # Clé active
+    "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",
     "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",
-    "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",
-    "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",
-    "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",
-    "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",
-    "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",
-    "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",
-    "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",
-    "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",
 ]
 
-# Index de la clé actuellement utilisée
 current_groq_key_index = 0
-
-# Initialiser le client avec la première clé
 groq_api_key = GROQ_API_KEYS[current_groq_key_index] if GROQ_API_KEYS else os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
 
 
 def rotate_groq_key():
-    """Passe à la clé Groq suivante en cas d'échec d'authentification."""
     global current_groq_key_index, groq_client, groq_api_key
-    
     current_groq_key_index = (current_groq_key_index + 1) % len(GROQ_API_KEYS)
     new_key = GROQ_API_KEYS[current_groq_key_index]
-    
     print(f"🔄 Rotation vers la clé Groq #{current_groq_key_index + 1}")
-    
     groq_api_key = new_key
     groq_client = Groq(api_key=new_key)
-    
     return groq_client
 
 
 def call_groq_with_retry(messages, model="llama-3.3-70b-versatile", temperature=0.3, max_tokens=8000, response_format=None):
-    """
-    Appelle l'API Groq avec rotation automatique des clés en cas d'échec d'authentification.
-    
-    Args:
-        messages: Liste des messages pour le chat
-        model: Modèle à utiliser
-        temperature: Température de génération
-        max_tokens: Nombre maximum de tokens
-        response_format: Format de réponse (ex: {"type": "json_object"})
-    
-    Returns:
-        Réponse de l'API Groq
-    
-    Raises:
-        Exception: Si toutes les clés ont échoué
-    """
     if not groq_client:
         raise Exception("Groq client not initialized")
-    
     attempts = 0
     max_attempts = len(GROQ_API_KEYS)
-    
     while attempts < max_attempts:
         try:
-            kwargs = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            }
-            
+            kwargs = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
             if response_format:
                 kwargs["response_format"] = response_format
-            
             response = groq_client.chat.completions.create(**kwargs)
             return response
-            
         except Exception as e:
             error_message = str(e).lower()
-            
-            # Vérifier si c'est une erreur d'authentification ou de clé invalide
             if "authentication" in error_message or "invalid" in error_message or "unauthorized" in error_message or "401" in error_message:
                 print(f"⚠️ Erreur d'authentification avec la clé #{current_groq_key_index + 1}: {e}")
                 attempts += 1
-                
                 if attempts < max_attempts:
                     rotate_groq_key()
-                    print(f"🔄 Tentative {attempts + 1}/{max_attempts} avec une nouvelle clé...")
                 else:
                     raise Exception(f"❌ Toutes les clés Groq ({max_attempts}) ont échoué. Dernière erreur: {e}")
             else:
-                # Autre type d'erreur, ne pas faire de rotation
                 raise e
-    
     raise Exception("Échec de l'appel à Groq après rotation de toutes les clés")
 
 
-# -----------------------------------------------------------------------------
-# DINOv2 (lazy load)
-# -----------------------------------------------------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DINO_MODEL_NAME = "facebook/dinov2-large"
-
 DINO_MODEL: Optional[AutoModel] = None
 DINO_PROCESSOR: Optional[AutoImageProcessor] = None
 
@@ -183,7 +110,6 @@ def ensure_dino_loaded():
     global DINO_MODEL, DINO_PROCESSOR
     if DINO_MODEL is not None and DINO_PROCESSOR is not None:
         return
-
     print(f"🔧 Loading DINOv2 on {DEVICE}...")
     DINO_MODEL = AutoModel.from_pretrained(DINO_MODEL_NAME).to(DEVICE).eval()
     DINO_PROCESSOR = AutoImageProcessor.from_pretrained(DINO_MODEL_NAME)
@@ -191,23 +117,16 @@ def ensure_dino_loaded():
 
 
 def compute_embedding_from_pil(image: Image.Image) -> np.ndarray:
-    """Compute DINOv2 embedding (1024 dims)."""
     ensure_dino_loaded()
-
     image = image.convert("RGB")
     inputs = DINO_PROCESSOR(images=image, return_tensors="pt")
     inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-
     with torch.no_grad():
         outputs = DINO_MODEL(**inputs)
         embedding = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
-
     return embedding.astype("float32")
 
 
-# -----------------------------------------------------------------------------
-# TEMP UPLOAD VALIDATION
-# -----------------------------------------------------------------------------
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
 
 
@@ -226,60 +145,37 @@ def guess_extension_from_mime(mime_type: Optional[str]) -> Optional[str]:
     return None
 
 
-# -----------------------------------------------------------------------------
-# BACKGROUND CLEANUP TASK
-# -----------------------------------------------------------------------------
 def cleanup_old_files(interval: int = 1800, max_age_seconds: int = 2 * 3600):
-    """Deletes files in temp_uploads/ and temp_docx/ older than max_age_seconds."""
     while True:
         now = time.time()
         try:
-            # Clean temp uploads
             for f in TEMP_UPLOAD_DIR.iterdir():
                 if not f.is_file():
                     continue
                 try:
-                    age = now - f.stat().st_mtime
-                    if age > max_age_seconds:
+                    if now - f.stat().st_mtime > max_age_seconds:
                         f.unlink(missing_ok=True)
-                        print(f"🧹 Deleted old temp file: {f.name}")
                 except Exception as e:
                     print(f"Error deleting {f.name}: {e}")
-            
-            # Clean temp DOCX files (remove files older than 1 hour)
-            docx_max_age = 3600  # 1 hour
             for f in DOCX_TEMP_DIR.iterdir():
                 if not f.is_file() or not f.suffix == ".docx":
                     continue
                 try:
-                    age = now - f.stat().st_mtime
-                    if age > docx_max_age:
+                    if now - f.stat().st_mtime > 3600:
                         f.unlink(missing_ok=True)
-                        print(f"🧹 Deleted old DOCX file: {f.name}")
                 except Exception as e:
                     print(f"Error deleting {f.name}: {e}")
-        
         except Exception as e:
             print(f"Cleanup error: {e}")
-        
         time.sleep(interval)
 
 
-# Start cleanup thread
 cleanup_thread = Thread(target=cleanup_old_files, daemon=True)
 cleanup_thread.start()
 
 
-# -----------------------------------------------------------------------------
-# DB HELPERS
-# -----------------------------------------------------------------------------
 def serialize_to_json_compatible(obj):
-    """
-    Convert datetime and other non-JSON-serializable objects to JSON-compatible format.
-    Recursively processes dicts and lists.
-    """
     from datetime import datetime, date, time
-    
     if isinstance(obj, dict):
         return {k: serialize_to_json_compatible(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -297,42 +193,25 @@ def get_db_conn():
 
 
 def search_similar_in_db(query_embedding: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
-    """
-    Returns top_k similar images from pgvector.
-    Uses cosine distance (<=>).
-    similarity = 1 - distance
-    """
     query_vec = query_embedding.tolist()
-
     sql = """
-        SELECT
-            mi.id,
-            mi.image_path,
-            mi.matiere_id,
-            m.nom_matiere,
-            m.reference,
-            (1 - (mi.embedding <=> %s)) AS similarity
+        SELECT mi.id, mi.image_path, mi.matiere_id, m.nom_matiere, m.reference,
+               (1 - (mi.embedding <=> %s)) AS similarity
         FROM public.matiere_images mi
         JOIN public.matieres m ON m.matiere_id = mi.matiere_id
         ORDER BY mi.embedding <=> %s
         LIMIT %s;
     """
-
     conn = get_db_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, (query_vec, query_vec, top_k))
-            rows = cur.fetchall()
-            return [dict(r) for r in rows]
+            return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
 
 def build_image_url(image_path: str) -> str:
-    """
-    image_path stored in DB is like: embeddings_v7/images/xxx.png
-    We want to expose it through /images/<filename>.
-    """
     filename = Path(image_path).name
     url = f"{request.host_url.rstrip('/')}/images/{secure_filename(filename)}"
     if url.startswith("http://"):
@@ -340,310 +219,92 @@ def build_image_url(image_path: str) -> str:
     return url
 
 
-# -----------------------------------------------------------------------------
-# GROQ CONTENT GENERATION
-# -----------------------------------------------------------------------------
-def generate_fiche_adn_content_with_groq(
-    fiche_data: Dict[str, Any],
-    material_name: str,
-    reference: str,
-    type_matiere: str,
-    specifications: List[Dict[str, Any]]
-) -> str:
-    """
-    Generate detailed fiche ADN content using Groq API with structured format.
-    Extracts data from the specifications dictionary structure.
-    """
+def generate_fiche_adn_content_with_groq(fiche_data, material_name, reference, type_matiere, specifications):
     if not groq_client:
-        print("⚠️ Groq client not initialized. Using fallback content.")
         return generate_fallback_fiche_adn_content(material_name, reference, type_matiere, specifications)
-    
     try:
-        # Extract data from specifications structure
-        datasheet_spec = None
-        msds_spec = None
-        lab_control_spec = None
+        datasheet_spec = msds_spec = lab_control_spec = None
         expert_notes_data = []
         fiches_data = []
-        
-        # If specifications is already a dict (from API), extract directly
         if isinstance(specifications, dict):
             specs_list = specifications.get("specifications", [])
             raw_expert_notes = specifications.get("expert_notes", [])
             fiches_data = specifications.get("fiches", [])
-            
-            # Extract note_json from expert_notes
             for note in raw_expert_notes:
                 if isinstance(note, dict):
                     note_json = note.get("note_json", {})
                     if note_json:
-                        expert_notes_data.append({
-                            "expert_notes": note_json.get("expert_notes", ""),
-                            "full_text": note_json.get("full_text", ""),
-                            "magnification": note_json.get("magnification", ""),
-                            "protocol": note_json.get("protocol", "")
-                        })
+                        expert_notes_data.append({"expert_notes": note_json.get("expert_notes", ""), "full_text": note_json.get("full_text", ""), "magnification": note_json.get("magnification", ""), "protocol": note_json.get("protocol", "")})
         else:
             specs_list = specifications if isinstance(specifications, list) else []
-        
-        # Parse specification documents
         for spec in specs_list:
             if isinstance(spec, dict):
                 source_type = spec.get("source_type", "").lower()
-                donnees = spec.get("donnees", {})
-                
                 if "datasheet" in source_type:
                     datasheet_spec = spec
                 elif "msds" in source_type:
                     msds_spec = spec
                 elif "control" in source_type or "feuille" in source_type:
                     lab_control_spec = spec
-        
-        # Build comprehensive data structure for Groq
-        prompt_data = {
-            "material": {
-                "nom_matiere": material_name,
-                "reference": reference,
-                "type_matiere": type_matiere
-            },
-            "datasheet": datasheet_spec.get("donnees", {}) if datasheet_spec else {},
-            "msds": msds_spec.get("donnees", {}) if msds_spec else {},
-            "lab_control": lab_control_spec.get("donnees", {}) if lab_control_spec else {},
-            "expert_notes": expert_notes_data[:5] if expert_notes_data else [],  # Limit to 5
-            "fiches": fiches_data
-        }
-        
-        # Create comprehensive prompt (ENGLISH only)
+        prompt_data = {"material": {"nom_matiere": material_name, "reference": reference, "type_matiere": type_matiere}, "datasheet": datasheet_spec.get("donnees", {}) if datasheet_spec else {}, "msds": msds_spec.get("donnees", {}) if msds_spec else {}, "lab_control": lab_control_spec.get("donnees", {}) if lab_control_spec else {}, "expert_notes": expert_notes_data[:5] if expert_notes_data else [], "fiches": fiches_data}
         prompt = f"""Generate a COMPLETE and PROFESSIONAL MATERIAL DNA SHEET (FICHE ADN) in ENGLISH with the following strict structure.
 Use ONLY the data provided in JSON. If a section lacks data, write "Not available".
-
-⚠️ MANDATORY TRANSLATION RULE:
-- ANY TEXT OR FIELD taken from the input data MUST be translated to ENGLISH
-- This includes: material names, product designations, component names, descriptions, notes, observations
-- Preserve technical identifiers (CAS numbers, references, chemical formulas)
-- If field is in French, German, or any other language → TRANSLATE TO ENGLISH
-- Examples:
-  * "Graphite naturel" → "Natural graphite"
-  * "Propriétés physicochimiques" → "Physicochemical properties"
-  * "Matériel de sécurité" → "Safety equipment"
-
-COMPLETE JSON DATA:
-{json.dumps(prompt_data, ensure_ascii=False, default=str, indent=2)}
-
+⚠️ MANDATORY TRANSLATION RULE: ANY TEXT OR FIELD taken from the input data MUST be translated to ENGLISH
+COMPLETE JSON DATA: {json.dumps(prompt_data, ensure_ascii=False, default=str, indent=2)}
 STRICT FORMATTING REQUIREMENTS:
-
 I — IDENTITY & LOGISTICS
-Extract from MSDS §1 and Datasheet:
-- Material, Reference, Commercial designation
-- Supplier: Name, Addresses (Head Office, Branches), Phone, Email, Website
-- AVO Form, Supplier lot numbers
-- Brand Lines
-- Dates: Datasheet revision date, MSDS date
-RULE: Only mention certificate checks (iO checks) if value ≠ "iO"
-
 II — GENERAL PRODUCT CHARACTERISTICS
-From MSDS §1 & §2:
-- Product family
-- Main chemical substance
-- Official chemical name
-- CAS # and EC #
-- UN Transport Classification
-- Synonyms
-- COMPLETE list of components with CAS
-
 III — CHEMICAL PROPERTIES - TRIPARTITE STRUCTURE
 ### III.1 QUANTIFIED PROPERTIES (Datasheet)
-Table: Parameter | Min | Max | Unit
-
 ### III.2 DETAILED COMPOSITION (MSDS §2)
-- Main components
-- Heavy metals (Cd, Pb, Hg, Cr VI)
-- Quartz ranges
-- Important notes
-
 ### III.3 STABILITY & HAZARDS (MSDS §9, §10, §3)
-- Thermal stability
-- Decomposition products
-- Incompatible materials
-- Hazardous polymerization
-
 ## IV — PHYSICAL PROPERTIES
-Consolidated table (MSDS §9 + Datasheet):
-State | Appearance | Odor | Water solubility | Melting point | Specific weight | Electrical conductivity | Flash point | Bulk density
-
 ## V — LASER GRANULOMETRY
-Particle size distribution (Datasheet):
-Parameter | d10 (µm) | d50 (µm) | d90 (µm)
-
 ## VI — GRANULOMETRIC CONTROLS (LAB-CONTROL)
-Table in ENGLISH:
-Parameter | Test Method | Min | Max | Unit
-
 ## VII — EXPERT NOTES & OBSERVATIONS
-From expert_notes:
-- Examination protocol (magnifications, preparation)
-- Particle morphology
-- Process impact
-- Critical attention points
-- Safety recommendations
-
 ## VIII — STORAGE
-Table from MSDS §7:
-Adequate Conditions | Inadequate Conditions | Incompatibilities | Handling | Required Signaling | Temperature | Humidity
-
 ## IX — PACKAGING
-From Datasheet:
-- Packaging types (Bags, Big Bags, Pallets)
-- Unit weights (standard bag, big bag)
-- Transport recommendations
-- Disposal instructions (MSDS §13)
-
 ## X — SAFETY — COMPLETE MSDS DATA
-Extract from MSDS §1 to §17:
-
-### X.1 CLASSIFICATION & IDENTIFICATION (§1, §2, §3)
-- Hazard class
-- NFPA Rating (Health, Flammability, Reactivity)
-- Specific risks
-- Exposure routes
-
-### X.2 PROTECTION EQUIPMENT (§8)
-- Exposure limits (ACGIH TLV, OSHA PEL)
-- Respiratory equipment
-- Protective gloves
-- Eye protection
-- Other PPE
-
-### X.3 FIRST AID (§4)
-Inhalation | Ingestion | Skin contact | Eye contact
-
-### X.4 FIRE MEASURES (§5)
-- Suitable extinguishing agents
-- Hazardous combustion products
-- Firefighter protection equipment
-
-### X.5 SPILLS & CLEANUP (§6)
-- Actions for small spills
-- Actions for large spills
-- Environmental precautions
-
-### X.6 TOXICOLOGY (§11)
-- Carcinogenicity
-- Mutagenicity
-- Reproductive toxicity
-- LD50/LC50 data
-- Specific effects (pneumoconiosis)
-
-### X.7 ECOLOGY & DISPOSAL (§12, §13)
-- Environmental effects
-- Biodegradability
-- Waste disposal method
-
-OUTPUT FORMAT:
-Use Markdown with:
-- ## for main section headers
-- ### for subsection headers
-- Markdown tables for structured data
-- Bullet lists for enumerations
-- **bold** for keywords
-
-QUALITY REQUIREMENTS:
-✓ Accurate and complete data
-✓ Professional format
-✓ No hallucinations/invented data
-✓ Rigid structure respected
-✓ Ready for Word document integration
-✓ ALL TEXT IN ENGLISH ONLY — Translate all input fields to English
-✓ Preserve technical terms and identifiers (CAS numbers, reference codes)
-✓ All descriptive content must be in English, never mix languages"""
-
-        message = call_groq_with_retry(
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            model="llama-3.3-70b-versatile",
-            max_tokens=5000
-        )
-        
+OUTPUT FORMAT: Use Markdown with tables, bullet lists, **bold** for keywords. ALL TEXT IN ENGLISH ONLY."""
+        message = call_groq_with_retry(messages=[{"role": "user", "content": prompt}], model="llama-3.3-70b-versatile", max_tokens=5000)
         content = message.choices[0].message.content if message.choices else ""
-        
         if not content or len(content.strip()) < 100:
-            print(f"⚠️ Groq returned empty or very short content: {len(content)} chars")
-            print(f"Response: {content}")
             raise Exception("Groq returned insufficient content")
-        
-        print(f"✅ Groq generated {len(content)} chars of content")
         return content
-    
     except Exception as e:
         print(f"❌ Groq generation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        # Don't use fallback - raise the error so user knows Groq failed
         raise e
 
 
-# -------------------------------------------------------
-# MARKDOWN TO DOCX FORMATTING
-# -------------------------------------------------------
 def add_formatted_markdown_to_docx(doc: Document, markdown_text):
-    """
-    Parses markdown text and adds it to the DOCX document with basic formatting.
-    Supports:
-    - Headings (##, ###, ####)
-    - Bold (**text**)
-    - Unordered lists (* or -)
-    - Simple tables (for the summary)
-    """
-    # Normalize line endings
     lines = markdown_text.strip().replace('\r\n', '\n').split('\n')
-    
     in_table = False
     table = None
-    
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        
         if not line:
             i += 1
             continue
-
-        # Table handling
         if line.startswith('|') and '|' in line[1:]:
             if not in_table:
-                # Start of a new table
                 in_table = True
                 header_line = line
-                
-                # Check for separator line
                 if i + 1 < len(lines) and lines[i+1].strip().startswith('|--'):
-                    separator_line = lines[i+1].strip()
-                    
-                    # Count columns from header
                     num_cols = len([h.strip() for h in header_line.split('|') if h.strip()])
-                    
                     if num_cols > 0:
                         table = doc.add_table(rows=1, cols=num_cols)
                         table.style = 'Table Grid'
-                        
-                        # Populate header
                         hdr_cells = table.rows[0].cells
                         headers = [h.strip() for h in header_line.split('|') if h.strip()]
                         for j, header in enumerate(headers):
                             if j < num_cols:
                                 hdr_cells[j].text = header
-                        
-                        i += 2 # Skip header and separator
+                        i += 2
                         continue
                 else:
-                    # Not a valid table, treat as plain text
                     in_table = False
-
-            else: # Already in table
+            else:
                 if line.startswith('|'):
                     row_data = [cell.strip() for cell in line.split('|') if cell.strip()]
                     if table and len(row_data) == table.columns:
@@ -653,35 +314,24 @@ def add_formatted_markdown_to_docx(doc: Document, markdown_text):
                         i += 1
                         continue
                     else:
-                        # End of table or malformed row
                         in_table = False
                         table = None
                 else:
-                    # End of table
                     in_table = False
                     table = None
-
-        # If not in a table or table processing is done for the line
         if not in_table:
-            # Headings
             if line.startswith('### '):
                 doc.add_heading(line[4:].strip(), level=3)
             elif line.startswith('## '):
                 doc.add_heading(line[3:].strip(), level=2)
             elif line.startswith('# '):
                 doc.add_heading(line[2:].strip(), level=1)
-            
-            # Unordered Lists
             elif line.startswith(('* ', '- ')):
-                # Handle nested lists indicated by indentation
                 indent_level = (len(line) - len(line.lstrip(' '))) // 2
                 style = 'List Bullet'
                 if indent_level > 0:
                     style = f'List Bullet {indent_level + 1}'
-                
-                p = doc.add_paragraph(line[2:].strip(), style=style)
-
-            # Paragraphs with bold
+                doc.add_paragraph(line[2:].strip(), style=style)
             else:
                 p = doc.add_paragraph()
                 parts = re.split(r'(\*\*.*?\*\*)', line)
@@ -690,209 +340,96 @@ def add_formatted_markdown_to_docx(doc: Document, markdown_text):
                         p.add_run(part[2:-2]).bold = True
                     elif part:
                         p.add_run(part)
-            i += 1
+        i += 1
 
 
-def generate_fallback_fiche_adn_content(
-    material_name: str,
-    reference: str,
-    type_matiere: str,
-    specifications: List[Dict[str, Any]]
-) -> str:
-    """Generate fallback content if Groq fails."""
-    content = f"""FICHE ADN - MATIÈRE
-
-Nom: {material_name}
-Référence: {reference}
-Type: {type_matiere}
-
-SPÉCIFICATIONS TECHNIQUES
-
-"""
+def generate_fallback_fiche_adn_content(material_name, reference, type_matiere, specifications):
+    content = f"FICHE ADN - MATIÈRE\n\nNom: {material_name}\nRéférence: {reference}\nType: {type_matiere}\n\nSPÉCIFICATIONS TECHNIQUES\n\n"
     if isinstance(specifications, list):
         for spec in specifications:
             if isinstance(spec, dict):
                 content += f"• {spec.get('source_type', 'Donnée')}: {spec.get('donnees', 'N/A')}\n"
-    
-    content += """
-
-RECOMMANDATIONS D'UTILISATION
-
-Cette matière doit être manipulée selon les spécifications techniques ci-dessus.
-Pour plus d'informations, veuillez consulter la documentation technique complète.
-"""
+    content += "\n\nRECOMMANDATIONS D'UTILISATION\n\nCette matière doit être manipulée selon les spécifications techniques ci-dessus.\n"
     return content
 
 
 def get_first_image_for_material(matiere_id: int) -> Optional[Image.Image]:
-    """
-    Retrieve the first image associated with a material from the database.
-    Handles cross-platform paths (Windows backslashes vs Linux forward slashes).
-    
-    Args:
-        matiere_id: Material ID
-    
-    Returns:
-        PIL Image or None
-    """
     conn = None
     try:
         conn = get_db_conn()
-        
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT image_path
-                FROM public.matiere_images
-                WHERE matiere_id = %s
-                LIMIT 1
-                """,
-                (matiere_id,)
-            )
+            cur.execute("SELECT image_path FROM public.matiere_images WHERE matiere_id = %s LIMIT 1", (matiere_id,))
             result = cur.fetchone()
-            
             if result and result.get("image_path"):
                 image_path = result["image_path"]
-                
-                # Normalize path: convert Windows backslashes to forward slashes
                 normalized_path = image_path.replace("\\", "/")
                 filename = Path(normalized_path).name
-                
-                # Try to find the image file
-                possible_paths = [
-                    Path(normalized_path),  # Absolute or relative path from DB (normalized)
-                    BASE_DIR / normalized_path,  # Relative to BASE_DIR
-                    IMAGES_DIR / filename,  # embeddings_v7/images/filename
-                    BASE_DIR / "output_v3" / "images" / filename,  # output_v3 location
-                ]
-                
-                for file_path in possible_paths:
+                for file_path in [Path(normalized_path), BASE_DIR / normalized_path, IMAGES_DIR / filename, BASE_DIR / "output_v3" / "images" / filename]:
                     if file_path.exists():
                         try:
                             return Image.open(file_path).convert("RGB")
-                        except Exception as e:
-                            print(f"⚠️ Error loading image {file_path}: {e}")
-        
+                        except Exception:
+                            pass
         return None
-    
     except Exception as e:
         print(f"⚠️ Error retrieving image: {e}")
         return None
-    
     finally:
         if conn:
             conn.close()
 
 
 def get_all_images_for_material(matiere_id: int, limit: int = 2) -> List[Dict[str, Any]]:
-    """
-    Retrieve images associated with a material from the database with magnification info.
-    Handles cross-platform paths (Windows backslashes vs Linux forward slashes).
-    
-    Args:
-        matiere_id: Material ID
-        limit: Maximum number of images to retrieve (default: 2)
-    
-    Returns:
-        List of dicts with keys: image_path, magnification, and image_obj (PIL Image)
-    """
     conn = None
     try:
         conn = get_db_conn()
-        
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT 
-                    mi.id,
-                    mi.image_path,
-                    men.note_json
+            cur.execute("""
+                SELECT mi.id, mi.image_path, men.note_json
                 FROM public.matiere_images mi
                 LEFT JOIN public.matiere_expert_notes men ON men.matiere_image_id = mi.id
-                WHERE mi.matiere_id = %s
-                ORDER BY mi.id
-                LIMIT %s
-                """,
-                (matiere_id, limit)
-            )
+                WHERE mi.matiere_id = %s ORDER BY mi.id LIMIT %s
+            """, (matiere_id, limit))
             results = cur.fetchall()
-            
             images_data = []
             for result in results:
                 image_path = result.get("image_path")
                 note_json = result.get("note_json") or {}
                 magnification = note_json.get("magnification", "N/A") if isinstance(note_json, dict) else "N/A"
-                
-                # Try to find the image file
                 image_obj = None
                 if image_path:
-                    # Normalize path: convert Windows backslashes to forward slashes
                     normalized_path = image_path.replace("\\", "/")
-                    # Get just the filename from the path
                     filename = Path(normalized_path).name
-                    
-                    possible_paths = [
-                        Path(normalized_path),  # Absolute or relative path from DB (normalized)
-                        BASE_DIR / normalized_path,  # Relative to BASE_DIR (handles output_v3/images/...)
-                        IMAGES_DIR / filename,  # embeddings_v7/images/filename
-                        BASE_DIR / "output_v3" / "images" / filename,  # output_v3 location (cross-platform)
-                    ]
-                    
-                    for file_path in possible_paths:
+                    for file_path in [Path(normalized_path), BASE_DIR / normalized_path, IMAGES_DIR / filename, BASE_DIR / "output_v3" / "images" / filename]:
                         try:
                             if file_path.exists():
                                 image_obj = Image.open(file_path).convert("RGB")
-                                print(f"✅ Loaded image from: {file_path}")
                                 break
-                        except Exception as e:
-                            print(f"⚠️ Error loading image {file_path}: {e}")
-                    
-                    if not image_obj:
-                        print(f"⚠️ Image not found for: {image_path}")
-                        print(f"   Normalized: {normalized_path}")
-                        print(f"   Tried locations: {[str(p) for p in possible_paths]}")
-                
-                images_data.append({
-                    "image_path": image_path,
-                    "magnification": magnification,
-                    "image_obj": image_obj
-                })
-            
+                        except Exception:
+                            pass
+                images_data.append({"image_path": image_path, "magnification": magnification, "image_obj": image_obj})
             return images_data
-        
     except Exception as e:
         print(f"⚠️ Error retrieving images: {e}")
-        import traceback
-        traceback.print_exc()
         return []
-    
     finally:
         if conn:
             conn.close()
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # ROOT / HEALTH
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify(
-        {
-            "service": "micrograph-search-api",
-            "status": "ok",
-            "model": DINO_MODEL_NAME,
-            "dino_loaded": DINO_MODEL is not None,
-            "images_dir": str(IMAGES_DIR),
-        }
-    ), 200
+    return jsonify({"service": "micrograph-search-api", "status": "ok", "model": DINO_MODEL_NAME, "dino_loaded": DINO_MODEL is not None, "images_dir": str(IMAGES_DIR)}), 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
     check_db = request.args.get("check_db", "false").strip().lower() in {"1", "true", "yes"}
-    db_ok = None
-    db_error = None
-
+    db_ok = db_error = None
     if check_db:
         try:
             conn = get_db_conn()
@@ -904,25 +441,11 @@ def health():
         except Exception as e:
             db_ok = False
             db_error = str(e)
-
-    return jsonify(
-        {
-            "status": "ok",
-            "dino_loaded": DINO_MODEL is not None,
-            "groq_configured": groq_client is not None,
-            "openai_configured": client is not None,
-            "db_ok": db_ok,
-            "db_error": db_error,
-        }
-    ), 200
+    return jsonify({"status": "ok", "dino_loaded": DINO_MODEL is not None, "groq_configured": groq_client is not None, "openai_configured": client is not None, "db_ok": db_ok, "db_error": db_error}), 200
 
 
-# -----------------------------------------------------------------------------
-# FILE SERVING
-# -----------------------------------------------------------------------------
 @app.route("/images/<path:filename>", methods=["GET"])
 def serve_image(filename):
-    """Serve images from embeddings_v7/images"""
     try:
         return send_from_directory(str(IMAGES_DIR), filename)
     except Exception:
@@ -931,222 +454,107 @@ def serve_image(filename):
 
 @app.route("/temp_files/<path:filename>", methods=["GET"])
 def serve_temp_file(filename):
-    """Serve locally stored temp uploads"""
     try:
         return send_from_directory(str(TEMP_UPLOAD_DIR), filename)
     except Exception:
         return jsonify({"error": "temp_file_not_found"}), 404
 
 
-# -----------------------------------------------------------------------------
-# UPLOAD AND SEARCH (MERGED)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# UPLOAD AND SEARCH (MATIERES)
+# =============================================================================
+
 @app.route("/upload_and_search", methods=["POST"])
 def upload_and_search():
-    """
-    Merged endpoint:
-    1) Receives openaiFileIdRefs (list of file references).
-    2) Downloads and saves them to temp_uploads/.
-    3) For each file, computes embedding and searches for similar images.
-    4) Returns both the local file info and the search results.
-    """
     data = request.get_json(silent=True) or {}
     refs = data.get("openaiFileIdRefs")
     top_k = int(data.get("top_k", 5))
-
     if not refs or not isinstance(refs, list):
-        return jsonify(
-            {
-                "success": False,
-                "error": "missing_openaiFileIdRefs",
-                "message": "Provide openaiFileIdRefs (list).",
-            }
-        ), 400
-
+        return jsonify({"success": False, "error": "missing_openaiFileIdRefs"}), 400
     if top_k < 1 or top_k > 50:
-        return jsonify({"success": False, "error": "invalid_top_k", "message": "top_k must be 1..50"}), 400
-
+        return jsonify({"success": False, "error": "invalid_top_k"}), 400
     final_results = []
     errors = []
-
     for file_ref in refs:
         try:
             if not isinstance(file_ref, dict):
-                errors.append("Each item in openaiFileIdRefs must be an object.")
+                errors.append("Each item must be an object.")
                 continue
-
             file_id = file_ref.get("id")
             download_link = file_ref.get("download_link")
             original_name = file_ref.get("name") or "uploaded_file"
             mime_type = file_ref.get("mime_type")
-
             if not file_id:
                 errors.append("Missing id in file reference.")
                 continue
-
             file_bytes = None
-
-            # 1) Try direct link if provided
             if download_link:
                 try:
                     r = requests.get(download_link, timeout=20)
                     r.raise_for_status()
                     file_bytes = r.content
                 except Exception as e:
-                    print(f"⚠️ download_link failed, fallback to file_id: {e}")
-
-            # 2) Fallback: OpenAI file content
+                    print(f"⚠️ download_link failed: {e}")
             if file_bytes is None:
                 if not client:
-                    errors.append(f"{original_name}: OpenAI API key not configured. Use download_link instead.")
+                    errors.append(f"{original_name}: OpenAI API key not configured.")
                     continue
                 file_bytes = client.files.content(file_id).read()
-
             filename_safe = secure_filename(original_name or "uploaded_file") or "uploaded_file"
-
             if "." not in filename_safe:
                 ext = guess_extension_from_mime(mime_type) or ".png"
                 filename_safe += ext
-
             if not allowed_file(filename_safe):
-                errors.append(f"{original_name}: File type not allowed (png/jpg/jpeg only).")
+                errors.append(f"{original_name}: File type not allowed.")
                 continue
-
-            # Save to temp
             unique_filename = f"{uuid.uuid4().hex}_{int(time.time())}_{filename_safe}"
             file_path = TEMP_UPLOAD_DIR / unique_filename
             with open(file_path, "wb") as f:
                 f.write(file_bytes)
-
-            # Generate local URL
             file_url = f"{request.host_url.rstrip('/')}/temp_files/{unique_filename}"
             if file_url.startswith("http://"):
                 file_url = "https://" + file_url[len("http://"):]
-
-            # --- SEARCH PART ---
             img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
             query_embedding = compute_embedding_from_pil(img)
             rows = search_similar_in_db(query_embedding, top_k=top_k)
-
-            search_results = []
-            for r in rows:
-                search_results.append(
-                    {
-                        "id": r["id"],
-                        "image_url": build_image_url(r["image_path"]),
-                        "matiere_id": r["matiere_id"],
-                        "material_name": r["nom_matiere"],
-                        "reference": r["reference"],
-                        "similarity": float(r["similarity"]) if r["similarity"] is not None else None,
-                    }
-                )
-
-            final_results.append(
-                {
-                    "original_name": original_name,
-                    "filename": unique_filename,
-                    "url": file_url,
-                    "expires_in": "2 hours",
-                    "search_results": search_results
-                }
-            )
-
+            search_results = [{"id": r["id"], "image_url": build_image_url(r["image_path"]), "matiere_id": r["matiere_id"], "material_name": r["nom_matiere"], "reference": r["reference"], "similarity": float(r["similarity"]) if r["similarity"] is not None else None} for r in rows]
+            final_results.append({"original_name": original_name, "filename": unique_filename, "url": file_url, "expires_in": "2 hours", "search_results": search_results})
         except Exception as e:
-            print(f"❌ Error processing file_ref: {e}")
             errors.append(f"{file_ref}: {str(e)}")
-
     if not final_results and errors:
         return jsonify({"success": False, "message": "All operations failed", "errors": errors}), 500
-
-    return jsonify(
-        {
-            "success": True,
-            "message": f"Processed {len(final_results)} files with search results.",
-            "results": final_results,
-            "errors": errors,
-        }
-    ), 200
+    return jsonify({"success": True, "message": f"Processed {len(final_results)} files.", "results": final_results, "errors": errors}), 200
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # MATERIAL DETAILS
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 @app.route("/material_details/<int:matiere_id>", methods=["GET"])
 def get_material_details(matiere_id):
-    """
-    Get complete material information by matiere_id.
-    Returns: matieres + fiches_matieres + specifications + expert_notes
-    """
     conn = None
     try:
         conn = get_db_conn()
-
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM public.matieres WHERE matiere_id = %s", (matiere_id,))
             material = cur.fetchone()
-
             if not material:
-                return jsonify(
-                    {"success": False, "error": "material_not_found", "message": f"matiere_id {matiere_id} not found"}
-                ), 404
-
+                return jsonify({"success": False, "error": "material_not_found"}), 404
             material = dict(material)
-
-            cur.execute(
-                """
-                SELECT fiche_id, date_creation_fiche, derniere_modification
-                FROM public.fiches_matieres
-                WHERE matiere_id = %s
-                ORDER BY fiche_id DESC
-                """,
-                (matiere_id,),
-            )
+            cur.execute("SELECT fiche_id, date_creation_fiche, derniere_modification FROM public.fiches_matieres WHERE matiere_id = %s ORDER BY fiche_id DESC", (matiere_id,))
             fiches = [dict(row) for row in cur.fetchall()]
-
             specifications = []
             for fiche in fiches:
-                cur.execute(
-                    """
-                    SELECT spec_id, fiche_id, source_type, donnees, date_creation, derniere_modification
-                    FROM public.specifications
-                    WHERE fiche_id = %s
-                    ORDER BY spec_id
-                    """,
-                    (fiche["fiche_id"],),
-                )
+                cur.execute("SELECT spec_id, fiche_id, source_type, donnees, date_creation, derniere_modification FROM public.specifications WHERE fiche_id = %s ORDER BY spec_id", (fiche["fiche_id"],))
                 specifications.extend([dict(row) for row in cur.fetchall()])
-
-            cur.execute(
-                """
+            cur.execute("""
                 SELECT men.id, men.matiere_image_id, men.note_json, men.created_at
                 FROM public.matiere_expert_notes men
                 INNER JOIN public.matiere_images mi ON mi.id = men.matiere_image_id
-                WHERE mi.matiere_id = %s
-                ORDER BY men.created_at DESC
-                """,
-                (matiere_id,),
-            )
+                WHERE mi.matiere_id = %s ORDER BY men.created_at DESC
+            """, (matiere_id,))
             expert_notes = [dict(row) for row in cur.fetchall()]
-
-            response = {
-                "success": True,
-                "material": material,
-                "fiches_matieres": fiches,
-                "specifications": specifications,
-                "expert_notes": expert_notes,
-                "summary": {
-                    "matiere_id": matiere_id,
-                    "nom_matiere": material.get("nom_matiere"),
-                    "reference": material.get("reference"),
-                    "type_matiere": material.get("type_matiere"),
-                    "num_fiches": len(fiches),
-                    "num_specifications": len(specifications),
-                    "num_expert_notes": len(expert_notes),
-                },
-            }
-
-            return jsonify(response), 200
-
+            return jsonify({"success": True, "material": material, "fiches_matieres": fiches, "specifications": specifications, "expert_notes": expert_notes, "summary": {"matiere_id": matiere_id, "nom_matiere": material.get("nom_matiere"), "reference": material.get("reference"), "type_matiere": material.get("type_matiere"), "num_fiches": len(fiches), "num_specifications": len(specifications), "num_expert_notes": len(expert_notes)}}), 200
     except Exception as e:
         return jsonify({"success": False, "error": "retrieval_failed", "message": str(e)}), 500
     finally:
@@ -1154,754 +562,267 @@ def get_material_details(matiere_id):
             conn.close()
 
 
-# -----------------------------------------------------------------------------
-# FICHE ADN - MATERIAL DNA SHEET
-# -----------------------------------------------------------------------------
+# =============================================================================
+# FICHE ADN
+# =============================================================================
+
 @app.route("/fiche_adn", methods=["GET"])
 def get_fiche_adn():
-    """
-    Get the complete ADN (DNA) specifications sheet for a material.
-    
-    Query Parameters:
-        - reference (str): Material reference (e.g., "6600135")
-    
-    Returns: Complete JSON specifications aggregating all fiches, specs, and expert notes
-    """
     reference = request.args.get("reference", "").strip()
-    
     if not reference:
-        return jsonify({
-            "success": False, 
-            "error": "missing_parameters",
-            "message": "The 'reference' query parameter is required"
-        }), 400
-    
+        return jsonify({"success": False, "error": "missing_parameters"}), 400
     conn = None
     try:
         conn = get_db_conn()
-        
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Query the fiches_ADN_matieres table
             cur.execute("""
-                SELECT 
-                    fiche_adn_id,
-                    matiere_id,
-                    nom_matiere,
-                    reference,
-                    type_matiere,
-                    specifications,
-                    num_specifications,
-                    date_creation,
-                    derniere_modification
+                SELECT fiche_adn_id, matiere_id, nom_matiere, reference, type_matiere,
+                       specifications, num_specifications, date_creation, derniere_modification
                 FROM public.fiches_adn_matieres
                 WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
                 LIMIT 1
             """, (reference,))
-            
             result = cur.fetchone()
-            
             if not result:
-                return jsonify({
-                    "success": False,
-                    "error": "fiche_adn_not_found",
-                    "message": f"No fiche ADN found for reference: {reference}"
-                }), 404
-            
-            result_dict = dict(result)
-            
-            return jsonify({
-                "success": True,
-                "fiche_adn": {
-                    "fiche_adn_id": result_dict["fiche_adn_id"],
-                    "matiere_id": result_dict["matiere_id"],
-                    "nom_matiere": result_dict["nom_matiere"],
-                    "reference": result_dict["reference"],
-                    "type_matiere": result_dict["type_matiere"],
-                    "num_specifications": result_dict["num_specifications"],
-                    "date_creation": result_dict["date_creation"],
-                    "derniere_modification": result_dict["derniere_modification"],
-                    "specifications": result_dict["specifications"]  # Complete JSON blob
-                }
-            }), 200
-    
+                return jsonify({"success": False, "error": "fiche_adn_not_found"}), 404
+            return jsonify({"success": True, "fiche_adn": dict(result)}), 200
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": "retrieval_failed",
-            "message": str(e)
-        }), 500
+        return jsonify({"success": False, "error": "retrieval_failed", "message": str(e)}), 500
     finally:
         if conn:
             conn.close()
 
 
-# Alternative endpoint: Get by matiere_id only (faster)
 @app.route("/fiche_adn/<int:matiere_id>", methods=["GET"])
 def get_fiche_adn_by_id(matiere_id):
-    """
-    Get the complete ADN specifications sheet for a material by matiere_id.
-    
-    Path Parameter:
-        - matiere_id (int): The material ID
-    
-    Returns: Complete JSON specifications aggregating all fiches, specs, and expert notes
-    """
     conn = None
     try:
         conn = get_db_conn()
-        
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT 
-                    fiche_adn_id,
-                    matiere_id,
-                    nom_matiere,
-                    reference,
-                    type_matiere,
-                    specifications,
-                    num_specifications,
-                    date_creation,
-                    derniere_modification
-                FROM public.fiches_adn_matieres
-                WHERE matiere_id = %s
-                LIMIT 1
+                SELECT fiche_adn_id, matiere_id, nom_matiere, reference, type_matiere,
+                       specifications, num_specifications, date_creation, derniere_modification
+                FROM public.fiches_adn_matieres WHERE matiere_id = %s LIMIT 1
             """, (matiere_id,))
-            
             result = cur.fetchone()
-            
             if not result:
-                return jsonify({
-                    "success": False,
-                    "error": "fiche_adn_not_found",
-                    "message": f"No fiche ADN found for matiere_id: {matiere_id}"
-                }), 404
-            
-            result_dict = dict(result)
-            
-            return jsonify({
-                "success": True,
-                "fiche_adn": {
-                    "fiche_adn_id": result_dict["fiche_adn_id"],
-                    "matiere_id": result_dict["matiere_id"],
-                    "nom_matiere": result_dict["nom_matiere"],
-                    "reference": result_dict["reference"],
-                    "type_matiere": result_dict["type_matiere"],
-                    "num_specifications": result_dict["num_specifications"],
-                    "date_creation": result_dict["date_creation"],
-                    "derniere_modification": result_dict["derniere_modification"],
-                    "specifications": result_dict["specifications"]  # Complete JSON blob
-                }
-            }), 200
-    
+                return jsonify({"success": False, "error": "fiche_adn_not_found"}), 404
+            return jsonify({"success": True, "fiche_adn": dict(result)}), 200
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": "retrieval_failed",
-            "message": str(e)
-        }), 500
+        return jsonify({"success": False, "error": "retrieval_failed", "message": str(e)}), 500
     finally:
         if conn:
             conn.close()
 
 
-# GENERATE FICHE ADN DOCX
-# -----------------------------------------------------------------------------
 @app.route("/generate_fiche_adn_docx", methods=["GET"])
 def generate_fiche_adn_docx():
-    """
-    Generate a DOCX file for the fiche ADN with material details and image.
-    
-    Query Parameters:
-        - reference (str): Material reference (e.g., "6600135")
-    
-    Returns: DOCX file download or JSON error
-    """
     reference = request.args.get("reference", "").strip()
-    
     if not reference:
-        return jsonify({
-            "success": False,
-            "error": "missing_parameters",
-            "message": "The 'reference' query parameter is required"
-        }), 400
-    
+        return jsonify({"success": False, "error": "missing_parameters"}), 400
     conn = None
     try:
         conn = get_db_conn()
-        
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Get fiche ADN data
             cur.execute("""
-                SELECT 
-                    fiche_adn_id,
-                    matiere_id,
-                    nom_matiere,
-                    reference,
-                    type_matiere,
-                    specifications,
-                    num_specifications,
-                    date_creation,
-                    derniere_modification
+                SELECT fiche_adn_id, matiere_id, nom_matiere, reference, type_matiere,
+                       specifications, num_specifications, date_creation, derniere_modification
                 FROM public.fiches_adn_matieres
                 WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
                 LIMIT 1
             """, (reference,))
-            
             result = cur.fetchone()
-            
             if not result:
-                return jsonify({
-                    "success": False,
-                    "error": "fiche_adn_not_found",
-                    "message": f"No fiche ADN found for reference: {reference}"
-                }), 404
-            
+                return jsonify({"success": False, "error": "fiche_adn_not_found"}), 404
             result_dict = dict(result)
             matiere_id = result_dict["matiere_id"]
             material_name = result_dict["nom_matiere"]
             type_matiere = result_dict["type_matiere"]
             specifications = result_dict.get("specifications")
-            
-            # Parse specifications if it's a string JSON
             if isinstance(specifications, str):
                 try:
                     specifications = json.loads(specifications)
                 except:
                     specifications = {}
-            
-            # Ensure specifications is a dict (it should be from DB)
             if not isinstance(specifications, dict):
                 specifications = {}
-        
-        # Generate content using Groq
-        content = generate_fiche_adn_content_with_groq(
-            result_dict,
-            material_name,
-            reference,
-            type_matiere,
-            specifications
-        )
-        
-        # Create DOCX document
+        content = generate_fiche_adn_content_with_groq(result_dict, material_name, reference, type_matiere, specifications)
         doc = Document()
-        
-        # Add title
         title = doc.add_heading(f"MATERIAL DNA SHEET - {material_name}", level=1)
         title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        
-        # Add reference info
         info_paragraph = doc.add_paragraph()
         info_run = info_paragraph.add_run(f"Reference: {reference}\n")
         info_run.bold = True
         info_paragraph.add_run(f"Type: {type_matiere}\n")
         info_paragraph.add_run(f"Generated on: {result_dict.get('date_creation', 'N/A')}")
-        
-        # Add a line break
         doc.add_paragraph()
-        
-        # Add generated content with proper formatting
         doc.add_heading("CONTENT", level=2)
         add_formatted_markdown_to_docx(doc, content)
-        
-        # Try to add images with magnification (limit to 2 different magnifications)
-        images = get_all_images_for_material(matiere_id, limit=10)  # Get more to find 2 different magnifications
+        images = get_all_images_for_material(matiere_id, limit=10)
         if images:
             doc.add_page_break()
-            
-            # Add title for micrographies section
             title_paragraph = doc.add_heading("Examples of micrographie for a reference:", level=2)
             title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            
-            doc.add_paragraph()  # Add spacing
-            
-            # Find 2 images with different magnifications
+            doc.add_paragraph()
             added_magnifications = set()
             images_to_add = []
-            
             for img_data in images:
                 if img_data["image_obj"] and len(images_to_add) < 2:
                     magnification = img_data.get("magnification", "N/A")
-                    # Only add if we haven't added this magnification yet
                     if magnification not in added_magnifications:
                         images_to_add.append(img_data)
                         added_magnifications.add(magnification)
-            
-            # Add each image with its magnification (max 2)
             for idx, img_data in enumerate(images_to_add, 1):
                 if img_data["image_obj"]:
-                    # Add magnification heading
                     magnification = img_data.get("magnification", "N/A")
-                    if magnification and magnification != "N/A":
-                        mag_heading = doc.add_heading(f"Grossissement: {magnification}x", level=3)
-                    else:
-                        mag_heading = doc.add_heading(f"Grossissement: N/A", level=3)
+                    mag_heading = doc.add_heading(f"Grossissement: {magnification}x" if magnification != "N/A" else "Grossissement: N/A", level=3)
                     mag_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    
-                    # Save image temporarily and add to document
                     img_stream = io.BytesIO()
                     img_data["image_obj"].save(img_stream, format="PNG")
                     img_stream.seek(0)
-                    
-                    # Add image to document (max width: 5 inches)
                     try:
                         doc.add_picture(img_stream, width=Inches(5))
-                        last_paragraph = doc.paragraphs[-1]
-                        last_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
                     except Exception as e:
-                        print(f"⚠️ Could not add image {idx} to document: {e}")
-                    
-                    doc.add_paragraph()  # Add spacing between images
-        
-        # Generate unique filename (timestamp + random to avoid collisions)
+                        print(f"⚠️ Could not add image {idx}: {e}")
+                    doc.add_paragraph()
         timestamp = int(time.time())
         random_id = uuid.uuid4().hex[:8]
         filename = f"Fiche_ADN_{reference}_{timestamp}_{random_id}.docx"
         filepath = DOCX_TEMP_DIR / filename
-        
-        # Save document to temporary directory
         doc.save(str(filepath))
-        
-        print(f"✅ DOCX file saved to temp: {filepath}")
-        print(f"📁 File will be automatically deleted after 1 hour")
-        
-        # Build absolute download URL
-        # Get the host from request headers (for Azure deployment)
         host = request.host or os.getenv("API_HOST", "localhost:5000")
-        # Check X-Forwarded-Proto header first (set by Azure load balancer)
         protocol = request.headers.get("X-Forwarded-Proto", request.scheme)
-        # Force HTTPS for production domains
         if ".azurewebsites.net" in host or ".azure" in host:
             protocol = "https"
         absolute_download_url = f"{protocol}://{host}/download_fiche_adn_docx/{filename}"
-        
-        # Return JSON response with download URL
-        return jsonify({
-            "success": True,
-            "file_name": filename,
-            "download_url": f"/download_fiche_adn_docx/{filename}",
-            "absolute_url": absolute_download_url,
-            "expires_in": "1 hour",
-            "message": f"DOCX file generated successfully for reference {reference}"
-        }), 200
-    
+        return jsonify({"success": True, "file_name": filename, "download_url": f"/download_fiche_adn_docx/{filename}", "absolute_url": absolute_download_url, "expires_in": "1 hour"}), 200
     except Exception as e:
-        print(f"❌ Error generating fiche ADN: {e}")
-        return jsonify({
-            "success": False,
-            "error": "generation_failed",
-            "message": str(e)
-        }), 500
-    
+        return jsonify({"success": False, "error": "generation_failed", "message": str(e)}), 500
     finally:
         if conn:
             conn.close()
 
-# DOWNLOAD FICHE ADN DOCX
-# -----------------------------------------------------------------------------
+
 @app.route("/download_fiche_adn_docx/<filename>", methods=["GET"])
 def download_fiche_adn_docx(filename):
-    """
-    Download a previously generated DOCX file.
-    
-    Path Parameters:
-        - filename (str): Name of the DOCX file (e.g., "Fiche_ADN_6600323_1708367890.docx")
-    
-    Returns: DOCX file download or JSON error
-    """
     try:
-        # Security: Validate filename
-        if not filename.endswith(".docx"):
-            return jsonify({
-                "success": False,
-                "error": "invalid_file",
-                "message": "Invalid file type"
-            }), 400
-        
-        # Prevent path traversal attacks
-        if ".." in filename or "/" in filename or "\\" in filename:
-            return jsonify({
-                "success": False,
-                "error": "invalid_file",
-                "message": "Invalid filename"
-            }), 400
-        
-        # Build file path from temporary DOCX directory
+        if not filename.endswith(".docx") or ".." in filename or "/" in filename or "\\" in filename:
+            return jsonify({"success": False, "error": "invalid_file"}), 400
         file_path = DOCX_TEMP_DIR / filename
-        
-        # Check if file exists
         if not file_path.exists():
-            return jsonify({
-                "success": False,
-                "error": "file_not_found",
-                "message": f"File not found: {filename}. File may have expired (1 hour retention)."
-            }), 404
-        
-        # Return file
-        return send_file(
-            str(file_path),
-            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            as_attachment=True,
-            download_name=filename
-        )
-    
+            return jsonify({"success": False, "error": "file_not_found"}), 404
+        return send_file(str(file_path), mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document", as_attachment=True, download_name=filename)
     except Exception as e:
-        print(f"❌ Error downloading DOCX: {e}")
-        return jsonify({
-            "success": False,
-            "error": "download_failed",
-            "message": str(e)
-        }), 500
+        return jsonify({"success": False, "error": "download_failed", "message": str(e)}), 500
 
-# POPULATE FICHES ADN TABLE
-# -----------------------------------------------------------------------------
+
 @app.route("/populate_fiches_adn_table", methods=["POST"])
 def populate_fiches_adn_table():
-    """
-    Populate/Update the fiches_adn_matieres table by aggregating data from:
-    - matieres (main materials table)
-    - fiches_matieres (technical sheets)
-    - specifications (linked specifications)
-    - matiere_expert_notes (expert notes with images)
-    
-    Process:
-    1. Fetch all materials from database
-    2. For each material, aggregate all related data into JSON
-    3. Insert or update record in fiches_adn_matieres
-    
-    Returns: Summary of processed records
-    """
     try:
         conn = get_db_conn()
-        
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Fetch all materials
-            cur.execute("""
-                SELECT matiere_id, nom_matiere, reference, type_matiere, 
-                       date_creation, date_mise_a_jour
-                FROM public.matieres
-                ORDER BY matiere_id
-            """)
+            cur.execute("SELECT matiere_id, nom_matiere, reference, type_matiere FROM public.matieres ORDER BY matiere_id")
             materials = cur.fetchall()
-            
             if not materials:
-                return jsonify({
-                    "success": False,
-                    "message": "No materials found in database"
-                }), 404
-            
-            processed_count = 0
-            updated_count = 0
-            inserted_count = 0
-            error_count = 0
+                return jsonify({"success": False, "message": "No materials found"}), 404
+            processed_count = updated_count = inserted_count = error_count = 0
             errors_details = []
-            
             for material in materials:
                 try:
                     matiere_id = material["matiere_id"]
-                    nom_matiere = material["nom_matiere"]
-                    reference = material["reference"]
-                    type_matiere = material["type_matiere"]
-                    
-                    # Fetch fiches for this material
-                    cur.execute("""
-                        SELECT fiche_id, date_creation_fiche, derniere_modification
-                        FROM public.fiches_matieres
-                        WHERE matiere_id = %s
-                        ORDER BY fiche_id DESC
-                    """, (matiere_id,))
+                    cur.execute("SELECT fiche_id FROM public.fiches_matieres WHERE matiere_id = %s ORDER BY fiche_id DESC", (matiere_id,))
                     fiches = [dict(row) for row in cur.fetchall()]
-                    
-                    # Fetch all specifications for these fiches
                     specifications_list = []
                     for fiche in fiches:
-                        cur.execute("""
-                            SELECT spec_id, fiche_id, source_type, donnees, 
-                                   date_creation, derniere_modification
-                            FROM public.specifications
-                            WHERE fiche_id = %s
-                            ORDER BY spec_id
-                        """, (fiche["fiche_id"],))
+                        cur.execute("SELECT spec_id, fiche_id, source_type, donnees, date_creation, derniere_modification FROM public.specifications WHERE fiche_id = %s ORDER BY spec_id", (fiche["fiche_id"],))
                         specifications_list.extend([dict(row) for row in cur.fetchall()])
-                    
-                    # Fetch expert notes with images
                     cur.execute("""
-                        SELECT men.id, men.matiere_image_id, men.note_json, men.created_at,
-                               mi.image_path
+                        SELECT men.id, men.matiere_image_id, men.note_json, men.created_at, mi.image_path
                         FROM public.matiere_expert_notes men
                         INNER JOIN public.matiere_images mi ON mi.id = men.matiere_image_id
-                        WHERE mi.matiere_id = %s
-                        ORDER BY men.created_at DESC
+                        WHERE mi.matiere_id = %s ORDER BY men.created_at DESC
                     """, (matiere_id,))
                     expert_notes = [dict(row) for row in cur.fetchall()]
-                    
-                    # Aggregate everything into JSON structure
-                    aggregated_data = {
-                        "fiches": fiches,
-                        "specifications": specifications_list,
-                        "expert_notes": expert_notes,
-                        "summary": {
-                            "num_fiches": len(fiches),
-                            "num_specifications": len(specifications_list),
-                            "num_expert_notes": len(expert_notes)
-                        }
-                    }
-                    
-                    # Convert datetime objects to ISO format strings for JSON serialization
-                    aggregated_data = serialize_to_json_compatible(aggregated_data)
-                    
-                    # Check if record already exists
-                    cur.execute("""
-                        SELECT fiche_adn_id FROM public.fiches_adn_matieres
-                        WHERE matiere_id = %s
-                    """, (matiere_id,))
+                    aggregated_data = serialize_to_json_compatible({"fiches": fiches, "specifications": specifications_list, "expert_notes": expert_notes, "summary": {"num_fiches": len(fiches), "num_specifications": len(specifications_list), "num_expert_notes": len(expert_notes)}})
+                    cur.execute("SELECT fiche_adn_id FROM public.fiches_adn_matieres WHERE matiere_id = %s", (matiere_id,))
                     existing = cur.fetchone()
-                    
                     if existing:
-                        # Update existing record
-                        cur.execute("""
-                            UPDATE public.fiches_adn_matieres
-                            SET nom_matiere = %s,
-                                reference = %s,
-                                type_matiere = %s,
-                                specifications = %s,
-                                num_specifications = %s,
-                                derniere_modification = CURRENT_TIMESTAMP
-                            WHERE matiere_id = %s
-                        """, (
-                            nom_matiere,
-                            reference,
-                            type_matiere,
-                            Json(aggregated_data),
-                            len(specifications_list),
-                            matiere_id
-                        ))
+                        cur.execute("UPDATE public.fiches_adn_matieres SET nom_matiere=%s, reference=%s, type_matiere=%s, specifications=%s, num_specifications=%s, derniere_modification=CURRENT_TIMESTAMP WHERE matiere_id=%s",
+                                    (material["nom_matiere"], material["reference"], material["type_matiere"], Json(aggregated_data), len(specifications_list), matiere_id))
                         updated_count += 1
                     else:
-                        # Insert new record
-                        cur.execute("""
-                            INSERT INTO public.fiches_adn_matieres
-                            (matiere_id, nom_matiere, reference, type_matiere, 
-                             specifications, num_specifications, date_creation, derniere_modification)
-                            VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                        """, (
-                            matiere_id,
-                            nom_matiere,
-                            reference,
-                            type_matiere,
-                            Json(aggregated_data),
-                            len(specifications_list)
-                        ))
+                        cur.execute("INSERT INTO public.fiches_adn_matieres (matiere_id, nom_matiere, reference, type_matiere, specifications, num_specifications, date_creation, derniere_modification) VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                                    (matiere_id, material["nom_matiere"], material["reference"], material["type_matiere"], Json(aggregated_data), len(specifications_list)))
                         inserted_count += 1
-                    
                     processed_count += 1
-                    
-                    # Commit after each material to ensure partial success
                     conn.commit()
-                    
                 except Exception as mat_error:
-                    error_msg = str(mat_error)
-                    print(f"❌ Error processing material {material.get('matiere_id')}: {error_msg}")
-                    import traceback
-                    traceback.print_exc()
                     error_count += 1
-                    errors_details.append({
-                        "matiere_id": material.get('matiere_id'),
-                        "reference": material.get('reference'),
-                        "nom_matiere": material.get('nom_matiere'),
-                        "error": error_msg
-                    })
+                    errors_details.append({"matiere_id": material.get("matiere_id"), "error": str(mat_error)})
                     conn.rollback()
-                    continue
-            
-            return jsonify({
-                "success": True if error_count == 0 else False,
-                "message": "Fiches ADN table populated successfully" if error_count == 0 else f"Population completed with {error_count} errors",
-                "summary": {
-                    "total_materials": len(materials),
-                    "processed": processed_count,
-                    "inserted": inserted_count,
-                    "updated": updated_count,
-                    "errors": error_count
-                },
-                "errors_details": errors_details[:10] if errors_details else []  # Return first 10 errors
-            }), 200
-            
+            return jsonify({"success": error_count == 0, "summary": {"total_materials": len(materials), "processed": processed_count, "inserted": inserted_count, "updated": updated_count, "errors": error_count}, "errors_details": errors_details[:10]}), 200
     except Exception as e:
-        print(f"❌ Error populating fiches_adn_matieres: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": "population_failed",
-            "message": str(e)
-        }), 500
+        return jsonify({"success": False, "error": str(e)}), 500
     finally:
         if conn:
             conn.close()
 
 
-# VERIFY FICHES ADN TABLE
-# -----------------------------------------------------------------------------
 @app.route("/verify_fiches_adn_table", methods=["GET"])
 def verify_fiches_adn_table():
-    """
-    Verify and analyze the fiches_adn_matieres table.
-    
-    Returns:
-    - Total record count
-    - Specifications statistics (total, average per material)
-    - Sample records
-    - Data quality metrics
-    
-    Returns: JSON with verification results
-    """
     try:
         conn = get_db_conn()
-        
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Count total records
             cur.execute("SELECT COUNT(*) as total FROM public.fiches_adn_matieres")
             total_count = cur.fetchone()["total"]
-            
             if total_count == 0:
-                return jsonify({
-                    "success": True,
-                    "message": "Table is empty",
-                    "total_records": 0,
-                    "statistics": {},
-                    "samples": []
-                }), 200
-            
-            # Get statistics
+                return jsonify({"success": True, "message": "Table is empty", "total_records": 0}), 200
             cur.execute("""
-                SELECT 
-                    COUNT(*) as total_records,
-                    SUM(num_specifications) as total_specifications,
-                    AVG(num_specifications) as avg_specifications_per_material,
-                    MIN(num_specifications) as min_specifications,
-                    MAX(num_specifications) as max_specifications,
-                    COUNT(CASE WHEN num_specifications = 0 THEN 1 END) as materials_without_specs,
-                    COUNT(CASE WHEN specifications IS NOT NULL THEN 1 END) as materials_with_data
+                SELECT COUNT(*) as total_records, SUM(num_specifications) as total_specifications,
+                       AVG(num_specifications) as avg_specifications_per_material,
+                       MIN(num_specifications) as min_specifications, MAX(num_specifications) as max_specifications,
+                       COUNT(CASE WHEN num_specifications = 0 THEN 1 END) as materials_without_specs,
+                       COUNT(CASE WHEN specifications IS NOT NULL THEN 1 END) as materials_with_data
                 FROM public.fiches_adn_matieres
             """)
             stats = dict(cur.fetchone())
-            
-            # Get sample records (first 5)
-            cur.execute("""
-                SELECT 
-                    fiche_adn_id,
-                    matiere_id,
-                    nom_matiere,
-                    reference,
-                    type_matiere,
-                    num_specifications,
-                    date_creation,
-                    derniere_modification,
-                    specifications
-                FROM public.fiches_adn_matieres
-                ORDER BY derniere_modification DESC
-                LIMIT 5
-            """)
+            cur.execute("SELECT fiche_adn_id, matiere_id, nom_matiere, reference, type_matiere, num_specifications, date_creation, derniere_modification, specifications FROM public.fiches_adn_matieres ORDER BY derniere_modification DESC LIMIT 5")
             samples = []
             for row in cur.fetchall():
                 sample = dict(row)
-                # Parse specifications JSON to show summary
                 specs_data = sample.get("specifications", {})
                 if isinstance(specs_data, str):
                     try:
                         specs_data = json.loads(specs_data)
                     except:
                         specs_data = {}
-                
-                sample["specifications_summary"] = {
-                    "num_fiches": specs_data.get("summary", {}).get("num_fiches", 0) if isinstance(specs_data, dict) else 0,
-                    "num_specifications": specs_data.get("summary", {}).get("num_specifications", 0) if isinstance(specs_data, dict) else 0,
-                    "num_expert_notes": specs_data.get("summary", {}).get("num_expert_notes", 0) if isinstance(specs_data, dict) else 0
-                }
-                # Remove full specifications data from sample for brevity
+                sample["specifications_summary"] = {"num_fiches": specs_data.get("summary", {}).get("num_fiches", 0) if isinstance(specs_data, dict) else 0, "num_specifications": specs_data.get("summary", {}).get("num_specifications", 0) if isinstance(specs_data, dict) else 0, "num_expert_notes": specs_data.get("summary", {}).get("num_expert_notes", 0) if isinstance(specs_data, dict) else 0}
                 del sample["specifications"]
                 samples.append(sample)
-            
-            # Get recent updates
-            cur.execute("""
-                SELECT 
-                    fiche_adn_id,
-                    nom_matiere,
-                    reference,
-                    derniere_modification
-                FROM public.fiches_adn_matieres
-                ORDER BY derniere_modification DESC
-                LIMIT 10
-            """)
-            recent_updates = [dict(row) for row in cur.fetchall()]
-            
-            return jsonify({
-                "success": True,
-                "message": "Verification completed successfully",
-                "total_records": total_count,
-                "statistics": {
-                    "total_records": int(stats["total_records"]),
-                    "total_specifications": int(stats["total_specifications"] or 0),
-                    "avg_specifications_per_material": float(stats["avg_specifications_per_material"] or 0),
-                    "min_specifications": int(stats["min_specifications"] or 0),
-                    "max_specifications": int(stats["max_specifications"] or 0),
-                    "materials_without_specs": int(stats["materials_without_specs"] or 0),
-                    "materials_with_data": int(stats["materials_with_data"] or 0)
-                },
-                "samples": samples,
-                "recent_updates": recent_updates
-            }), 200
-            
+            return jsonify({"success": True, "total_records": total_count, "statistics": stats, "samples": samples}), 200
     except Exception as e:
-        print(f"❌ Error verifying fiches_adn_matieres: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": "verification_failed",
-            "message": str(e)
-        }), 500
+        return jsonify({"success": False, "error": str(e)}), 500
     finally:
         if conn:
             conn.close()
 
 
-# GENERATE APPLICATIONS ANALYSIS
-# -----------------------------------------------------------------------------
 @app.route("/search", methods=["POST"])
 def search():
-    """
-    Search similar micrographs (pgvector).
-    Accepts ONE of:
-      - download_link (recommended: robust for autoscaling)
-      - temp_filename (fallback: local file)
-      - file_id (fallback: OpenAI Files API)
-    """
     data = request.get_json(silent=True) or {}
     if not data:
-        return jsonify({"success": False, "error": "missing_json_body", "message": "Missing JSON body"}), 400
-
+        return jsonify({"success": False, "error": "missing_json_body"}), 400
     top_k = int(data.get("top_k", 5))
     if top_k < 1 or top_k > 50:
-        return jsonify({"success": False, "error": "invalid_top_k", "message": "top_k must be 1..50"}), 400
-
+        return jsonify({"success": False, "error": "invalid_top_k"}), 400
     temp_filename = data.get("temp_filename")
     file_id = data.get("file_id")
     download_link = data.get("download_link")
-
     provided = [bool(download_link), bool(temp_filename), bool(file_id)]
     if sum(provided) != 1:
-        return jsonify(
-            {
-                "success": False,
-                "error": "invalid_input",
-                "message": "Provide exactly ONE of: download_link, temp_filename, file_id",
-            }
-        ), 400
-
+        return jsonify({"success": False, "error": "Provide exactly ONE of: download_link, temp_filename, file_id"}), 400
     img = None
-
-    # 1) download_link (BEST)
     if download_link:
         try:
             r = requests.get(download_link, timeout=20)
@@ -1909,543 +830,144 @@ def search():
             img = Image.open(io.BytesIO(r.content)).convert("RGB")
         except Exception as e:
             return jsonify({"success": False, "error": "download_link_failed", "message": str(e)}), 400
-
-    # 2) temp_filename (fallback)
     elif temp_filename:
         file_path = TEMP_UPLOAD_DIR / temp_filename
         if not file_path.exists():
-            return jsonify(
-                {
-                    "success": False,
-                    "error": "temp_file_not_found",
-                    "message": f"{temp_filename} not found (likely autoscaling issue). Use download_link instead.",
-                }
-            ), 404
-        try:
-            img = Image.open(file_path).convert("RGB")
-        except Exception as e:
-            return jsonify({"success": False, "error": "invalid_image", "message": str(e)}), 400
-
-    # 3) file_id (fallback)
+            return jsonify({"success": False, "error": "temp_file_not_found"}), 404
+        img = Image.open(file_path).convert("RGB")
     elif file_id:
         if not client:
-            return jsonify({"success": False, "error": "openai_not_configured", "message": "OpenAI API key not configured. Use download_link instead."}), 400
-        try:
-            file_content = client.files.content(file_id).read()
-            img = Image.open(io.BytesIO(file_content)).convert("RGB")
-        except Exception as e:
-            return jsonify({"success": False, "error": "openai_retrieval_failed", "message": str(e)}), 400
-
+            return jsonify({"success": False, "error": "openai_not_configured"}), 400
+        file_content = client.files.content(file_id).read()
+        img = Image.open(io.BytesIO(file_content)).convert("RGB")
     try:
         query_embedding = compute_embedding_from_pil(img)
         rows = search_similar_in_db(query_embedding, top_k=top_k)
-
-        results = []
-        for r in rows:
-            results.append(
-                {
-                    "id": r["id"],
-                    "image_url": build_image_url(r["image_path"]),
-                    "matiere_id": r["matiere_id"],
-                    "material_name": r["nom_matiere"],
-                    "reference": r["reference"],
-                    "similarity": float(r["similarity"]) if r["similarity"] is not None else None,
-                }
-            )
-
+        results = [{"id": r["id"], "image_url": build_image_url(r["image_path"]), "matiere_id": r["matiere_id"], "material_name": r["nom_matiere"], "reference": r["reference"], "similarity": float(r["similarity"]) if r["similarity"] is not None else None} for r in rows]
         return jsonify({"success": True, "results": results}), 200
-
     except Exception as e:
         return jsonify({"success": False, "error": "search_failed", "message": str(e)}), 500
 
 
-# -----------------------------------------------------------------------------
-# APPLICATION ANALYSIS ENDPOINTS
-# -----------------------------------------------------------------------------
+# =============================================================================
+# APPLICATION ANALYSIS
+# =============================================================================
 
-def generate_application_analysis_with_llm(
-    fiche_adn_data: Dict[str, Any],
-    company_context: str = None
-) -> Dict[str, Any]:
-    """
-    Generate comprehensive application analysis using LLM.
-    
-    Args:
-        fiche_adn_data: Complete fiche ADN data (material specifications)
-        company_context: AVOCarbon company context and product scope
-        
-    Returns:
-        Structured analysis with applications, processes, properties, and opportunities
-    """
+def generate_application_analysis_with_llm(fiche_adn_data, company_context=None):
     if not groq_client:
-        return {
-            "success": False,
-            "error": "llm_not_configured",
-            "message": "Groq client not initialized"
-        }
-    
-    # Default company context if not provided
+        return {"success": False, "error": "llm_not_configured"}
     if not company_context:
-        company_context = """
-AVOCarbon - Company Scope:
+        company_context = """AVOCarbon - Company Scope:
 Core Business Areas:
-1. Carbon brushes for electric motors (automotive, power tools, household appliances)
+1. Carbon brushes for electric motors
 2. Brush-holder assemblies
 3. Inductors and coils (chokes) for EMI filtering
 4. Dynamic sealing joints (via Cyclam division)
 5. Self-lubricating bearings and bushings
 6. Friction rings, rotors, vanes for motors and pumps
-
-Target Industries:
-- Automotive (electric/hybrid vehicles, alternators, starters, auxiliary motors)
-- Power tools
-- Household appliances
-- Industrial equipment
-- Specific mobility (special vehicles, electric two-wheelers)
-
-Technology Focus:
-- Carbon and graphite composite materials
-- Electrical conduction and EMI suppression
-- Friction and wear management
-- Self-lubrication systems
-- Thermal management
-"""
-    
-    # Extract key material properties
+Target Industries: Automotive, Power tools, Household appliances, Industrial equipment"""
     material_name = fiche_adn_data.get("nom_matiere", "Unknown Material")
     reference = fiche_adn_data.get("reference", "N/A")
     type_matiere = fiche_adn_data.get("type_matiere", "N/A")
     specifications = fiche_adn_data.get("specifications", {})
-    
-    # Build comprehensive prompt
     prompt = f"""# Material Application Analysis Request
-
-You are an industrial materials application engineer analyzing potential uses for a material.
-
-## Material Information
-- Name: {material_name}
-- Reference: {reference}
-- Type: {type_matiere}
-
-## Material Specifications (Fiche ADN)
-{json.dumps(specifications, indent=2, ensure_ascii=False)}
-
-## Company Context
-{company_context}
-
-## Analysis Requirements
-
-Please analyze this material and provide a comprehensive structured response with the following information:
-
-1. **Main Application Domains**: List the primary application areas where this material is generally used
-
-2. **Detailed Applications**: For each application, provide:
-   a. Application name and category
-   b. Industry/sector
-   c. Is it within AVOCarbon's current scope? (core_business / strategic_opportunity / outside_scope)
-   d. Priority level for AVOCarbon (1-5, where 5 is highest strategic importance)
-
-3. **Manufacturing Engagement**: For each application, describe:
-   a. Complete manufacturing/engagement process (step-by-step)
-   b. Specific role of the material in this application
-   c. Critical process parameters (temperature, pressure, time, etc.)
-
-4. **Required Properties**: For each application, list:
-   a. Critical material properties needed
-   b. Performance specifications
-   c. Why these properties matter for this application
-
-5. **Strategic Opportunities**: Identify:
-   a. Applications within AVOCarbon's current expertise that could be developed
-   b. New market opportunities adjacent to current business
-   c. Potential partnerships or technology transfers
-
-## Response Format
-
-Provide your response as a valid JSON object with this exact structure:
-
-```json
-{{
-  "material_summary": {{
-    "key_characteristics": ["list", "of", "key", "properties"],
-    "primary_domains": ["domain1", "domain2"]
-  }},
-  "applications": [
-    {{
-      "application_name": "string",
-      "application_category": "string (e.g., 'Carbon Brushes', 'Friction Materials')",
-      "industry_sector": "string",
-      "domain": "core_business | strategic_opportunity | outside_scope",
-      "priority_level": 1-5,
-      "engagement_process": {{
-        "process_description": "detailed string",
-        "steps": [
-          {{
-            "step_number": 1,
-            "step_name": "string",
-            "description": "string",
-            "parameters": {{"temperature": "value", "pressure": "value"}}
-          }}
-        ],
-        "material_role": "string describing the material's function"
-      }},
-      "required_properties": [
-        {{
-          "property_name": "string",
-          "importance": "critical | important | beneficial",
-          "target_value": "string or null",
-          "reason": "why this property matters"
-        }}
-      ],
-      "market_potential": {{
-        "current_market_size": "string estimate or 'unknown'",
-        "growth_trend": "growing | stable | declining | unknown",
-        "competitive_advantage": "string or null"
-      }}
-    }}
-  ],
-  "strategic_recommendations": {{
-    "within_scope": [
-      {{
-        "opportunity": "string",
-        "rationale": "string",
-        "development_effort": "low | medium | high"
-      }}
-    ],
-    "strategic_expansion": [
-      {{
-        "opportunity": "string",
-        "rationale": "string",
-        "requirements": "string"
-      }}
-    ]
-  }}
-}}
-```
-
-Please provide only the JSON response, without any markdown formatting or code blocks.
-"""
-    
+Material: {material_name} | Reference: {reference} | Type: {type_matiere}
+Company Context: {company_context}
+Specifications: {json.dumps(specifications, indent=2, ensure_ascii=False)}
+Provide a comprehensive JSON analysis with this structure:
+{{"material_summary": {{"key_characteristics": [], "primary_domains": []}}, "applications": [{{"application_name": "string", "application_category": "string", "industry_sector": "string", "domain": "core_business | strategic_opportunity | outside_scope", "priority_level": 1, "engagement_process": {{"process_description": "string", "steps": [], "material_role": "string"}}, "required_properties": [{{"property_name": "string", "importance": "critical", "reason": "string"}}], "market_potential": {{"growth_trend": "growing", "competitive_advantage": "string"}}}}], "strategic_recommendations": {{"within_scope": [{{"opportunity": "string", "rationale": "string", "development_effort": "low"}}], "strategic_expansion": [{{"opportunity": "string", "rationale": "string", "requirements": "string"}}]}}}}
+Respond ONLY with valid JSON."""
     try:
-        # Call Groq API with retry
-        response = call_groq_with_retry(
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert materials engineer specializing in industrial applications of carbon, graphite, and composite materials. You provide detailed, technically accurate analysis in structured JSON format."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.3,
-            max_tokens=8000,
-            response_format={"type": "json_object"}
-        )
-        
-        # Parse response
-        analysis_text = response.choices[0].message.content
-        analysis_data = json.loads(analysis_text)
-        
-        return {
-            "success": True,
-            "analysis": analysis_data,
-            "model_used": "llama-3.1-70b-versatile",
-            "prompt_tokens": response.usage.prompt_tokens,
-            "completion_tokens": response.usage.completion_tokens
-        }
-        
+        response = call_groq_with_retry(messages=[{"role": "system", "content": "You are an expert materials engineer. Respond only with valid JSON."}, {"role": "user", "content": prompt}], model="llama-3.3-70b-versatile", temperature=0.3, max_tokens=8000, response_format={"type": "json_object"})
+        analysis_data = json.loads(response.choices[0].message.content)
+        return {"success": True, "analysis": analysis_data, "model_used": "llama-3.3-70b-versatile"}
     except json.JSONDecodeError as e:
-        print(f"⚠️ JSON parsing error: {e}")
-        print(f"Raw response: {analysis_text[:500]}...")
-        return {
-            "success": False,
-            "error": "json_parse_error",
-            "message": str(e),
-            "raw_response": analysis_text[:1000]
-        }
+        return {"success": False, "error": "json_parse_error", "message": str(e)}
     except Exception as e:
-        print(f"⚠️ LLM generation error: {e}")
-        return {
-            "success": False,
-            "error": "llm_generation_failed",
-            "message": str(e)
-        }
+        return {"success": False, "error": "llm_generation_failed", "message": str(e)}
 
 
-def generate_application_analysis_docx_with_llm(fiche_data: Dict[str, Any], analysis_data: Dict[str, Any]) -> str:
-    """
-    Generate a formatted DOCX document with application analysis using LLM-generated content.
-    
-    Returns the filepath to the generated DOCX file.
-    """
+def generate_application_analysis_docx_with_llm(fiche_data, analysis_data):
     if not groq_client:
         raise Exception("Groq client not initialized")
-
-    # Build prompt for DOCX content generation
-    prompt = f"""
-You are a technical writer creating a professional DOCX report.
-Based on the material data and analysis JSON provided, generate the full markdown content for the report.
-Follow the requested structure exactly.
-
-## Material Data
-- Name: {fiche_data.get('nom_matiere', 'N/A')}
-- Reference: {fiche_data.get('reference', 'N/A')}
-
-## Analysis JSON
-```json
-{json.dumps(analysis_data, indent=2, ensure_ascii=False)}
-```
-
-## Report Structure
-
+    prompt = f"""Tu es un expert en formulation industrielle. Génère le contenu markdown complet d'un rapport d'analyse d'usage pour:
+- Matière: {fiche_data.get('nom_matiere', 'N/A')} (Ref: {fiche_data.get('reference', 'N/A')})
+Données d'analyse: {json.dumps(analysis_data, indent=2, ensure_ascii=False)}
+Structure requise:
 ### 1) Lecture rapide du matériau
-
-**Points clés issus de la fiche :**
-- [Liste des points clés, par exemple : Pureté carbone très élevée : 99,8 %, Faible teneur en cendres : 0,2 %, etc.]
-
-**Interprétation :**
-- [Interprétation détaillée, par exemple : Cela correspond à un graphite naturel de qualité industrielle fine, adapté à...]
-
-### 2) Domaines d’application principaux
-
-Pour chaque application (A, B, C, etc.) :
-
-**A) [Nom de l'application]**
-
-([Indication si l'application est cœur de métier, opportunité stratégique, etc. de votre groupe])
-
-**Engagement du matériau**
-- [Description détaillée du processus d'engagement du matériau, étape par étape]
-
-**Rôle du graphite**
-- [Description du rôle spécifique du matériau dans cette application]
-
-**Propriétés clés recherchées**
-- [Liste des propriétés clés, par exemple : Conductivité électrique, Faible friction, etc.]
-
-[Répéter la structure ci-dessus pour chaque application (B, C, D, etc.)]
-
+### 2) Domaines d'application principaux (A, B, C...)
 ### 3) Tableau de synthèse
-
-| Application | Process d’engagement | Rôle du graphite | Propriétés clés |
-|-------------|----------------------|------------------|-----------------|
-| [Application 1] | [Process 1] | [Rôle 1] | [Propriétés 1] |
-| [Application 2] | [Process 2] | [Rôle 2] | [Propriétés 2] |
-| ... | ... | ... | ... |
-
-### 4) Applications stratégiques hors cœur de métier (potentiel de développement)
-
-**Opportunités intéressantes**
-- [Liste des opportunités, par exemple : Plastiques conducteurs pour électronique, Bagues autolubrifiantes pour pompes industrielles, etc.]
-
+### 4) Applications stratégiques hors cœur de métier
 ### 5) Lecture stratégique pour votre groupe
-
-Ce type de graphite :
-- [Résumé de la pertinence du matériau pour AVOCarbon, par exemple : est un graphite de formulation (pas un graphite structurel massif)]
-- [Est idéal pour : balais carbone, composites autolubrifiants, plastiques techniques conducteurs]
-
-➡️ Il est parfaitement cohérent avec :
-- [Votre activité balais]
-- [Vos projets bushings]
-- [Vos pistes hors automobile]
-
-Please provide only the complete markdown content for the document body.
-"""
-
-    try:
-        response = call_groq_with_retry(
-            messages=[
-                {"role": "system", "content": "You are a technical writer that generates markdown content for reports."},
-                {"role": "user", "content": prompt}
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.2,
-            max_tokens=4000
-        )
-        
-        markdown_content = response.choices[0].message.content
-        
-        # Create DOCX from markdown
-        doc = Document()
-        doc.add_heading(f"Analyse d'usage du {fiche_data.get('nom_matiere', 'Matière')} {fiche_data.get('reference', 'N/A')}", level=1)
-        
-        add_formatted_markdown_to_docx(doc, markdown_content)
-        
-        # Save to temp_docx folder
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        ref_safe = fiche_data.get("reference", "material").replace(" ", "_")
-        filename = f"Analyse_{ref_safe}_{timestamp}.docx"
-        filepath = DOCX_TEMP_DIR / filename
-        
-        doc.save(str(filepath))
-        
-        return filename
-
-    except Exception as e:
-        print(f"⚠️ Error generating DOCX with LLM: {e}")
-        raise e
+Génère uniquement le contenu markdown."""
+    response = call_groq_with_retry(messages=[{"role": "system", "content": "You are a technical writer generating markdown content for reports."}, {"role": "user", "content": prompt}], model="llama-3.3-70b-versatile", temperature=0.2, max_tokens=4000)
+    markdown_content = response.choices[0].message.content
+    doc = Document()
+    doc.add_heading(f"Analyse d'usage du {fiche_data.get('nom_matiere', 'Matière')} {fiche_data.get('reference', 'N/A')}", level=1)
+    add_formatted_markdown_to_docx(doc, markdown_content)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ref_safe = fiche_data.get("reference", "material").replace(" ", "_")
+    filename = f"Analyse_{ref_safe}_{timestamp}.docx"
+    filepath = DOCX_TEMP_DIR / filename
+    doc.save(str(filepath))
+    return filename
 
 
 @app.route("/generate_application_analysis", methods=["POST"])
 def generate_application_analysis():
-    """
-    Generate application analysis for a material using LLM.
-    
-    Request body:
-        {
-            "reference": "material reference",
-            "company_context": "optional custom company context",
-            "save_to_db": true/false (default: true)
-        }
-    
-    Returns:
-        Structured application analysis with DOCX download link
-    """
     data = request.get_json() or {}
     reference = data.get("reference", "").strip()
     company_context = data.get("company_context")
     save_to_db = data.get("save_to_db", True)
-    
     if not reference:
-        return jsonify({
-            "success": False,
-            "error": "missing_parameters",
-            "message": "Parameter 'reference' is required"
-        }), 400
-    
+        return jsonify({"success": False, "error": "missing_parameters"}), 400
     conn = None
     try:
         conn = get_db_conn()
-        
-        # Fetch fiche ADN
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT 
-                    fiche_adn_id,
-                    matiere_id,
-                    nom_matiere,
-                    reference,
-                    type_matiere,
-                    specifications
-                FROM public.fiches_adn_matieres
-                WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
-                LIMIT 1
-            """, (reference,))
-            
+            cur.execute("SELECT fiche_adn_id, matiere_id, nom_matiere, reference, type_matiere, specifications FROM public.fiches_adn_matieres WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', '')) LIMIT 1", (reference,))
             fiche_adn = cur.fetchone()
-            
             if not fiche_adn:
-                return jsonify({
-                    "success": False,
-                    "error": "fiche_adn_not_found",
-                    "message": f"No fiche ADN found for reference: {reference}"
-                }), 404
-            
+                return jsonify({"success": False, "error": "fiche_adn_not_found"}), 404
             fiche_data = dict(fiche_adn)
-            
-            # Check if analysis already exists for this reference
-            cur.execute("""
-                SELECT fiche_app_id, analysis_data FROM public.fiches_applications_matieres
-                WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
-                LIMIT 1
-            """, (reference,))
-            
+            cur.execute("SELECT fiche_app_id, analysis_data FROM public.fiches_applications_matieres WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', '')) LIMIT 1", (reference,))
             existing = cur.fetchone()
             if existing:
-                # Return existing analysis instead of regenerating
                 existing_dict = dict(existing)
                 existing_analysis = existing_dict.get("analysis_data", {})
-                
-                # Generate DOCX if it doesn't exist
                 docx_filename = generate_application_analysis_docx_with_llm(fiche_data, existing_analysis)
-                # Force HTTPS for Azure deployment
                 protocol = request.headers.get("X-Forwarded-Proto", request.scheme)
                 if ".azurewebsites.net" in request.host or ".azure" in request.host:
                     protocol = "https"
                 download_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True, _scheme=protocol)
-                
-                return jsonify({
-                    "success": True,
-                    "message": "Analysis already exists for this reference",
-                    "analysis": existing_analysis,
-                    "fiche_app_id": existing_dict.get("fiche_app_id"),
-                    "docx_filename": docx_filename,
-                    "download_url": download_url,
-                    "is_existing": True
-                }), 200
-        
-        # Generate analysis using LLM
+                return jsonify({"success": True, "message": "Analysis already exists", "analysis": existing_analysis, "download_url": download_url, "is_existing": True}), 200
         analysis_result = generate_application_analysis_with_llm(fiche_data, company_context)
-        
         if not analysis_result.get("success"):
             return jsonify(analysis_result), 500
-        
-        # Save to database (only if it was already unique)
         if save_to_db:
             analysis_data = analysis_result["analysis"]
-            
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Get fiche_adn_id from fiches_ADN_matieres
-                cur.execute("""
-                    SELECT fiche_adn_id FROM public.fiches_adn_matieres
-                    WHERE matiere_id = %s
-                    LIMIT 1
-                """, (fiche_data["matiere_id"],))
-                
+                cur.execute("SELECT fiche_adn_id FROM public.fiches_adn_matieres WHERE matiere_id = %s LIMIT 1", (fiche_data["matiere_id"],))
                 fiche_adn_row = cur.fetchone()
                 fiche_adn_id = fiche_adn_row["fiche_adn_id"] if fiche_adn_row else None
-                
-                # Insert into fiches_applications_matieres (existing table)
-                cur.execute("""
-                    INSERT INTO public.fiches_applications_matieres
-                    (matiere_id, fiche_adn_id, nom_matiere, reference, type_matiere, 
-                     analysis_data, num_applications, date_creation, derniere_modification)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    RETURNING fiche_app_id
-                """, (
-                    fiche_data["matiere_id"],
-                    fiche_adn_id,
-                    fiche_data["nom_matiere"],
-                    fiche_data["reference"],
-                    fiche_data["type_matiere"],
-                    Json(analysis_data),
-                    len(analysis_data.get("applications", []))
-                ))
-                
+                cur.execute("INSERT INTO public.fiches_applications_matieres (matiere_id, fiche_adn_id, nom_matiere, reference, type_matiere, analysis_data, num_applications, date_creation, derniere_modification) VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING fiche_app_id",
+                            (fiche_data["matiere_id"], fiche_adn_id, fiche_data["nom_matiere"], fiche_data["reference"], fiche_data["type_matiere"], Json(analysis_data), len(analysis_data.get("applications", []))))
                 fiche_app_id = cur.fetchone()["fiche_app_id"]
-                
                 conn.commit()
-                
                 analysis_result["fiche_app_id"] = fiche_app_id
                 analysis_result["saved_to_database"] = True
-        
-        # Generate DOCX
         docx_filename = generate_application_analysis_docx_with_llm(fiche_data, analysis_result["analysis"])
-        # Force HTTPS for Azure deployment
         protocol = request.headers.get("X-Forwarded-Proto", request.scheme)
         if ".azurewebsites.net" in request.host or ".azure" in request.host:
             protocol = "https"
         download_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True, _scheme=protocol)
-        
         analysis_result["docx_filename"] = docx_filename
         analysis_result["download_url"] = download_url
-        
         return jsonify(analysis_result), 200
-        
     except Exception as e:
         if conn:
             conn.rollback()
-        print(f"⚠️ Error generating application analysis: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": "analysis_generation_failed",
-            "message": str(e)
-        }), 500
+        return jsonify({"success": False, "error": "analysis_generation_failed", "message": str(e)}), 500
     finally:
         if conn:
             conn.close()
@@ -2453,98 +975,36 @@ def generate_application_analysis():
 
 @app.route("/application_analysis", methods=["GET"])
 def get_application_analysis():
-    """
-    Retrieve application analysis for a material by reference.
-    
-    Query parameters:
-        - reference: Material reference code (required)
-        - include_sessions: true/false (include all analysis sessions)
-        - include_steps: true/false (include detailed process steps)
-    
-    Returns:
-        Complete application analysis with DOCX download link
-    """
     reference = request.args.get("reference", "").strip()
     include_sessions = request.args.get("include_sessions", "false").lower() == "true"
     include_steps = request.args.get("include_steps", "true").lower() == "true"
-    
     if not reference:
-        return jsonify({
-            "success": False,
-            "error": "missing_parameters",
-            "message": "Query parameter 'reference' is required"
-        }), 400
-    
+        return jsonify({"success": False, "error": "missing_parameters"}), 400
     conn = None
     try:
         conn = get_db_conn()
-        
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Get material info via reference
-            cur.execute("""
-                SELECT m.matiere_id, m.nom_matiere, m.reference, m.type_matiere
-                FROM public.matieres m
-                WHERE UPPER(REPLACE(TRIM(m.reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
-                LIMIT 1
-            """, (reference,))
-            
+            cur.execute("SELECT m.matiere_id, m.nom_matiere, m.reference, m.type_matiere FROM public.matieres m WHERE UPPER(REPLACE(TRIM(m.reference), ' ', '')) = UPPER(REPLACE(%s, ' ', '')) LIMIT 1", (reference,))
             material = cur.fetchone()
             if not material:
-                return jsonify({
-                    "success": False,
-                    "error": "material_not_found",
-                    "message": f"Material with reference {reference} not found"
-                }), 404
-            
+                return jsonify({"success": False, "error": "material_not_found"}), 404
             material = dict(material)
             matiere_id = material["matiere_id"]
-            
-            # Get analyses from fiches_applications_matieres
-            cur.execute("""
-                SELECT 
-                    fiche_app_id,
-                    fiche_adn_id,
-                    analysis_data,
-                    num_applications,
-                    date_creation,
-                    derniere_modification
-                FROM public.fiches_applications_matieres
-                WHERE matiere_id = %s
-                ORDER BY date_creation DESC
-            """, (matiere_id,))
-            
+            cur.execute("SELECT fiche_app_id, fiche_adn_id, analysis_data, num_applications, date_creation, derniere_modification FROM public.fiches_applications_matieres WHERE matiere_id = %s ORDER BY date_creation DESC", (matiere_id,))
             fiches = [dict(row) for row in cur.fetchall()]
-            
-            # Get latest analysis
             latest_analysis = fiches[0] if fiches else None
             applications = []
-            
             if latest_analysis:
                 analysis_data = latest_analysis.get("analysis_data", {})
                 applications = analysis_data.get("applications", [])
-            
-            # Process steps are already in the JSON structure
             if include_steps and applications:
                 for app in applications:
                     process = app.get("engagement_process", {})
                     app["process_steps"] = process.get("steps", [])
-            
-            # Include all fiches if requested
-            sessions = fiches if include_sessions else []
-            
-            # Build summary from JSON data
-            summary = {
-                "total_applications": len(applications),
-                "by_domain": {},
-                "by_priority": {"high": 0, "medium": 0, "low": 0},
-                "total_analyses": len(fiches)
-            }
-            
-            # Count by domain and priority from applications
+            summary = {"total_applications": len(applications), "by_domain": {}, "by_priority": {"high": 0, "medium": 0, "low": 0}, "total_analyses": len(fiches)}
             for app in applications:
                 domain = app.get("domain", "unknown")
                 summary["by_domain"][domain] = summary["by_domain"].get(domain, 0) + 1
-                
                 priority = app.get("priority_level", 0)
                 if priority >= 4:
                     summary["by_priority"]["high"] += 1
@@ -2552,173 +1012,125 @@ def get_application_analysis():
                     summary["by_priority"]["medium"] += 1
                 else:
                     summary["by_priority"]["low"] += 1
-            
-            # Generate DOCX if analysis exists
             docx_url = None
             if latest_analysis:
                 fiche_data = dict(material)
-                fiche_data["nom_matiere"] = material.get("nom_matiere", "")
-                analysis_json = latest_analysis.get("analysis_data", {})
-                
-                docx_filename = generate_application_analysis_docx_with_llm(fiche_data, analysis_json)
-                # Force HTTPS for Azure deployment
+                docx_filename = generate_application_analysis_docx_with_llm(fiche_data, latest_analysis.get("analysis_data", {}))
                 protocol = request.headers.get("X-Forwarded-Proto", request.scheme)
                 if ".azurewebsites.net" in request.host or ".azure" in request.host:
                     protocol = "https"
                 docx_url = url_for('download_fiche_adn_docx', filename=docx_filename, _external=True, _scheme=protocol)
-            
-            return jsonify({
-                "success": True,
-                "material": material,
-                "applications": applications,
-                "analysis_sessions": sessions if include_sessions else None,
-                "summary": summary,
-                "docx_download_url": docx_url
-            }), 200
-            
+            return jsonify({"success": True, "material": material, "applications": applications, "analysis_sessions": fiches if include_sessions else None, "summary": summary, "docx_download_url": docx_url}), 200
     except Exception as e:
-        print(f"⚠️ Error retrieving application analysis: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": "retrieval_failed",
-            "message": str(e)
-        }), 500
+        return jsonify({"success": False, "error": "retrieval_failed", "message": str(e)}), 500
     finally:
         if conn:
             conn.close()
 
 
 # =============================================================================
-# BLACK MIX CRUD ENDPOINTS
+# BLACK MIX — CORE HELPERS
 # =============================================================================
 
-def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name):
-    """
-    Build complete JSON snapshot (ADN) of Black Mix for archiving/export/PDF generation.
-    Uses existing database cursor to gather all related data.
-    """
-    
-    # ── Black Mix header + revision history ──
-    cur.execute(
-        "SELECT document_revision_history FROM public.black_mixes WHERE id = %s",
-        (black_mix_id,)
-    )
+def resolve_ref_lookup(cur, components):
+    ref_lookup = {}
+    validation_errors = []
+    for component in components:
+        ref = component.get("reference")
+        if not ref:
+            validation_errors.append("Component missing reference")
+            continue
+        if ref in ref_lookup:
+            continue
+        cur.execute("SELECT id FROM public.black_mixes WHERE reference = %s LIMIT 1", (ref,))
+        bm_row = cur.fetchone()
+        if bm_row:
+            ref_lookup[ref] = {"type": "black_mix", "id": bm_row[0]}
+            continue
+        cur.execute("SELECT matiere_id FROM public.matieres WHERE reference = %s LIMIT 1", (ref,))
+        mat_row = cur.fetchone()
+        if mat_row:
+            ref_lookup[ref] = {"type": "matiere", "id": mat_row[0]}
+            continue
+        validation_errors.append(f"Reference '{ref}' not found in black_mixes or matieres")
+    return ref_lookup, validation_errors
+
+
+def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name, _visited=None):
+    if _visited is None:
+        _visited = set()
+    if black_mix_id in _visited:
+        return {"black_mix_id": black_mix_id, "product_reference": product_reference, "mix_name": mix_name, "error": "Circular reference detected — snapshot truncated here"}
+    _visited.add(black_mix_id)
+    cur.execute("SELECT document_revision_history FROM public.black_mixes WHERE id = %s", (black_mix_id,))
     bm_row = cur.fetchone()
     revision_history = bm_row[0] if bm_row and bm_row[0] else None
+    cur.execute("""
+        SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit, c.metadata,
+               c.matiere_id, c.sub_black_mix_id,
+               m.reference AS matiere_reference, m.nom_matiere AS matiere_name,
+               bm.reference AS sub_bm_reference, bm.name AS sub_bm_name
+        FROM public.black_mix_components c
+        LEFT JOIN public.matieres m ON m.matiere_id = c.matiere_id
+        LEFT JOIN public.black_mixes bm ON bm.id = c.sub_black_mix_id
+        WHERE c.black_mix_id = %s ORDER BY c.id
+    """, (black_mix_id,))
+    raw_components = cur.fetchall()
+    components = []
+    for r in raw_components:
+        (comp_id, component_name, qty, unit, metadata, matiere_id, sub_bm_id, matiere_ref, matiere_name, sub_bm_ref, sub_bm_name) = r
+        is_sub = sub_bm_id is not None
+        entry = {"id": comp_id, "component_name": component_name, "quantity": float(qty) if qty is not None else None, "unit": unit, "metadata": metadata, "is_sub_black_mix": is_sub, "reference": sub_bm_ref if is_sub else matiere_ref, "material_name": sub_bm_name if is_sub else matiere_name, "sub_black_mix_id": sub_bm_id, "matiere_id": matiere_id, "sub_black_mix_adn": None}
+        if is_sub:
+            entry["sub_black_mix_adn"] = build_black_mix_adn_snapshot(cur, sub_bm_id, sub_bm_ref, sub_bm_name, _visited=set(_visited))
+        components.append(entry)
+    cur.execute("SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters FROM public.black_mix_process_steps s WHERE s.black_mix_id = %s ORDER BY s.step_order", (black_mix_id,))
+    steps_raw = cur.fetchall()
+    process_steps = []
+    for s in steps_raw:
+        step_id, step_order, step_name, machine, parameters = s
+        cur.execute("""
+            SELECT sm.matiere_id, sm.sub_black_mix_id, m.reference AS matiere_ref, bm.reference AS sub_bm_ref
+            FROM public.black_mix_step_materials sm
+            LEFT JOIN public.matieres m ON m.matiere_id = sm.matiere_id
+            LEFT JOIN public.black_mixes bm ON bm.id = sm.sub_black_mix_id
+            WHERE sm.process_step_id = %s
+        """, (step_id,))
+        step_mat_refs = [sm[3] if sm[1] is not None else sm[2] for sm in cur.fetchall() if (sm[3] if sm[1] is not None else sm[2])]
+        process_steps.append({"step_order": step_order, "step_name": step_name, "machine": machine, "parameters": parameters, "materials": step_mat_refs})
+    cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit FROM public.black_mix_control_plan WHERE black_mix_id = %s ORDER BY parameter_name", (black_mix_id,))
+    control_plan = [{"parameter_name": r[0], "target_value": float(r[1]) if r[1] is not None else None, "min_value": float(r[2]) if r[2] is not None else None, "max_value": float(r[3]) if r[3] is not None else None, "unit": r[4]} for r in cur.fetchall()]
 
-    # ── Components ──
-    cur.execute(
-        """SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit,
-                  m.reference, m.nom_matiere, c.metadata
-           FROM public.black_mix_components c
-           JOIN public.matieres m ON c.matiere_id = m.matiere_id
-           WHERE c.black_mix_id = %s
-           ORDER BY c.id""",
-        (black_mix_id,)
-    )
-    components = [
-        {
-            "id": r[0],
-            "component_name": r[1],
-            "quantity": float(r[2]) if r[2] is not None else None,
-            "unit": r[3],
-            "reference": r[4],
-            "material_name": r[5],
-            "metadata": r[6]
-        }
-        for r in cur.fetchall()
-    ]
+    def flatten(comp_list, depth=0):
+        flat = []
+        for c in comp_list:
+            flat.append({**c, "depth": depth, "sub_black_mix_adn": None})
+            if c["is_sub_black_mix"] and c["sub_black_mix_adn"]:
+                flat.extend(flatten(c["sub_black_mix_adn"].get("composition", []), depth + 1))
+        return flat
 
-    # ── Process steps + step materials ──
-    cur.execute(
-        """SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters,
-                  ARRAY_AGG(m.reference ORDER BY m.reference) AS materials
-           FROM public.black_mix_process_steps s
-           LEFT JOIN public.black_mix_step_materials sm ON sm.process_step_id = s.id
-           LEFT JOIN public.matieres m ON m.matiere_id = sm.matiere_id
-           WHERE s.black_mix_id = %s
-           GROUP BY s.id
-           ORDER BY s.step_order""",
-        (black_mix_id,)
-    )
-    process_steps = [
-        {
-            "step_order": r[1],
-            "step_name": r[2],
-            "machine": r[3],
-            "parameters": r[4],
-            "materials": list(r[5]) if r[5] and r[5][0] is not None else []
-        }
-        for r in cur.fetchall()
-    ]
+    return {"black_mix_id": black_mix_id, "product_reference": product_reference, "mix_name": mix_name, "status": "draft", "document_revision_history": revision_history, "created_at": datetime.now().isoformat(), "composition": components, "composition_flat": flatten(components), "process_steps": process_steps, "step_materials": {str(s["step_order"]): s["materials"] for s in process_steps}, "control_plan": control_plan, "snapshot_timestamp": datetime.now().isoformat()}
 
-    step_materials = {}
-    for step in process_steps:
-        step_materials[str(step["step_order"])] = step["materials"]
 
-    # ── Control plan ──
-    cur.execute(
-        """SELECT parameter_name, target_value, min_value, max_value, unit
-           FROM public.black_mix_control_plan
-           WHERE black_mix_id = %s
-           ORDER BY parameter_name""",
-        (black_mix_id,)
-    )
-    control_plan = [
-        {
-            "parameter_name": r[0],
-            "target_value": float(r[1]) if r[1] is not None else None,
-            "min_value": float(r[2]) if r[2] is not None else None,
-            "max_value": float(r[3]) if r[3] is not None else None,
-            "unit": r[4]
-        }
-        for r in cur.fetchall()
-    ]
-
-    return {
-        "black_mix_id": black_mix_id,
-        "product_reference": product_reference,
-        "mix_name": mix_name,
-        "status": "draft",
-        "document_revision_history": revision_history,  # ← ajouté
-        "created_at": datetime.now().isoformat(),
-        "composition": components,
-        "process_steps": process_steps,
-        "step_materials": step_materials,
-        "control_plan": control_plan,
-        "snapshot_timestamp": datetime.now().isoformat()
-    }
-
+# =============================================================================
+# BLACK MIX — ENDPOINTS
+# =============================================================================
 
 @app.route("/black-mix/validate-material/<reference>", methods=["GET"])
 def validate_black_mix_material(reference):
-    """Validate if a material reference exists in the database."""
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT matiere_id, nom_matiere, reference FROM public.matieres WHERE reference = %s",
-                (reference,)
-            )
-            row = cur.fetchone()
-            if row:
-                return jsonify({
-                    "reference": reference,
-                    "exists": True,
-                    "material_name": row[1],
-                    "matiere_id": row[0]
-                }), 200
-            else:
-                return jsonify({
-                    "reference": reference,
-                    "exists": False,
-                    "material_name": None,
-                    "matiere_id": None
-                }), 200
+            cur.execute("SELECT id, name FROM public.black_mixes WHERE reference = %s LIMIT 1", (reference,))
+            bm_row = cur.fetchone()
+            if bm_row:
+                return jsonify({"reference": reference, "exists": True, "component_type": "black_mix", "material_name": bm_row[1], "id": bm_row[0]}), 200
+            cur.execute("SELECT matiere_id, nom_matiere FROM public.matieres WHERE reference = %s LIMIT 1", (reference,))
+            mat_row = cur.fetchone()
+            if mat_row:
+                return jsonify({"reference": reference, "exists": True, "component_type": "matiere", "material_name": mat_row[1], "id": mat_row[0]}), 200
+            return jsonify({"reference": reference, "exists": False, "component_type": None, "material_name": None, "id": None}), 200
     except Exception as e:
-        logging.error(f"Validate material error: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
         conn.close()
@@ -2726,30 +1138,596 @@ def validate_black_mix_material(reference):
 
 @app.route("/black-mix/submit", methods=["POST"])
 def submit_black_mix():
-    """Submit a complete Black Mix with components, process steps, and control plan."""
-
     if not request.is_json:
-        return jsonify({
-            "success": False,
-            "error": "Request body must be JSON"
-        }), 400
-
+        return jsonify({"success": False, "error": "Request body must be JSON"}), 400
     data = request.get_json()
-
     product_reference = data.get("product_reference")
     mix_name = data.get("mix_name")
     components = data.get("components", [])
     process_steps = data.get("process_steps", [])
+    step_materials_map = data.get("step_materials", {})
     control_plan = data.get("control_plan", [])
     document_revision_history = data.get("document_revision_history")
-
-    # ------------------------------
-    # Basic validation
-    # ------------------------------
     if not product_reference or not mix_name:
+        return jsonify({"success": False, "error": "product_reference and mix_name are required"}), 400
+    if not process_steps:
+        return jsonify({"success": False, "error": "At least one process_step is required"}), 400
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                ref_lookup, validation_errors = resolve_ref_lookup(cur, components)
+                if validation_errors:
+                    return jsonify({"success": False, "validation_errors": validation_errors}), 400
+                all_step_refs = {ref for refs in step_materials_map.values() for ref in refs if ref}
+                extra_refs = all_step_refs - set(ref_lookup.keys())
+                if extra_refs:
+                    extra_lookup, extra_errors = resolve_ref_lookup(cur, [{"reference": r} for r in extra_refs])
+                    if extra_errors:
+                        return jsonify({"success": False, "validation_errors": extra_errors}), 400
+                    ref_lookup.update(extra_lookup)
+                cur.execute("INSERT INTO public.black_mixes (reference, name, status, created_at, document_revision_history) VALUES (%s, %s, 'draft', NOW(), %s) RETURNING id",
+                            (product_reference, mix_name, Json(document_revision_history) if document_revision_history else None))
+                black_mix_id = cur.fetchone()[0]
+                for component in components:
+                    ref = component.get("reference")
+                    resolved = ref_lookup[ref]
+                    cur.execute("INSERT INTO public.black_mix_components (black_mix_id, matiere_id, sub_black_mix_id, component_name, quantity_value, quantity_unit, metadata) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                                (black_mix_id, resolved["id"] if resolved["type"] == "matiere" else None, resolved["id"] if resolved["type"] == "black_mix" else None, component.get("component_name") or ref, component.get("quantity"), component.get("unit", "kg"), Json(component.get("metadata", {}))))
+                for step in process_steps:
+                    step_order = step.get("step_order")
+                    cur.execute("INSERT INTO public.black_mix_process_steps (black_mix_id, step_order, step_name, machine_name, parameters) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                                (black_mix_id, step_order, step.get("step_name"), step.get("machine"), Json(step.get("parameters", {}))))
+                    process_step_id = cur.fetchone()[0]
+                    refs_for_step = step_materials_map.get(str(step_order), [])
+                    if not refs_for_step:
+                        raise ValueError(f"Step '{step.get('step_name')}' (order {step_order}) has no materials in step_materials")
+                    seen_ids = set()
+                    for ref in refs_for_step:
+                        if not ref:
+                            continue
+                        resolved = ref_lookup.get(ref)
+                        if not resolved:
+                            raise ValueError(f"Reference '{ref}' in step_materials not found")
+                        dedup_key = (resolved["type"], resolved["id"])
+                        if dedup_key in seen_ids:
+                            continue
+                        seen_ids.add(dedup_key)
+                        if resolved["type"] == "matiere":
+                            cur.execute("INSERT INTO public.black_mix_step_materials (process_step_id, matiere_id, created_at) VALUES (%s, %s, NOW())", (process_step_id, resolved["id"]))
+                        else:
+                            cur.execute("INSERT INTO public.black_mix_step_materials (process_step_id, sub_black_mix_id, created_at) VALUES (%s, %s, NOW())", (process_step_id, resolved["id"]))
+                for param in control_plan:
+                    cur.execute("INSERT INTO public.black_mix_control_plan (black_mix_id, parameter_name, target_value, min_value, max_value, unit) VALUES (%s, %s, %s, %s, %s, %s)",
+                                (black_mix_id, param.get("parameter_name"), param.get("target_value"), param.get("min_value"), param.get("max_value"), param.get("unit")))
+                adn_snapshot = build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
+                cur.execute("INSERT INTO public.black_mix_adn (black_mix_id, adn_text, version, created_at) VALUES (%s, %s, 1, NOW()) RETURNING id", (black_mix_id, Json(adn_snapshot)))
+                adn_id = cur.fetchone()[0]
+                return jsonify({"success": True, "message": f"Black Mix '{mix_name}' created successfully", "black_mix_id": black_mix_id, "product_reference": product_reference, "component_types": {ref: info["type"] for ref, info in ref_lookup.items()}, "adn": {"id": adn_id, "version": 1}}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/black-mix/list", methods=["GET"])
+def list_black_mixes():
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, reference, name, status, created_at FROM public.black_mixes ORDER BY created_at DESC")
+            rows = cur.fetchall()
+            return jsonify({"success": True, "black_mixes": [{"id": r[0], "product_reference": r[1], "mix_name": r[2], "status": r[3], "created_at": r[4].isoformat() if r[4] else None} for r in rows]}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/black-mix/<int:mix_id>", methods=["GET"])
+def get_black_mix_details(mix_id):
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, reference, name, status, created_at, document_revision_history FROM public.black_mixes WHERE id = %s", (mix_id,))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"success": False, "error": "Black Mix not found"}), 404
+            result = {"id": row[0], "product_reference": row[1], "mix_name": row[2], "status": row[3], "created_at": row[4].isoformat() if row[4] else None, "document_revision_history": row[5]}
+            cur.execute("""
+                SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit, c.matiere_id, c.sub_black_mix_id, c.metadata,
+                       m.reference AS matiere_ref, m.nom_matiere AS matiere_name,
+                       bm.reference AS sub_bm_ref, bm.name AS sub_bm_name
+                FROM public.black_mix_components c
+                LEFT JOIN public.matieres m ON m.matiere_id = c.matiere_id
+                LEFT JOIN public.black_mixes bm ON bm.id = c.sub_black_mix_id
+                WHERE c.black_mix_id = %s ORDER BY c.id
+            """, (mix_id,))
+            result["components"] = []
+            for r in cur.fetchall():
+                is_sub = r[5] is not None
+                result["components"].append({"id": r[0], "component_name": r[1], "quantity": float(r[2]) if r[2] is not None else None, "unit": r[3], "is_sub_black_mix": is_sub, "reference": r[9] if is_sub else r[7], "material_name": r[10] if is_sub else r[8], "matiere_id": r[4], "sub_black_mix_id": r[5], "metadata": r[6]})
+            cur.execute("""
+                SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters,
+                       ARRAY_AGG(COALESCE(bm.reference, m.reference) ORDER BY COALESCE(bm.reference, m.reference)) AS materials
+                FROM public.black_mix_process_steps s
+                LEFT JOIN public.black_mix_step_materials sm ON sm.process_step_id = s.id
+                LEFT JOIN public.matieres m ON m.matiere_id = sm.matiere_id
+                LEFT JOIN public.black_mixes bm ON bm.id = sm.sub_black_mix_id
+                WHERE s.black_mix_id = %s GROUP BY s.id ORDER BY s.step_order
+            """, (mix_id,))
+            result["process_steps"] = [{"step_order": r[1], "step_name": r[2], "machine": r[3], "parameters": r[4], "materials": [x for x in (r[5] or []) if x is not None]} for r in cur.fetchall()]
+            cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit FROM public.black_mix_control_plan WHERE black_mix_id = %s", (mix_id,))
+            result["control_plan"] = [{"parameter_name": r[0], "target_value": float(r[1]) if r[1] else None, "min_value": float(r[2]) if r[2] else None, "max_value": float(r[3]) if r[3] else None, "unit": r[4]} for r in cur.fetchall()]
+            return jsonify({"success": True, "black_mix": result}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/black-mix/<int:mix_id>/adn", methods=["GET"])
+def get_black_mix_adn(mix_id):
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, black_mix_id, adn_text, version, created_at FROM public.black_mix_adn WHERE black_mix_id = %s ORDER BY version DESC LIMIT 1", (mix_id,))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"success": False, "error": "ADN not found for this Black Mix"}), 404
+            adn_id, black_mix_id, adn_text, version, created_at = row
+            return jsonify({"success": True, "adn": {"id": adn_id, "black_mix_id": black_mix_id, "version": version, "created_at": created_at.isoformat() if created_at else None, "snapshot": adn_text}}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/black-mix/<int:mix_id>/adn-enriched", methods=["GET"])
+def get_black_mix_adn_enriched(mix_id):
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT id, reference, name, status, document_revision_history FROM black_mixes WHERE id = %s", (mix_id,))
+                black_mix = cur.fetchone()
+                if not black_mix:
+                    return jsonify({"error": "Black mix not found"}), 404
+                cur.execute("""
+                    SELECT c.matiere_id, c.sub_black_mix_id, c.component_name, c.quantity_value, c.quantity_unit, c.metadata,
+                           m.reference, m.nom_matiere, m.type_matiere,
+                           bm.reference AS sub_bm_ref, bm.name AS sub_bm_name, f.specifications
+                    FROM black_mix_components c
+                    LEFT JOIN matieres m ON m.matiere_id = c.matiere_id
+                    LEFT JOIN black_mixes bm ON bm.id = c.sub_black_mix_id
+                    LEFT JOIN fiches_adn_matieres f ON f.matiere_id = c.matiere_id
+                    WHERE c.black_mix_id = %s
+                """, (mix_id,))
+                components = cur.fetchall()
+                for c in components:
+                    if not c["specifications"]:
+                        c["specifications"] = "Information non disponible"
+                cur.execute("SELECT id, step_order, step_name, machine_name, parameters FROM black_mix_process_steps WHERE black_mix_id = %s ORDER BY step_order", (mix_id,))
+                process_steps = cur.fetchall()
+                cur.execute("""
+                    SELECT sm.process_step_id, COALESCE(bm.reference, m.reference) AS reference, COALESCE(bm.name, m.nom_matiere) AS nom_matiere
+                    FROM black_mix_step_materials sm
+                    JOIN black_mix_process_steps ps ON ps.id = sm.process_step_id
+                    LEFT JOIN matieres m ON m.matiere_id = sm.matiere_id
+                    LEFT JOIN black_mixes bm ON bm.id = sm.sub_black_mix_id
+                    WHERE ps.black_mix_id = %s
+                """, (mix_id,))
+                step_materials = cur.fetchall()
+                materials_by_step = {}
+                for row in step_materials:
+                    materials_by_step.setdefault(row["process_step_id"], []).append({"reference": row["reference"], "nom_matiere": row["nom_matiere"]})
+                for step in process_steps:
+                    step["materials"] = materials_by_step.get(step["id"], [])
+                cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit FROM black_mix_control_plan WHERE black_mix_id = %s", (mix_id,))
+                control_plan = cur.fetchall()
+                data_for_ai = {"black_mix_identity": {"reference": black_mix["reference"], "name": black_mix["name"], "status": black_mix["status"], "revision_history": black_mix["document_revision_history"]}, "components": components, "process_steps": process_steps, "step_materials": step_materials, "control_plan": control_plan}
+                prompt = f"""Tu es un expert en formulation industrielle de matériaux carbone et graphite.
+Génère un "Rapport Technique BLACK MIX ADN" en suivant STRICTEMENT cette structure:
+#### 1. Introduction
+#### 2. Identité et Vue d'ensemble du Black Mix
+#### 3. Architecture et Processus du Black Mix
+#### 4. ADN Détaillé des Composants
+#### 5. Synthèse de l'Identité Structurelle
+RÈGLES: Aucune hallucination. Langue: Français. Style professionnel.
+### DONNÉES SOURCE (JSON):
+{json.dumps(data_for_ai, indent=2, ensure_ascii=False)}"""
+                ai_response = call_groq_with_retry(messages=[{"role": "system", "content": "Tu es un expert en formulation industrielle."}, {"role": "user", "content": prompt}], model="llama-3.3-70b-versatile", temperature=0.2, max_tokens=6000)
+                return jsonify({"black_mix": black_mix, "source_data": data_for_ai, "ai_analysis": ai_response.choices[0].message.content if ai_response.choices else ""}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/black-mix/<int:mix_id>/adn-combined", methods=["GET"])
+def get_black_mix_adn_combined(mix_id):
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, reference, name, status, created_at, document_revision_history FROM public.black_mixes WHERE id = %s", (mix_id,))
+            bm = cur.fetchone()
+            if not bm:
+                return jsonify({"success": False, "error": "Black Mix not found"}), 404
+            black_mix_info = {"id": bm[0], "product_reference": bm[1], "mix_name": bm[2], "status": bm[3], "created_at": bm[4].isoformat() if bm[4] else None, "document_revision_history": bm[5]}
+            cur.execute("SELECT adn_text, version, created_at FROM public.black_mix_adn WHERE black_mix_id = %s ORDER BY version DESC LIMIT 1", (mix_id,))
+            adn_row = cur.fetchone()
+            if not adn_row:
+                return jsonify({"success": False, "error": "ADN not found for this Black Mix"}), 404
+            base_adn = adn_row[0]
+            adn_version = adn_row[1]
+            adn_created = adn_row[2].isoformat() if adn_row[2] else None
+            components_combined = []
+            for comp in base_adn.get("composition", []):
+                ref = comp.get("reference")
+                entry = {"reference": ref, "material_name": comp.get("material_name", comp.get("component_name", "")), "quantity": comp.get("quantity"), "unit": comp.get("unit"), "metadata": comp.get("metadata", {}), "is_sub_black_mix": comp.get("is_sub_black_mix", False), "adn_matiere": None}
+                if ref and not comp.get("is_sub_black_mix"):
+                    cur.execute("SELECT fiche_adn_id, nom_matiere, type_matiere, specifications, num_specifications FROM public.fiches_adn_matieres WHERE reference = %s LIMIT 1", (ref,))
+                    adn_row2 = cur.fetchone()
+                    if adn_row2:
+                        entry["adn_matiere"] = {"fiche_adn_id": adn_row2[0], "nom_matiere": adn_row2[1], "type_matiere": adn_row2[2], "specifications": adn_row2[3], "num_specifications": adn_row2[4]}
+                if comp.get("is_sub_black_mix") and comp.get("sub_black_mix_adn"):
+                    entry["sub_black_mix_adn"] = comp["sub_black_mix_adn"]
+                components_combined.append(entry)
+            process_steps_combined = []
+            for step in base_adn.get("process_steps", []):
+                mat_refs = step.get("materials", [])
+                materials_detail = []
+                for mref in mat_refs:
+                    if not mref:
+                        continue
+                    mat_info = {"reference": mref}
+                    for cc in components_combined:
+                        if cc["reference"] == mref:
+                            mat_info.update({"material_name": cc["material_name"], "quantity": cc["quantity"], "unit": cc["unit"], "is_sub_black_mix": cc["is_sub_black_mix"]})
+                            break
+                    materials_detail.append(mat_info)
+                process_steps_combined.append({"step_order": step.get("step_order"), "step_name": step.get("step_name"), "machine": step.get("machine"), "parameters": step.get("parameters"), "material_references": mat_refs, "materials_detail": materials_detail})
+            return jsonify({"success": True, "black_mix": black_mix_info, "adn_version": adn_version, "adn_created_at": adn_created, "composition": components_combined, "composition_flat": base_adn.get("composition_flat", []), "process_steps": process_steps_combined, "control_plan": base_adn.get("control_plan", [])}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# NUANCES — CORE HELPERS
+# =============================================================================
+
+def get_matiere_full_adn(cur, matiere_id, reference=None):
+    if not matiere_id:
+        return None
+    cur.execute("""
+        SELECT fiche_adn_id, nom_matiere, material_name, reference, type_matiere,
+               specifications, num_specifications, date_creation, derniere_modification
+        FROM public.fiches_adn_matieres WHERE matiere_id = %s LIMIT 1
+    """, (matiere_id,))
+    row = cur.fetchone()
+    fiche_adn = dict(row) if row else None
+    cur.execute("SELECT fiche_id FROM public.fiches_matieres WHERE matiere_id = %s ORDER BY fiche_id DESC", (matiere_id,))
+    fiche_rows = cur.fetchall()
+    specs = []
+    for fr in fiche_rows:
+        fiche_id = fr["fiche_id"] if isinstance(fr, dict) else fr[0]
+        cur.execute("SELECT spec_id, fiche_id, source_type, donnees, date_creation, derniere_modification FROM public.specifications WHERE fiche_id = %s ORDER BY spec_id", (fiche_id,))
+        specs.extend([dict(s) for s in cur.fetchall()])
+    cur.execute("""
+        SELECT men.id, men.matiere_image_id, men.note_json, men.created_at, mi.image_path
+        FROM public.matiere_expert_notes men
+        INNER JOIN public.matiere_images mi ON mi.id = men.matiere_image_id
+        WHERE mi.matiere_id = %s ORDER BY men.created_at DESC
+    """, (matiere_id,))
+    expert_notes = [dict(r) for r in cur.fetchall()]
+    return {"matiere_id": matiere_id, "fiche_adn": fiche_adn, "specifications": specs, "expert_notes": expert_notes, "summary": {"num_specifications": len(specs), "num_expert_notes": len(expert_notes)}}
+
+
+def resolve_nuance_ref_lookup(cur, components):
+    ref_lookup = {}
+    validation_errors = []
+    for component in components:
+        ref = component.get("reference")
+        if not ref:
+            validation_errors.append("Component missing reference")
+            continue
+        if ref in ref_lookup:
+            continue
+        cur.execute("SELECT id FROM public.nuances WHERE reference = %s LIMIT 1", (ref,))
+        row = cur.fetchone()
+        if row:
+            ref_lookup[ref] = {"type": "nuance", "id": row[0]}
+            continue
+        cur.execute("SELECT id FROM public.black_mixes WHERE reference = %s LIMIT 1", (ref,))
+        row = cur.fetchone()
+        if row:
+            ref_lookup[ref] = {"type": "black_mix", "id": row[0]}
+            continue
+        cur.execute("SELECT matiere_id FROM public.matieres WHERE reference = %s LIMIT 1", (ref,))
+        row = cur.fetchone()
+        if row:
+            ref_lookup[ref] = {"type": "matiere", "id": row[0]}
+            continue
+        validation_errors.append(f"Reference '{ref}' not found in nuances, black_mixes or matieres")
+    return ref_lookup, validation_errors
+
+
+# =============================================================================
+# CUISSON PROGRAMS — HELPERS (UPDATED)
+# =============================================================================
+
+def parse_warne_nachbehandlung(raw_value: str):
+    """
+    Parse '101 25' → (program_number='101', h2_percent=25)
+    Formats number as zero-padded string: '1' → '001', '101' → '101'
+    K-type kept as-is: 'K000' → 'K000'
+    """
+    if not raw_value or not raw_value.strip():
+        return None, None
+    parts = raw_value.strip().split()
+    try:
+        raw_num = parts[0]
+        h2_percent = int(parts[1]) if len(parts) >= 2 else None
+        # Format number: numeric → zero-padded 3 digits, K-type → as-is
+        if raw_num.upper().startswith('K'):
+            program_number = raw_num.upper()
+        else:
+            program_number = str(int(raw_num)).zfill(3)
+        return program_number, h2_percent
+    except (ValueError, IndexError):
+        return None, None
+
+
+def get_cuisson_program_by_number(cur, program_number: str):
+    """
+    Returns full cuisson program from DB including kontrolle column.
+    program_number is VARCHAR: '001', '101', 'K000'
+    """
+    if not program_number:
+        return None
+    cur.execute(
+        """
+        SELECT id, program_number, max_temperature, kontrolle, type,
+               start_temp, oven_1, oven_2, oven_3, oven_4, oven_5,
+               oven_6, oven_7, oven_8, oven_9, oven_10, oven_11,
+               oven_12, oven_13, phases_json
+        FROM public.cuisson_programs
+        WHERE program_number = %s LIMIT 1
+        """,
+        (program_number,)
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    # Build ovens dict (only non-null)
+    ovens = {}
+    for i in range(13):
+        val = row[6 + i]
+        if val:
+            ovens[f"oven_{i+1}"] = val
+    return {
+        "id":                row[0],
+        "program_number":    row[1],
+        "max_temperature_c": float(row[2]) if row[2] else None,
+        "kontrolle":         row[3],
+        "type":              row[4],
+        "start_temp_c":      float(row[5]) if row[5] else 20,
+        "ovens":             ovens,
+        "phases":            row[19],
+    }
+
+
+def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _visited=None):
+    """
+    Recursively builds a fully enriched ADN snapshot for a nuance.
+    Includes: cuisson program (with kontrolle), components, mishkarte, control plan, images.
+    """
+    if _visited is None:
+        _visited = set()
+    if nuance_id in _visited:
+        return {"nuance_id": nuance_id, "product_reference": product_reference, "nuance_name": nuance_name, "error": "Circular reference detected — snapshot truncated here"}
+    _visited.add(nuance_id)
+
+    # ── Revision history ─────────────────────────────────────────────────────
+    cur.execute("SELECT document_revision_history FROM public.nuances WHERE id = %s", (nuance_id,))
+    row = cur.fetchone()
+    revision_history = row[0] if row and row[0] else None
+
+    # ── Cuisson program (Wärme-Nachbehandlung) — UPDATED with kontrolle ──────
+    cur.execute(
+        """
+        SELECT n.cuisson_raw, n.cuisson_program_number, n.cuisson_h2_percent,
+               cp.type, cp.kontrolle, cp.max_temperature, cp.start_temp, cp.phases_json
+        FROM public.nuances n
+        LEFT JOIN public.cuisson_programs cp ON cp.id = n.cuisson_program_id
+        WHERE n.id = %s
+        """,
+        (nuance_id,)
+    )
+    cuisson_row = cur.fetchone()
+    cuisson_info = None
+    if cuisson_row and cuisson_row[0]:
+        h2 = cuisson_row[2]
+        n2 = (100 - h2) if h2 is not None else None
+        cuisson_info = {
+            "raw":            cuisson_row[0],
+            "program_number": cuisson_row[1],
+            "h2_percent":     h2,
+            "n2_percent":     n2,
+            "atmosphere":     f"H2 {h2}% + N2 {n2}%" if h2 is not None else None,
+            "program": {
+                "type":              cuisson_row[3],
+                "kontrolle":         cuisson_row[4],
+                "max_temperature_c": float(cuisson_row[5]) if cuisson_row[5] else None,
+                "start_temp_c":      float(cuisson_row[6]) if cuisson_row[6] else 20,
+                "phases":            cuisson_row[7],
+            } if cuisson_row[3] else None,
+        }
+
+    # ── Components ───────────────────────────────────────────────────────────
+    cur.execute(
+        """
+        SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit, c.metadata,
+               c.matiere_id, c.sub_black_mix_id, c.sub_nuance_id,
+               m.reference AS matiere_reference, m.nom_matiere AS matiere_name,
+               bm.reference AS sub_bm_reference, bm.name AS sub_bm_name,
+               sn.reference AS sub_nuance_reference, sn.name AS sub_nuance_name
+        FROM public.nuance_components c
+        LEFT JOIN public.matieres    m  ON m.matiere_id = c.matiere_id
+        LEFT JOIN public.black_mixes bm ON bm.id        = c.sub_black_mix_id
+        LEFT JOIN public.nuances     sn ON sn.id        = c.sub_nuance_id
+        WHERE c.nuance_id = %s ORDER BY c.id
+        """,
+        (nuance_id,)
+    )
+    raw_components = cur.fetchall()
+    components = []
+    for r in raw_components:
+        (comp_id, component_name, qty, unit, metadata,
+         matiere_id, sub_bm_id, sub_nuance_id,
+         matiere_ref, matiere_name,
+         sub_bm_ref, sub_bm_name,
+         sub_nuance_ref, sub_nuance_name) = r
+        if sub_nuance_id is not None:
+            comp_type, ref, name = "nuance",    sub_nuance_ref, sub_nuance_name
+        elif sub_bm_id is not None:
+            comp_type, ref, name = "black_mix", sub_bm_ref,     sub_bm_name
+        else:
+            comp_type, ref, name = "matiere",   matiere_ref,    matiere_name
+        entry = {"id": comp_id, "component_name": component_name, "quantity": float(qty) if qty is not None else None, "unit": unit, "metadata": metadata, "component_type": comp_type, "reference": ref, "material_name": name, "matiere_id": matiere_id, "sub_black_mix_id": sub_bm_id, "sub_nuance_id": sub_nuance_id, "matiere_adn": None, "black_mix_adn": None, "sub_nuance_adn": None}
+        if comp_type == "matiere" and matiere_id:
+            entry["matiere_adn"] = get_matiere_full_adn(cur, matiere_id, ref)
+        elif comp_type == "black_mix" and sub_bm_id:
+            entry["black_mix_adn"] = build_black_mix_adn_snapshot(cur, sub_bm_id, sub_bm_ref, sub_bm_name, _visited=set(_visited))
+        elif comp_type == "nuance" and sub_nuance_id:
+            entry["sub_nuance_adn"] = build_nuance_adn_snapshot(cur, sub_nuance_id, sub_nuance_ref, sub_nuance_name, _visited=set(_visited))
+        components.append(entry)
+
+    # ── Process steps (mishkarte) ─────────────────────────────────────────────
+    cur.execute("SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters FROM public.nuance_process_steps s WHERE s.nuance_id = %s ORDER BY s.step_order", (nuance_id,))
+    steps_raw = cur.fetchall()
+    process_steps = []
+    for s in steps_raw:
+        step_id, step_order, step_name, machine, parameters = s
+        cur.execute("""
+            SELECT sm.matiere_id, sm.sub_black_mix_id, sm.sub_nuance_id,
+                   m.reference AS matiere_ref, bm.reference AS sub_bm_ref, sn.reference AS sub_nuance_ref
+            FROM public.nuance_step_materials sm
+            LEFT JOIN public.matieres    m  ON m.matiere_id = sm.matiere_id
+            LEFT JOIN public.black_mixes bm ON bm.id        = sm.sub_black_mix_id
+            LEFT JOIN public.nuances     sn ON sn.id        = sm.sub_nuance_id
+            WHERE sm.process_step_id = %s
+        """, (step_id,))
+        step_mat_refs = []
+        for sm in cur.fetchall():
+            ref = sm[5] if sm[2] is not None else (sm[4] if sm[1] is not None else sm[3])
+            if ref:
+                step_mat_refs.append(ref)
+        process_steps.append({"step_order": step_order, "step_name": step_name, "machine": machine, "parameters": parameters, "materials": step_mat_refs})
+
+    # ── Control plan ─────────────────────────────────────────────────────────
+    cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit FROM public.nuance_control_plan WHERE nuance_id = %s ORDER BY parameter_name", (nuance_id,))
+    control_plan = [{"parameter_name": r[0], "target_value": float(r[1]) if r[1] is not None else None, "min_value": float(r[2]) if r[2] is not None else None, "max_value": float(r[3]) if r[3] is not None else None, "unit": r[4]} for r in cur.fetchall()]
+
+    # ── Images + expert notes ─────────────────────────────────────────────────
+    cur.execute("""
+        SELECT ni.id, ni.image_path, ne.note_json, ne.created_at AS note_created_at
+        FROM public.nuance_images ni
+        LEFT JOIN public.nuance_expert_notes ne ON ne.nuance_image_id = ni.id
+        WHERE ni.nuance_id = %s ORDER BY ni.id
+    """, (nuance_id,))
+    images = [{"image_id": r[0], "image_path": r[1], "expert_note": {"note_json": r[2], "created_at": r[3].isoformat() if r[3] else None} if r[2] else None} for r in cur.fetchall()]
+
+    def flatten(comp_list, depth=0):
+        flat = []
+        for c in comp_list:
+            flat.append({**c, "depth": depth, "matiere_adn": None, "black_mix_adn": None, "sub_nuance_adn": None})
+            if c["component_type"] == "nuance" and c["sub_nuance_adn"]:
+                flat.extend(flatten(c["sub_nuance_adn"].get("composition", []), depth + 1))
+            elif c["component_type"] == "black_mix" and c["black_mix_adn"]:
+                for bm_comp in c["black_mix_adn"].get("composition", []):
+                    flat.append({**bm_comp, "depth": depth + 1})
+        return flat
+
+    return {
+        "nuance_id":                 nuance_id,
+        "product_reference":         product_reference,
+        "nuance_name":               nuance_name,
+        "status":                    "draft",
+        "document_revision_history": revision_history,
+        "created_at":                datetime.now().isoformat(),
+        "cuisson":                   cuisson_info,
+        "composition":               components,
+        "composition_flat":          flatten(components),
+        "process_steps":             process_steps,
+        "step_materials":            {str(s["step_order"]): s["materials"] for s in process_steps},
+        "control_plan":              control_plan,
+        "images":                    images,
+        "snapshot_timestamp":        datetime.now().isoformat(),
+    }
+
+
+# =============================================================================
+# NUANCES — ENDPOINTS
+# =============================================================================
+
+@app.route("/nuance/validate-material/<reference>", methods=["GET"])
+def validate_nuance_material(reference):
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name FROM public.nuances WHERE reference = %s LIMIT 1", (reference,))
+            row = cur.fetchone()
+            if row:
+                return jsonify({"reference": reference, "exists": True, "component_type": "nuance", "material_name": row[1], "id": row[0]}), 200
+            cur.execute("SELECT id, name FROM public.black_mixes WHERE reference = %s LIMIT 1", (reference,))
+            row = cur.fetchone()
+            if row:
+                return jsonify({"reference": reference, "exists": True, "component_type": "black_mix", "material_name": row[1], "id": row[0]}), 200
+            cur.execute("SELECT matiere_id, nom_matiere FROM public.matieres WHERE reference = %s LIMIT 1", (reference,))
+            row = cur.fetchone()
+            if row:
+                return jsonify({"reference": reference, "exists": True, "component_type": "matiere", "material_name": row[1], "id": row[0]}), 200
+            return jsonify({"reference": reference, "exists": False, "component_type": None, "material_name": None, "id": None}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/nuance/submit", methods=["POST"])
+def submit_nuance():
+    if not request.is_json:
+        return jsonify({"success": False, "error": "Request body must be JSON"}), 400
+
+    data = request.get_json()
+
+    import logging
+    logging.info(f"📥 Payload reçu:\n{json.dumps(data, indent=2)}")
+
+    product_reference  = data.get("product_reference")
+    nuance_name        = data.get("nuance_name")
+    components         = data.get("components", [])
+    process_steps      = data.get("process_steps", [])
+    step_materials_map = data.get("step_materials", {})
+    control_plan       = data.get("control_plan", [])
+
+    document_revision_history = data.get("document_revision_history")
+
+    warne_raw = data.get("warne_nachbehandlung")
+    if warne_raw:
+        warne_raw = warne_raw.strip()
+        if warne_raw == "":
+            warne_raw = None
+
+    # 🔴 VALIDATION
+    if not product_reference or not nuance_name:
         return jsonify({
             "success": False,
-            "error": "product_reference and mix_name are required"
+            "error": "product_reference and nuance_name are required"
         }), 400
 
     if not process_steps:
@@ -2762,26 +1740,10 @@ def submit_black_mix():
 
     try:
         with conn:
-            with conn.cursor() as cur:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
-                # ------------------------------
-                # Validate materials references
-                # ------------------------------
-                validation_errors = []
-
-                for component in components:
-                    ref = component.get("reference")
-                    if not ref:
-                        validation_errors.append("Component missing reference")
-                        continue
-
-                    cur.execute(
-                        "SELECT matiere_id FROM public.matieres WHERE reference = %s",
-                        (ref,)
-                    )
-
-                    if not cur.fetchone():
-                        validation_errors.append(f"Invalid material reference: {ref}")
+                # ───────── VALIDATION DES REFERENCES ─────────
+                ref_lookup, validation_errors = resolve_nuance_ref_lookup(cur, components)
 
                 if validation_errors:
                     return jsonify({
@@ -2789,159 +1751,164 @@ def submit_black_mix():
                         "validation_errors": validation_errors
                     }), 400
 
-                # ------------------------------
-                # Create Black Mix
-                # ------------------------------
-                cur.execute(
-                    """
-                    INSERT INTO public.black_mixes
-                    (reference, name, status, created_at, document_revision_history)
-                    VALUES (%s, %s, 'draft', NOW(), %s)
+                # 🔴 Validation step_materials
+                all_step_refs = {
+                    ref for refs in step_materials_map.values()
+                    for ref in refs if ref
+                }
+
+                extra_refs = all_step_refs - set(ref_lookup.keys())
+
+                if extra_refs:
+                    extra_lookup, extra_errors = resolve_nuance_ref_lookup(
+                        cur, [{"reference": r} for r in extra_refs]
+                    )
+
+                    if extra_errors:
+                        return jsonify({
+                            "success": False,
+                            "validation_errors": extra_errors
+                        }), 400
+
+                    ref_lookup.update(extra_lookup)
+
+                logging.info(f"✅ Ref lookup: {ref_lookup}")
+
+                # ───────── CUISSON ─────────
+                cuisson_program_number = None
+                cuisson_h2_percent     = None
+                cuisson_program_id     = None
+
+                if warne_raw:
+                    cuisson_program_number, cuisson_h2_percent = parse_warne_nachbehandlung(warne_raw)
+
+                    if cuisson_program_number:
+                        cur.execute(
+                            "SELECT id FROM public.cuisson_programs WHERE program_number = %s LIMIT 1",
+                            (cuisson_program_number,)
+                        )
+                        prog_row = cur.fetchone()
+
+                        if prog_row:
+                            cuisson_program_id = prog_row[0]
+
+                # ───────── INSERT NUANCE ─────────
+                cur.execute("""
+                    INSERT INTO public.nuances
+                        (reference, name, status, created_at,
+                         document_revision_history,
+                         cuisson_raw, cuisson_program_number,
+                         cuisson_h2_percent, cuisson_program_id)
+                    VALUES (%s, %s, 'draft', NOW(), %s, %s, %s, %s, %s)
                     RETURNING id
-                    """,
-                    (
-                        product_reference,
-                        mix_name,
-                        Json(document_revision_history) if document_revision_history else None
-                    )
-                )
+                """, (
+                    product_reference,
+                    nuance_name,
+                    Json(document_revision_history) if document_revision_history else None,
+                    warne_raw,
+                    cuisson_program_number,
+                    cuisson_h2_percent,
+                    cuisson_program_id
+                ))
 
-                black_mix_id = cur.fetchone()[0]
+                nuance_id = cur.fetchone()["id"]
 
-                # ------------------------------
-                # Insert components
-                # ------------------------------
+                # ───────── COMPONENTS ─────────
                 for component in components:
+                    ref = component.get("reference")
+                    resolved = ref_lookup[ref]
 
-                    cur.execute(
-                        "SELECT matiere_id FROM public.matieres WHERE reference = %s",
-                        (component["reference"],)
-                    )
+                    cur.execute("""
+                        INSERT INTO public.nuance_components
+                            (nuance_id, matiere_id, sub_black_mix_id, sub_nuance_id,
+                             component_name, quantity_value, quantity_unit, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        nuance_id,
+                        resolved["id"] if resolved["type"] == "matiere" else None,
+                        resolved["id"] if resolved["type"] == "black_mix" else None,
+                        resolved["id"] if resolved["type"] == "nuance" else None,
+                        component.get("component_name") or ref,
+                        component.get("quantity"),
+                        component.get("unit", "kg"),
+                        Json(component.get("metadata") or {})
+                    ))
 
-                    matiere_id = cur.fetchone()[0]
-
-                    cur.execute(
-                        """
-                        INSERT INTO public.black_mix_components
-                        (black_mix_id, matiere_id, component_name, quantity_value, quantity_unit, metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        """,
-                        (
-                            black_mix_id,
-                            matiere_id,
-                            component.get("component_name") or component["reference"],
-                            component.get("quantity"),
-                            component.get("unit", "phr"),
-                            Json(component.get("metadata", {}))
-                        )
-                    )
-
-                # ------------------------------
-                # Insert process steps
-                # ------------------------------
+                # ───────── PROCESS STEPS ─────────
                 for step in process_steps:
+                    step_order = step.get("step_order")
 
-                    if not step.get("materials"):
-                        raise ValueError(
-                            f"Process step '{step.get('step_name')}' must contain at least one material"
-                        )
-
-                    cur.execute(
-                        """
-                        INSERT INTO public.black_mix_process_steps
-                        (black_mix_id, step_order, step_name, machine_name, parameters)
+                    cur.execute("""
+                        INSERT INTO public.nuance_process_steps
+                            (nuance_id, step_order, step_name, machine_name, parameters)
                         VALUES (%s, %s, %s, %s, %s)
                         RETURNING id
-                        """,
-                        (
-                            black_mix_id,
-                            step.get("step_order"),
-                            step.get("step_name"),
-                            step.get("machine"),
-                            Json(step.get("parameters", {}))
-                        )
-                    )
+                    """, (
+                        nuance_id,
+                        step_order,
+                        step.get("step_name"),
+                        step.get("machine"),
+                        Json(step.get("parameters") or {})
+                    ))
 
-                    process_step_id = cur.fetchone()[0]
+                    process_step_id = cur.fetchone()["id"]
 
-                    # ------------------------------
-                    # Insert step-material relations
-                    # ------------------------------
-                    for ref in step.get("materials"):
+                    refs_for_step = step_materials_map.get(str(step_order), [])
 
-                        cur.execute(
-                            "SELECT matiere_id FROM public.matieres WHERE reference = %s",
-                            (ref,)
+                    if not refs_for_step:
+                        raise ValueError(
+                            f"Step '{step.get('step_name')}' has no materials"
                         )
 
-                        mat_row = cur.fetchone()
+                    for ref in refs_for_step:
+                        resolved = ref_lookup.get(ref)
 
-                        if not mat_row:
-                            raise ValueError(f"Invalid material reference in step: {ref}")
+                        if not resolved:
+                            raise ValueError(f"Reference '{ref}' not resolved")
 
-                        cur.execute(
-                            """
-                            INSERT INTO public.black_mix_step_materials
-                            (process_step_id, matiere_id, created_at)
-                            VALUES (%s, %s, NOW())
-                            """,
-                            (
-                                process_step_id,
-                                mat_row[0]
-                            )
-                        )
+                        cur.execute("""
+                            INSERT INTO public.nuance_step_materials
+                                (process_step_id, matiere_id, sub_black_mix_id, sub_nuance_id, created_at)
+                            VALUES (%s, %s, %s, %s, NOW())
+                        """, (
+                            process_step_id,
+                            resolved["id"] if resolved["type"] == "matiere" else None,
+                            resolved["id"] if resolved["type"] == "black_mix" else None,
+                            resolved["id"] if resolved["type"] == "nuance" else None
+                        ))
 
-                # ------------------------------
-                # Insert control plan
-                # ------------------------------
+                # ───────── CONTROL PLAN ─────────
                 for param in control_plan:
-
-                    cur.execute(
-                        """
-                        INSERT INTO public.black_mix_control_plan
-                        (black_mix_id, parameter_name, target_value, min_value, max_value, unit)
+                    cur.execute("""
+                        INSERT INTO public.nuance_control_plan
+                            (nuance_id, parameter_name, target_value, min_value, max_value, unit)
                         VALUES (%s, %s, %s, %s, %s, %s)
-                        """,
-                        (
-                            black_mix_id,
-                            param.get("parameter_name"),
-                            param.get("target_value"),
-                            param.get("min_value"),
-                            param.get("max_value"),
-                            param.get("unit")
-                        )
-                    )
+                    """, (
+                        nuance_id,
+                        param.get("parameter_name"),
+                        param.get("target_value"),
+                        param.get("min_value"),
+                        param.get("max_value"),
+                        param.get("unit")
+                    ))
 
-                # ------------------------------
-                # Build ADN snapshot
-                # ------------------------------
-                adn_snapshot = build_black_mix_adn_snapshot(
-                    cur,
-                    black_mix_id,
-                    product_reference,
-                    mix_name
+                # ───────── ADN ─────────
+                adn_snapshot = build_nuance_adn_snapshot(
+                    cur, nuance_id, product_reference, nuance_name
                 )
 
-                cur.execute(
-                    """
-                    INSERT INTO public.black_mix_adn
-                    (black_mix_id, adn_text, version, created_at)
+                cur.execute("""
+                    INSERT INTO public.nuance_adn
+                        (nuance_id, adn_text, version, created_at)
                     VALUES (%s, %s, 1, NOW())
                     RETURNING id
-                    """,
-                    (
-                        black_mix_id,
-                        Json(adn_snapshot)
-                    )
-                )
+                """, (nuance_id, Json(adn_snapshot)))
 
-                adn_id = cur.fetchone()[0]
+                adn_id = cur.fetchone()["id"]
 
                 return jsonify({
                     "success": True,
-                    "message": f"Black Mix '{mix_name}' created successfully",
-                    "black_mix_id": black_mix_id,
-                    "product_reference": product_reference,
+                    "nuance_id": nuance_id,
                     "adn": {
                         "id": adn_id,
                         "version": 1
@@ -2950,533 +1917,643 @@ def submit_black_mix():
 
     except Exception as e:
         conn.rollback()
+        logging.error("🔥 ERROR submit_nuance", exc_info=True)
 
         return jsonify({
             "success": False,
-            "error": str(e)
+            "error": str(e),
+            "type": type(e).__name__
         }), 500
 
     finally:
         conn.close()
-
-@app.route("/black-mix/list", methods=["GET"])
-def list_black_mixes():
-    """Get all Black Mixes."""
+@app.route("/nuance/list", methods=["GET"])
+def list_nuances():
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """SELECT id, reference, name, status, created_at
-                   FROM public.black_mixes
-                   ORDER BY created_at DESC"""
-            )
+            cur.execute("SELECT id, reference, name, status, created_at FROM public.nuances ORDER BY created_at DESC")
             rows = cur.fetchall()
-            return jsonify({
-                "success": True,
-                "black_mixes": [
-                    {
-                        "id": r[0],
-                        "product_reference": r[1],
-                        "mix_name": r[2],
-                        "status": r[3],
-                        "created_at": r[4].isoformat() if r[4] else None
-                    }
-                    for r in rows
-                ]
-            }), 200
+            return jsonify({"success": True, "nuances": [{"id": r[0], "product_reference": r[1], "nuance_name": r[2], "status": r[3], "created_at": r[4].isoformat() if r[4] else None} for r in rows]}), 200
     except Exception as e:
-        logging.error(f"List Black Mixes error: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
         conn.close()
 
 
-@app.route("/black-mix/<int:mix_id>", methods=["GET"])
-def get_black_mix_details(mix_id):
-    """Get complete details of a Black Mix."""
+@app.route("/nuance/<int:nuance_id>", methods=["GET"])
+def get_nuance_details(nuance_id):
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """SELECT id, reference, name, status, created_at, document_revision_history
-                   FROM public.black_mixes WHERE id = %s""",
-                (mix_id,)
-            )
+            cur.execute("SELECT id, reference, name, status, created_at, document_revision_history FROM public.nuances WHERE id = %s", (nuance_id,))
             row = cur.fetchone()
             if not row:
-                return jsonify({"success": False, "error": "Black Mix not found"}), 404
-
-            result = {
-                "id": row[0],
-                "product_reference": row[1],
-                "mix_name": row[2],
-                "status": row[3],
-                "created_at": row[4].isoformat() if row[4] else None,
-                "document_revision_history": row[5]
-            }
-
-            cur.execute(
-                """SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit,
-                          m.reference, m.nom_matiere, c.metadata
-                   FROM public.black_mix_components c
-                   JOIN public.matieres m ON c.matiere_id = m.matiere_id
-                   WHERE c.black_mix_id = %s""",
-                (mix_id,)
-            )
-            result["components"] = [
-                {
-                    "id": r[0],
-                    "component_name": r[1],
-                    "quantity": float(r[2]) if r[2] is not None else None,
-                    "unit": r[3],
-                    "reference": r[4],
-                    "material_name": r[5],
-                    "metadata": r[6]
-                }
-                for r in cur.fetchall()
-            ]
-
-            cur.execute(
-                """SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters,
-                          ARRAY_AGG(m.reference ORDER BY m.reference) AS materials
-                   FROM public.black_mix_process_steps s
-                   LEFT JOIN public.black_mix_step_materials sm ON sm.process_step_id = s.id
-                   LEFT JOIN public.matieres m ON m.matiere_id = sm.matiere_id
-                   WHERE s.black_mix_id = %s
-                   GROUP BY s.id
-                   ORDER BY s.step_order""",
-                (mix_id,)
-            )
-            result["process_steps"] = [
-                {
-                    "step_order": r[1],
-                    "step_name": r[2],
-                    "machine": r[3],
-                    "parameters": r[4],
-                    "materials": list(r[5]) if r[5] and r[5][0] is not None else []
-                }
-                for r in cur.fetchall()
-            ]
-
-            cur.execute(
-                """SELECT parameter_name, target_value, min_value, max_value, unit
-                   FROM public.black_mix_control_plan WHERE black_mix_id = %s""",
-                (mix_id,)
-            )
-            result["control_plan"] = [
-                {
-                    "parameter_name": r[0],
-                    "target_value": float(r[1]) if r[1] is not None else None,
-                    "min_value": float(r[2]) if r[2] is not None else None,
-                    "max_value": float(r[3]) if r[3] is not None else None,
-                    "unit": r[4]
-                }
-                for r in cur.fetchall()
-            ]
-
-            return jsonify({"success": True, "black_mix": result}), 200
-
+                return jsonify({"success": False, "error": "Nuance not found"}), 404
+            result = {"id": row[0], "product_reference": row[1], "nuance_name": row[2], "status": row[3], "created_at": row[4].isoformat() if row[4] else None, "document_revision_history": row[5]}
+            snapshot = build_nuance_adn_snapshot(cur, nuance_id, result["product_reference"], result["nuance_name"])
+            result["cuisson"]          = snapshot["cuisson"]
+            result["components"]       = snapshot["composition"]
+            result["components_flat"]  = snapshot["composition_flat"]
+            result["process_steps"]    = snapshot["process_steps"]
+            result["control_plan"]     = snapshot["control_plan"]
+            result["images"]           = [{**img, "image_url": build_image_url(img["image_path"])} if img.get("image_path") else img for img in snapshot.get("images", [])]
+            return jsonify({"success": True, "nuance": result}), 200
     except Exception as e:
-        logging.error(f"Get Black Mix details error: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
         conn.close()
 
 
-# -----------------------------------------------------------------------------
-# BLACK MIX ADN ENDPOINTS
-# -----------------------------------------------------------------------------
-
-@app.route("/black-mix/<int:mix_id>/adn", methods=["GET"])
-def get_black_mix_adn(mix_id):
-    """Retrieve the base ADN (DNA/snapshot) of a Black Mix for export/PDF/archiving."""
+@app.route("/nuance/<int:nuance_id>/adn", methods=["GET"])
+def get_nuance_adn(nuance_id):
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn.cursor() as cur:
-            # Get ADN from database
-            cur.execute(
-                """SELECT id, black_mix_id, adn_text, version, created_at
-                   FROM public.black_mix_adn
-                   WHERE black_mix_id = %s
-                   ORDER BY version DESC
-                   LIMIT 1""",
-                (mix_id,)
-            )
+            cur.execute("SELECT id, nuance_id, adn_text, version, created_at FROM public.nuance_adn WHERE nuance_id = %s ORDER BY version DESC LIMIT 1", (nuance_id,))
             row = cur.fetchone()
-            
             if not row:
-                return jsonify({
-                    "success": False,
-                    "error": "ADN not found for this Black Mix"
-                }), 404
-            
-            adn_id, black_mix_id, adn_text, version, created_at = row
-            
-            return jsonify({
-                "success": True,
-                "adn": {
-                    "id": adn_id,
-                    "black_mix_id": black_mix_id,
-                    "version": version,
-                    "created_at": created_at.isoformat() if created_at else None,
-                    "snapshot": adn_text
-                }
-            }), 200
-
+                return jsonify({"success": False, "error": "ADN not found for this Nuance"}), 404
+            return jsonify({"success": True, "adn": {"id": row[0], "nuance_id": row[1], "version": row[3], "created_at": row[4].isoformat() if row[4] else None, "snapshot": row[2]}}), 200
     except Exception as e:
-        print(f"⚠️ Error getting ADN: {e}")
-        import traceback
-        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/nuance/<int:nuance_id>/adn-enriched", methods=["GET"])
+def get_nuance_adn_enriched(nuance_id):
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT id, reference, name, status, document_revision_history FROM public.nuances WHERE id = %s", (nuance_id,))
+                nuance = cur.fetchone()
+                if not nuance:
+                    return jsonify({"error": "Nuance not found"}), 404
+                snapshot = build_nuance_adn_snapshot(cur, nuance_id, nuance["reference"], nuance["name"])
+                data_for_ai = {"nuance_identity": {"reference": nuance["reference"], "name": nuance["name"], "status": nuance["status"], "revision_history": nuance["document_revision_history"], "cuisson": snapshot.get("cuisson")}, "components": snapshot["composition"], "process_steps": snapshot["process_steps"], "control_plan": snapshot["control_plan"]}
+                prompt = f"""Tu es un expert en formulation industrielle de matériaux carbone et graphite.
+Génère un "Rapport Technique NUANCE ADN" en suivant STRICTEMENT cette structure:
+#### 1. Introduction
+#### 2. Identité et Vue d'ensemble de la Nuance
+*   **2.1. Informations Générales** : tableau (Référence, Nom, Statut).
+*   **2.2. Programme de Cuisson** : Wärme-Nachbehandlung, type, température max, atmosphère H2/N2, phases.
+*   **2.3. Historique des Révisions**.
+#### 3. Architecture et Processus de la Nuance
+*   **3.1. Composition Structurelle** : tableau (Référence, Matériau, Type, Quantité, Rôle).
+*   **3.2. Gamme de Fabrication (Mishkarte)** : tableau (Étape, Opération, Machine, Paramètres, Matières).
+*   **3.3. Analyse d'impact du processus**.
+*   **3.4. Plan de Contrôle**.
+#### 4. ADN Détaillé des Composants
+Pour CHAQUE composant : Référence, Type, Fonction, Spécifications complètes.
+#### 5. Synthèse de l'Identité Structurelle
+RÈGLES: Aucune hallucination. Langue: Français. Style professionnel.
+### DONNÉES SOURCE (JSON):
+{json.dumps(data_for_ai, indent=2, ensure_ascii=False)}"""
+                ai_response = call_groq_with_retry(messages=[{"role": "system", "content": "Tu es un expert en formulation industrielle."}, {"role": "user", "content": prompt}], model="llama-3.3-70b-versatile", temperature=0.2, max_tokens=6000)
+                return jsonify({"nuance": nuance, "source_data": data_for_ai, "ai_analysis": ai_response.choices[0].message.content if ai_response.choices else ""}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/nuance/<int:nuance_id>/adn-combined", methods=["GET"])
+def get_nuance_adn_combined(nuance_id):
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, reference, name, status, created_at, document_revision_history FROM public.nuances WHERE id = %s", (nuance_id,))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"success": False, "error": "Nuance not found"}), 404
+            nuance_info = {"id": row[0], "product_reference": row[1], "nuance_name": row[2], "status": row[3], "created_at": row[4].isoformat() if row[4] else None, "document_revision_history": row[5]}
+            snapshot = build_nuance_adn_snapshot(cur, nuance_id, nuance_info["product_reference"], nuance_info["nuance_name"])
+            for img in snapshot.get("images", []):
+                if img.get("image_path"):
+                    img["image_url"] = build_image_url(img["image_path"])
+            return jsonify({"success": True, "nuance": nuance_info, "snapshot_version": "live", "cuisson": snapshot["cuisson"], "composition": snapshot["composition"], "composition_flat": snapshot["composition_flat"], "process_steps": snapshot["process_steps"], "control_plan": snapshot["control_plan"], "images": snapshot["images"]}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# NUANCE IMAGES — UPLOAD + SEARCH PAR SIMILARITÉ
+# =============================================================================
+
+def search_similar_nuances_in_db(query_embedding: np.ndarray, top_k: int = 5):
+    query_vec = query_embedding.tolist()
+    sql = """
+        SELECT ni.id, ni.image_path, ni.nuance_id, n.name AS nuance_name, n.reference,
+               (1 - (ni.embedding <=> %s)) AS similarity
+        FROM public.nuance_images ni
+        JOIN public.nuances n ON n.id = ni.nuance_id
+        ORDER BY ni.embedding <=> %s LIMIT %s;
+    """
+    conn = get_db_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (query_vec, query_vec, top_k))
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+@app.route("/nuance/upload-image", methods=["POST"])
+def upload_nuance_image():
+    nuance_id = request.form.get("nuance_id")
+    if not nuance_id:
+        return jsonify({"success": False, "error": "nuance_id is required"}), 400
+    if "image" not in request.files:
+        return jsonify({"success": False, "error": "No image file provided"}), 400
+    file = request.files["image"]
+    if not file or not allowed_file(file.filename):
+        return jsonify({"success": False, "error": "Invalid file type. Allowed: png, jpg, jpeg"}), 400
+    expert_note_raw = request.form.get("expert_note")
+    expert_note = None
+    if expert_note_raw:
+        try:
+            expert_note = json.loads(expert_note_raw)
+        except Exception:
+            return jsonify({"success": False, "error": "expert_note must be valid JSON"}), 400
+    conn = None
+    try:
+        filename_safe = secure_filename(file.filename)
+        unique_filename = f"nuance_{nuance_id}_{uuid.uuid4().hex}_{filename_safe}"
+        file_path = IMAGES_DIR / unique_filename
+        file_bytes = file.read()
+        with open(file_path, "wb") as f:
+            f.write(file_bytes)
+        img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+        embedding = compute_embedding_from_pil(img)
+        conn = get_db_conn()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name, reference FROM public.nuances WHERE id = %s", (int(nuance_id),))
+            nuance = cur.fetchone()
+            if not nuance:
+                return jsonify({"success": False, "error": "Nuance not found"}), 404
+            cur.execute("INSERT INTO public.nuance_images (nuance_id, image_path, embedding, nuance_name, reference, created_at) VALUES (%s, %s, %s, %s, %s, NOW()) RETURNING id",
+                        (int(nuance_id), str(file_path), embedding.tolist(), nuance["name"], nuance["reference"]))
+            image_id = cur.fetchone()["id"]
+            note_id = None
+            if expert_note:
+                cur.execute("INSERT INTO public.nuance_expert_notes (nuance_image_id, note_json, created_at) VALUES (%s, %s, NOW()) RETURNING id", (image_id, Json(expert_note)))
+                note_id = cur.fetchone()["id"]
+            conn.commit()
+        return jsonify({"success": True, "message": "Image uploaded and embedding computed successfully", "image_id": image_id, "image_url": build_image_url(str(file_path)), "nuance_id": int(nuance_id), "note_id": note_id}), 200
+    except Exception as e:
+        if conn:
+            conn.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
         if conn:
             conn.close()
 
 
-import json
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from flask import jsonify
-
-@app.route("/black-mix/<int:mix_id>/adn-enriched", methods=["GET"])
-def get_black_mix_adn_enriched(mix_id):
-
-    conn = psycopg2.connect(DB_DSN)
-
+@app.route("/nuance/search-similar", methods=["POST"])
+def search_similar_nuances():
+    data = request.get_json(silent=True) or {}
+    top_k = int(data.get("top_k", 5))
+    if top_k < 1 or top_k > 50:
+        return jsonify({"success": False, "error": "invalid_top_k"}), 400
+    temp_filename = data.get("temp_filename")
+    file_id = data.get("file_id")
+    download_link = data.get("download_link")
+    provided = [bool(download_link), bool(temp_filename), bool(file_id)]
+    if sum(provided) != 1:
+        return jsonify({"success": False, "error": "Provide exactly ONE of: download_link, temp_filename, file_id"}), 400
+    img = None
+    if download_link:
+        try:
+            r = requests.get(download_link, timeout=20)
+            r.raise_for_status()
+            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        except Exception as e:
+            return jsonify({"success": False, "error": "download_link_failed", "message": str(e)}), 400
+    elif temp_filename:
+        file_path = TEMP_UPLOAD_DIR / temp_filename
+        if not file_path.exists():
+            return jsonify({"success": False, "error": "temp_file_not_found"}), 404
+        img = Image.open(file_path).convert("RGB")
+    elif file_id:
+        if not client:
+            return jsonify({"success": False, "error": "openai_not_configured"}), 400
+        img = Image.open(io.BytesIO(client.files.content(file_id).read())).convert("RGB")
     try:
-        with conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-
-                # ---------------------------------------------------
-                # 1. Black Mix identity
-                # ---------------------------------------------------
-                cur.execute("""
-                    SELECT id, reference, name, status, document_revision_history
-                    FROM black_mixes
-                    WHERE id = %s
-                """, (mix_id,))
-
-                black_mix = cur.fetchone()
-
-                if not black_mix:
-                    return jsonify({"error": "Black mix not found"}), 404
-
-
-                # ---------------------------------------------------
-                # 2. Components + ADN specifications
-                # ---------------------------------------------------
-                cur.execute("""
-                    SELECT
-                        c.matiere_id,
-                        c.component_name,
-                        c.quantity_value,
-                        c.quantity_unit,
-                        m.reference,
-                        m.nom_matiere,
-                        m.type_matiere,
-                        f.specifications
-                    FROM black_mix_components c
-                    JOIN matieres m
-                        ON m.matiere_id = c.matiere_id
-                    LEFT JOIN fiches_adn_matieres f
-                        ON f.matiere_id = c.matiere_id
-                    WHERE c.black_mix_id = %s
-                """, (mix_id,))
-
-                components = cur.fetchall()
-
-                for c in components:
-                    if not c["specifications"]:
-                        c["specifications"] = "Information non disponible"
-
-
-                # ---------------------------------------------------
-                # 3. Process steps
-                # ---------------------------------------------------
-                cur.execute("""
-                    SELECT
-                        ps.id,
-                        ps.step_order,
-                        ps.step_name,
-                        ps.machine_name,
-                        ps.parameters
-                    FROM black_mix_process_steps ps
-                    WHERE ps.black_mix_id = %s
-                    ORDER BY ps.step_order
-                """, (mix_id,))
-
-                process_steps = cur.fetchall()
-
-
-                # ---------------------------------------------------
-                # 4. Materials per step
-                # ---------------------------------------------------
-                cur.execute("""
-                    SELECT
-                        sm.process_step_id,
-                        m.reference,
-                        m.nom_matiere
-                    FROM black_mix_step_materials sm
-                    JOIN black_mix_process_steps ps
-                        ON ps.id = sm.process_step_id
-                    JOIN matieres m
-                        ON m.matiere_id = sm.matiere_id
-                    WHERE ps.black_mix_id = %s
-                """, (mix_id,))
-
-                step_materials = cur.fetchall()
-
-                materials_by_step = {}
-
-                for row in step_materials:
-                    step_id = row["process_step_id"]
-
-                    materials_by_step.setdefault(step_id, []).append({
-                        "reference": row["reference"],
-                        "nom_matiere": row["nom_matiere"]
-                    })
-
-                for step in process_steps:
-                    step["materials"] = materials_by_step.get(step["id"], [])
-
-
-                # ---------------------------------------------------
-                # 5. Control plan
-                # ---------------------------------------------------
-                cur.execute("""
-                    SELECT
-                        parameter_name,
-                        target_value,
-                        min_value,
-                        max_value,
-                        unit
-                    FROM black_mix_control_plan
-                    WHERE black_mix_id = %s
-                """, (mix_id,))
-
-                control_plan = cur.fetchall()
-
-
-                # ---------------------------------------------------
-                # 6. Structured data for AI
-                # ---------------------------------------------------
-                data_for_ai = {
-                    "black_mix_identity": {
-                        "reference": black_mix["reference"],
-                        "name": black_mix["name"],
-                        "status": black_mix["status"],
-                        "revision_history": black_mix["document_revision_history"]
-                    },
-                    "components": components,
-                    "process_steps": process_steps,
-                    "step_materials": step_materials,
-                    "control_plan": control_plan
-                }
-
-
-                # ---------------------------------------------------
-                # 7. YOUR PROMPT (unchanged)
-                # ---------------------------------------------------
-                prompt = f"""
-Tu es un expert en formulation industrielle de matériaux carbone et graphite. 
-Ton objectif est de générer un "Rapport Technique BLACK MIX ADN" en suivant STRICTEMENT la structure et le style du document de référence fourni, tout en intégrant une analyse approfondie de l'impact du processus de transformation.
-
-### CONSIGNES DE RÉDACTION :
-1. **AUCUNE HALLUCINATION** : N'invente aucune donnée, valeur numérique ou propriété. Si une information est manquante, indique "Information non disponible".
-2. **STYLE PROFESSIONNEL** : Utilise un ton technique, précis et structuré (tableaux, listes à puces, sections numérotées).
-3. **LANGUE** : Le rapport doit être rédigé en Français.
-
-### STRUCTURE DU RAPPORT À RESPECTER :
-
-#### 1. Introduction
-Présente brièvement le rapport comme une référence de prompt structurée pour le mélange spécifique, garantissant la précision technique et la traçabilité.
-
-#### 2. Identité et Vue d'ensemble du Black Mix
-*   **2.1. Informations Générales** : Crée un tableau avec les paramètres : Référence Produit, Nom du Mix, Version ADN (si dispo), Statut, Système d'Origine (si dispo), Type de Document, Révision Actuelle.
-*   **2.2. Historique des Révisions Clés** : Utilise les données de `revision_history` pour créer un tableau (Version, Date, Auteur, Description de la Modification). Analyse brièvement l'évolution si les données le permettent.
-
-#### 3. Architecture et Processus du Black Mix
-*   **3.1. Composition Structurelle et Phases** : Crée un tableau détaillé des composants (Code/Référence, Matériau, Quantité, Tolérance/Spécifications, Fonction, Phase). *Note : Déduis la phase (Sec, Humide, Final) selon la nature du composant et l'ordre d'introduction.*
-*   **3.2. Gamme de Fabrication Détaillée** : Crée un tableau des étapes du processus (`process_steps`) incluant : Étape, Opération, Paramètres, Références Impliquées (via `step_materials`), Objectif.
-*   **3.3. ANALYSE DE L'IMPACT DU PROCESSUS (NOUVEAU)** : 
-    *   Analyse comment les paramètres de chaque étape influencent la qualité finale.
-    *   Explique l'interaction entre machines et matériaux.
-*   **3.4. Spécifications de Contrôle Final (Plan de Contrôle)** : Tableau basé sur `control_plan`.
-
-#### 4. ADN Détaillé des Composants
-Pour CHAQUE matière première listée dans les composants :
-* Nom et Référence
-* Type et Fonction
-* Tableau des spécifications provenant de `specifications`.
-
-#### 5. Synthèse de l'Identité Structurelle
-Analyse finale + Note d'Expert.
-
-### DONNÉES SOURCE (JSON) :
-{json.dumps(data_for_ai, indent=2, ensure_ascii=False)}
-"""
-
-                # ---------------------------------------------------
-                # 8. Call LLM
-                # ---------------------------------------------------
-                ai_response = call_groq_with_retry(prompt)
-
-
-                # ---------------------------------------------------
-                # 9. Return response
-                # ---------------------------------------------------
-                return jsonify({
-                    "black_mix": black_mix,
-                    "source_data": data_for_ai,
-                    "ai_analysis": ai_response
-                })
-
-
+        query_embedding = compute_embedding_from_pil(img)
+        rows = search_similar_nuances_in_db(query_embedding, top_k=top_k)
+        results = [{"id": r["id"], "image_url": build_image_url(r["image_path"]), "nuance_id": r["nuance_id"], "nuance_name": r["nuance_name"], "reference": r["reference"], "similarity": float(r["similarity"]) if r["similarity"] is not None else None} for r in rows]
+        return jsonify({"success": True, "results": results}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"success": False, "error": "search_failed", "message": str(e)}), 500
 
-    finally:
-        conn.close()
 
-# -----------------------------------------------------------------------------
-# BLACK MIX COMBINED ADN (Black Mix ADN + Component fiches_adn_matieres)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# CUISSON PROGRAMS — ENDPOINTS (UPDATED with kontrolle + VARCHAR)
+# =============================================================================
 
-@app.route("/black-mix/<int:mix_id>/adn-combined", methods=["GET"])
-def get_black_mix_adn_combined(mix_id):
-    """
-    Return the full combined ADN: Black Mix snapshot + every component's
-    fiches_adn_matieres (datasheet, MSDS, control-sheet specs) in one payload.
-    This is the single source-of-truth endpoint for any downstream consumer
-    (ChatGPT DOCX, BI dashboard, quality audit…).
-    """
+@app.route("/cuisson-programs", methods=["GET"])
+def list_cuisson_programs():
     conn = psycopg2.connect(DB_DSN)
     try:
-        with conn.cursor() as cur:
-            # ── 1. Black Mix header ──
-            cur.execute(
-                """SELECT id, reference, name, status, created_at, document_revision_history
-                   FROM public.black_mixes WHERE id = %s""",
-                (mix_id,)
-            )
-            bm = cur.fetchone()
-            if not bm:
-                return jsonify({"success": False, "error": "Black Mix not found"}), 404
-
-            black_mix_info = {
-                "id": bm[0], "product_reference": bm[1], "mix_name": bm[2],
-                "status": bm[3],
-                "created_at": bm[4].isoformat() if bm[4] else None,
-                "document_revision_history": bm[5],
-            }
-
-            # ── 2. Base ADN snapshot ──
-            cur.execute(
-                """SELECT adn_text, version, created_at
-                   FROM public.black_mix_adn
-                   WHERE black_mix_id = %s ORDER BY version DESC LIMIT 1""",
-                (mix_id,)
-            )
-            adn_row = cur.fetchone()
-            if not adn_row:
-                return jsonify({"success": False, "error": "ADN not found for this Black Mix"}), 404
-
-            base_adn = adn_row[0]
-            adn_version = adn_row[1]
-            adn_created = adn_row[2].isoformat() if adn_row[2] else None
-
-            # ── 3. Components with full ADN matières ──
-            components_combined = []
-            for comp in base_adn.get("composition", []):
-                ref = comp.get("reference")
-                entry = {
-                    "reference": ref,
-                    "material_name": comp.get("material_name", comp.get("component_name", "")),
-                    "quantity": comp.get("quantity"),
-                    "unit": comp.get("unit"),
-                    "metadata": comp.get("metadata", {}),
-                    "adn_matiere": None,
-                }
-                if ref:
-                    cur.execute(
-                        """SELECT fiche_adn_id, nom_matiere, material_name, reference,
-                                  type_matiere, specifications, num_specifications
-                           FROM public.fiches_adn_matieres
-                           WHERE reference = %s
-                           LIMIT 1""",
-                        (ref,)
-                    )
-                    adn_row2 = cur.fetchone()
-                    if adn_row2:
-                        entry["adn_matiere"] = {
-                            "fiche_adn_id": adn_row2[0],
-                            "nom_matiere": adn_row2[1],
-                            "material_name": adn_row2[2],
-                            "type_matiere": adn_row2[4],
-                            "specifications": adn_row2[5],
-                            "num_specifications": adn_row2[6],
-                        }
-                components_combined.append(entry)
-
-            # ── 4. Process steps with materials names ──
-            process_steps_combined = []
-            for step in base_adn.get("process_steps", []):
-                mat_refs = step.get("materials", [])
-                materials_detail = []
-                for mref in mat_refs:
-                    if not mref:
-                        continue
-                    # Find matching component info
-                    mat_info = {"reference": mref}
-                    for cc in components_combined:
-                        if cc["reference"] == mref:
-                            mat_info["material_name"] = cc["material_name"]
-                            mat_info["quantity"] = cc["quantity"]
-                            mat_info["unit"] = cc["unit"]
-                            break
-                    materials_detail.append(mat_info)
-                process_steps_combined.append({
-                    "step_order": step.get("step_order"),
-                    "step_name": step.get("step_name"),
-                    "machine": step.get("machine"),
-                    "parameters": step.get("parameters"),
-                    "material_references": mat_refs,
-                    "materials_detail": materials_detail,
-                })
-
-            # ── 5. Control plan ──
-            control_plan = base_adn.get("control_plan", [])
-
-            return jsonify({
-                "success": True,
-                "black_mix": black_mix_info,
-                "adn_version": adn_version,
-                "adn_created_at": adn_created,
-                "composition": components_combined,
-                "process_steps": process_steps_combined,
-                "control_plan": control_plan,
-            }), 200
-
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, program_number, max_temperature, kontrolle, type,
+                       start_temp, oven_1, oven_2, oven_3, oven_4, oven_5,
+                       oven_6, oven_7, oven_8, oven_9, oven_10, oven_11,
+                       oven_12, oven_13, phases_json
+                FROM public.cuisson_programs
+                ORDER BY program_number
+            """)
+            rows = [dict(r) for r in cur.fetchall()]
+            return jsonify({"success": True, "count": len(rows), "programs": rows}), 200
     except Exception as e:
-        logging.error(f"Combined ADN error: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
         conn.close()
 
 
-# -----------------------------------------------------------------------------
+@app.route("/cuisson-programs/<string:program_number>", methods=["GET"])
+def get_cuisson_program_detail(program_number):
+    """
+    Get cuisson program by number.
+    Accepts: '101', '001', 'K000' — auto-formats numeric to zero-padded.
+    """
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        # Normalize: numeric → zero-padded, K-type → uppercase as-is
+        if program_number.upper().startswith('K'):
+            formatted = program_number.upper()
+        else:
+            try:
+                formatted = str(int(program_number)).zfill(3)
+            except ValueError:
+                formatted = program_number
+
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            program = get_cuisson_program_by_number(cur, formatted)
+            if not program:
+                return jsonify({"success": False, "error": f"Programme '{formatted}' non trouvé"}), 404
+            return jsonify({"success": True, "program": program}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/cuisson-programs/parse", methods=["GET"])
+def parse_cuisson_field():
+    """
+    Parse Wärme-Nachbehandlung field and return full program details.
+    Example: GET /cuisson-programs/parse?value=101 25
+    """
+    raw_value = request.args.get("value", "").strip()
+    if not raw_value:
+        return jsonify({"success": False, "error": "Paramètre 'value' requis. Ex: ?value=101 25"}), 400
+
+    program_number, h2_percent = parse_warne_nachbehandlung(raw_value)
+    n2_percent = (100 - h2_percent) if h2_percent is not None else None
+
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            program = get_cuisson_program_by_number(cur, program_number)
+        return jsonify({
+            "success":        True,
+            "raw_value":      raw_value,
+            "program_number": program_number,
+            "h2_percent":     h2_percent,
+            "n2_percent":     n2_percent,
+            "atmosphere":     f"H2 {h2_percent}% + N2 {n2_percent}%" if h2_percent is not None else None,
+            "program_found":  program is not None,
+            "program":        program,
+        }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route("/nuance/<int:nuance_id>/set-cuisson", methods=["POST"])
+def set_nuance_cuisson(nuance_id):
+    """
+    Associate a cuisson program to a nuance.
+    Body: { "warne_nachbehandlung": "101 25" }
+    """
+    data = request.get_json() or {}
+    raw_value = data.get("warne_nachbehandlung", "").strip()
+    if not raw_value:
+        return jsonify({"success": False, "error": "Champ 'warne_nachbehandlung' requis. Ex: '101 25'"}), 400
+
+    program_number, h2_percent = parse_warne_nachbehandlung(raw_value)
+    if not program_number:
+        return jsonify({"success": False, "error": f"Format invalide: '{raw_value}'. Attendu: '101 25'"}), 400
+
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, reference FROM public.nuances WHERE id = %s", (nuance_id,))
+            nuance = cur.fetchone()
+            if not nuance:
+                return jsonify({"success": False, "error": "Nuance non trouvée"}), 404
+
+            cur.execute("SELECT id FROM public.cuisson_programs WHERE program_number = %s LIMIT 1", (program_number,))
+            prog_row = cur.fetchone()
+            cuisson_program_id = prog_row["id"] if prog_row else None
+
+            cur.execute(
+                """
+                UPDATE public.nuances
+                SET cuisson_raw            = %s,
+                    cuisson_program_number = %s,
+                    cuisson_h2_percent     = %s,
+                    cuisson_program_id     = %s,
+                    updated_at             = NOW()
+                WHERE id = %s
+                """,
+                (raw_value, program_number, h2_percent, cuisson_program_id, nuance_id)
+            )
+            conn.commit()
+
+            program = get_cuisson_program_by_number(cur, program_number) if cuisson_program_id else None
+            n2_percent = (100 - h2_percent) if h2_percent is not None else None
+
+            return jsonify({
+                "success":             True,
+                "message":             f"Programme de cuisson '{raw_value}' associé à la nuance {nuance['reference']}",
+                "nuance_id":           nuance_id,
+                "cuisson_raw":         raw_value,
+                "program_number":      program_number,
+                "h2_percent":          h2_percent,
+                "n2_percent":          n2_percent,
+                "atmosphere":          f"H2 {h2_percent}% + N2 {n2_percent}%",
+                "program_found_in_db": cuisson_program_id is not None,
+                "program":             program,
+            }), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route("/nuance/<int:nuance_id>/update", methods=["PUT"])
+def update_nuance(nuance_id):
+    if not request.is_json:
+        return jsonify({"success": False, "error": "Request body must be JSON"}), 400
+    data = request.get_json()
+
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+
+                # ── 0. Vérifier existence ─────────────────────────────────────
+                cur.execute("SELECT id, reference FROM public.nuances WHERE id = %s", (nuance_id,))
+                existing = cur.fetchone()
+                if not existing:
+                    return jsonify({"success": False, "error": "Nuance not found"}), 404
+
+                # ── 1. Champs identité ────────────────────────────────────────
+                product_reference         = data.get("product_reference")
+                nuance_name               = data.get("nuance_name")
+                document_revision_history = data.get("document_revision_history")
+                warne_raw                 = (data.get("warne_nachbehandlung") or "").strip()
+
+                if not product_reference or not nuance_name:
+                    return jsonify({"success": False, "error": "product_reference and nuance_name are required"}), 400
+
+                # ── 2. Parser le programme de cuisson ────────────────────────
+                cuisson_program_number = cuisson_h2_percent = cuisson_program_id = None
+                if warne_raw:
+                    cuisson_program_number, cuisson_h2_percent = parse_warne_nachbehandlung(warne_raw)
+                    if cuisson_program_number:
+                        cur.execute(
+                            "SELECT id FROM public.cuisson_programs WHERE program_number = %s LIMIT 1",
+                            (cuisson_program_number,)
+                        )
+                        prog_row = cur.fetchone()
+                        if prog_row:
+                            cuisson_program_id = prog_row[0]
+
+                # ── 3. Mettre à jour la table nuances ────────────────────────
+                cur.execute(
+                    """
+                    UPDATE public.nuances
+                    SET reference                  = %s,
+                        name                       = %s,
+                        document_revision_history  = %s,
+                        cuisson_raw                = %s,
+                        cuisson_program_number     = %s,
+                        cuisson_h2_percent         = %s,
+                        cuisson_program_id         = %s,
+                        updated_at                 = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        product_reference,
+                        nuance_name,
+                        Json(document_revision_history) if document_revision_history else None,
+                        warne_raw or None,
+                        cuisson_program_number,
+                        cuisson_h2_percent,
+                        cuisson_program_id,
+                        nuance_id
+                    )
+                )
+
+                # ── 4. Résoudre et valider toutes les références ──────────────
+                components         = data.get("components", [])
+                process_steps      = data.get("process_steps", [])
+                step_materials_map = data.get("step_materials", {})
+                control_plan       = data.get("control_plan", [])
+
+                ref_lookup, validation_errors = resolve_nuance_ref_lookup(cur, components)
+                if validation_errors:
+                    return jsonify({"success": False, "validation_errors": validation_errors}), 400
+
+                all_step_refs = {ref for refs in step_materials_map.values() for ref in refs if ref}
+                extra_refs    = all_step_refs - set(ref_lookup.keys())
+                if extra_refs:
+                    extra_lookup, extra_errors = resolve_nuance_ref_lookup(
+                        cur, [{"reference": r} for r in extra_refs]
+                    )
+                    if extra_errors:
+                        return jsonify({"success": False, "validation_errors": extra_errors}), 400
+                    ref_lookup.update(extra_lookup)
+
+                # ── 5. Supprimer l'ancienne composition / étapes / contrôle ──
+                # Récupérer les IDs des anciennes étapes pour supprimer leurs matières
+                cur.execute(
+                    "SELECT id FROM public.nuance_process_steps WHERE nuance_id = %s",
+                    (nuance_id,)
+                )
+                old_step_ids = [r[0] for r in cur.fetchall()]
+                if old_step_ids:
+                    cur.execute(
+                        "DELETE FROM public.nuance_step_materials WHERE process_step_id = ANY(%s)",
+                        (old_step_ids,)
+                    )
+                cur.execute("DELETE FROM public.nuance_process_steps  WHERE nuance_id = %s", (nuance_id,))
+                cur.execute("DELETE FROM public.nuance_components      WHERE nuance_id = %s", (nuance_id,))
+                cur.execute("DELETE FROM public.nuance_control_plan    WHERE nuance_id = %s", (nuance_id,))
+
+                # ── 6. Réinsérer les composants ───────────────────────────────
+                for component in components:
+                    ref      = component.get("reference")
+                    resolved = ref_lookup[ref]
+                    cur.execute(
+                        """
+                        INSERT INTO public.nuance_components
+                            (nuance_id, matiere_id, sub_black_mix_id, sub_nuance_id,
+                             component_name, quantity_value, quantity_unit, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            nuance_id,
+                            resolved["id"] if resolved["type"] == "matiere"    else None,
+                            resolved["id"] if resolved["type"] == "black_mix"  else None,
+                            resolved["id"] if resolved["type"] == "nuance"     else None,
+                            component.get("component_name") or ref,
+                            component.get("quantity"),
+                            component.get("unit", "kg"),
+                            Json(component.get("metadata", {}))
+                        )
+                    )
+
+                # ── 7. Réinsérer les étapes + step_materials ──────────────────
+                if not process_steps:
+                    return jsonify({"success": False, "error": "At least one process_step is required"}), 400
+
+                for step in process_steps:
+                    step_order = step.get("step_order")
+                    cur.execute(
+                        """
+                        INSERT INTO public.nuance_process_steps
+                            (nuance_id, step_order, step_name, machine_name, parameters)
+                        VALUES (%s, %s, %s, %s, %s) RETURNING id
+                        """,
+                        (
+                            nuance_id,
+                            step_order,
+                            step.get("step_name"),
+                            step.get("machine"),
+                            Json(step.get("parameters", {}))
+                        )
+                    )
+                    process_step_id = cur.fetchone()[0]
+
+                    refs_for_step = step_materials_map.get(str(step_order), [])
+                    if not refs_for_step:
+                        raise ValueError(
+                            f"Step '{step.get('step_name')}' (order {step_order}) "
+                            f"has no materials in step_materials"
+                        )
+
+                    seen_ids = set()
+                    for ref in refs_for_step:
+                        if not ref:
+                            continue
+                        resolved = ref_lookup.get(ref)
+                        if not resolved:
+                            raise ValueError(f"Reference '{ref}' in step_materials not resolved")
+                        dedup_key = (resolved["type"], resolved["id"])
+                        if dedup_key in seen_ids:
+                            continue
+                        seen_ids.add(dedup_key)
+                        cur.execute(
+                            """
+                            INSERT INTO public.nuance_step_materials
+                                (process_step_id, matiere_id, sub_black_mix_id, sub_nuance_id, created_at)
+                            VALUES (%s, %s, %s, %s, NOW())
+                            """,
+                            (
+                                process_step_id,
+                                resolved["id"] if resolved["type"] == "matiere"   else None,
+                                resolved["id"] if resolved["type"] == "black_mix" else None,
+                                resolved["id"] if resolved["type"] == "nuance"    else None,
+                            )
+                        )
+
+                # ── 8. Réinsérer le plan de contrôle ─────────────────────────
+                for param in control_plan:
+                    cur.execute(
+                        """
+                        INSERT INTO public.nuance_control_plan
+                            (nuance_id, parameter_name, target_value, min_value, max_value, unit)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            nuance_id,
+                            param.get("parameter_name"),
+                            param.get("target_value"),
+                            param.get("min_value"),
+                            param.get("max_value"),
+                            param.get("unit")
+                        )
+                    )
+
+                # ── 9. Reconstruire et versionner l'ADN ──────────────────────
+                new_snapshot = build_nuance_adn_snapshot(
+                    cur, nuance_id, product_reference, nuance_name
+                )
+
+                cur.execute(
+                    "SELECT version FROM public.nuance_adn WHERE nuance_id = %s ORDER BY version DESC LIMIT 1",
+                    (nuance_id,)
+                )
+                last_version_row = cur.fetchone()
+                next_version     = (last_version_row[0] + 1) if last_version_row else 1
+
+                cur.execute(
+                    """
+                    INSERT INTO public.nuance_adn
+                        (nuance_id, adn_text, version, created_at)
+                    VALUES (%s, %s, %s, NOW()) RETURNING id
+                    """,
+                    (nuance_id, Json(new_snapshot), next_version)
+                )
+                new_adn_id = cur.fetchone()[0]
+
+                return jsonify({
+                    "success":           True,
+                    "message":           f"Nuance '{nuance_name}' updated successfully",
+                    "nuance_id":         nuance_id,
+                    "product_reference": product_reference,
+                    "component_types":   {ref: info["type"] for ref, info in ref_lookup.items()},
+                    "adn": {
+                        "id":      new_adn_id,
+                        "version": next_version
+                    },
+                    "cuisson": {
+                        "raw":           warne_raw or None,
+                        "program_number": cuisson_program_number,
+                        "h2_percent":    cuisson_h2_percent,
+                        "program_found": cuisson_program_id is not None
+                    }
+                }), 200
+
+    except ValueError as ve:
+        conn.rollback()
+        return jsonify({"success": False, "error": str(ve)}), 400
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Update Nuance error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+# =============================================================================
 # MAIN
-# -----------------------------------------------------------------------------
+# =============================================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "5000")))
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
-    
-    # Start cleanup thread for temporary files (every 30 minutes)
     cleanup_thread = Thread(target=cleanup_old_files, daemon=True)
     cleanup_thread.start()
     print("🧹 Background cleanup task started (runs every 30 minutes)")
-
     app.run(host=args.host, port=args.port, debug=args.debug)
