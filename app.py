@@ -55,8 +55,8 @@ openai_api_key = HARDCODED_OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 
 GROQ_API_KEYS = [
-    "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",
-    "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",
+    "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",
+    "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",
 ]
 
 current_groq_key_index = 0
@@ -1439,17 +1439,17 @@ def resolve_nuance_ref_lookup(cur, components):
         cur.execute("SELECT id FROM public.nuances WHERE reference = %s LIMIT 1", (ref,))
         row = cur.fetchone()
         if row:
-            ref_lookup[ref] = {"type": "nuance", "id": row[0]}
+            ref_lookup[ref] = {"type": "nuance", "id": row["id"]}
             continue
         cur.execute("SELECT id FROM public.black_mixes WHERE reference = %s LIMIT 1", (ref,))
         row = cur.fetchone()
         if row:
-            ref_lookup[ref] = {"type": "black_mix", "id": row[0]}
+            ref_lookup[ref] = {"type": "black_mix", "id": row["id"]}
             continue
         cur.execute("SELECT matiere_id FROM public.matieres WHERE reference = %s LIMIT 1", (ref,))
         row = cur.fetchone()
         if row:
-            ref_lookup[ref] = {"type": "matiere", "id": row[0]}
+            ref_lookup[ref] = {"type": "matiere", "id": row["matiere_id"]}
             continue
         validation_errors.append(f"Reference '{ref}' not found in nuances, black_mixes or matieres")
     return ref_lookup, validation_errors
@@ -1534,7 +1534,7 @@ def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _v
     # ── Revision history ─────────────────────────────────────────────────────
     cur.execute("SELECT document_revision_history FROM public.nuances WHERE id = %s", (nuance_id,))
     row = cur.fetchone()
-    revision_history = row[0] if row and row[0] else None
+    revision_history = row["document_revision_history"] if row and row["document_revision_history"] else None
 
     # ── Cuisson program (Wärme-Nachbehandlung) — UPDATED with kontrolle ──────
     cur.execute(
@@ -1549,22 +1549,22 @@ def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _v
     )
     cuisson_row = cur.fetchone()
     cuisson_info = None
-    if cuisson_row and cuisson_row[0]:
-        h2 = cuisson_row[2]
+    if cuisson_row and cuisson_row["cuisson_raw"]:
+        h2 = cuisson_row["cuisson_h2_percent"]
         n2 = (100 - h2) if h2 is not None else None
         cuisson_info = {
-            "raw":            cuisson_row[0],
-            "program_number": cuisson_row[1],
+            "raw":            cuisson_row["cuisson_raw"],
+            "program_number": cuisson_row["cuisson_program_number"],
             "h2_percent":     h2,
             "n2_percent":     n2,
             "atmosphere":     f"H2 {h2}% + N2 {n2}%" if h2 is not None else None,
             "program": {
-                "type":              cuisson_row[3],
-                "kontrolle":         cuisson_row[4],
-                "max_temperature_c": float(cuisson_row[5]) if cuisson_row[5] else None,
-                "start_temp_c":      float(cuisson_row[6]) if cuisson_row[6] else 20,
-                "phases":            cuisson_row[7],
-            } if cuisson_row[3] else None,
+                "type":              cuisson_row["type"],
+                "kontrolle":         cuisson_row["kontrolle"],
+                "max_temperature_c": float(cuisson_row["max_temperature"]) if cuisson_row["max_temperature"] else None,
+                "start_temp_c":      float(cuisson_row["start_temp"]) if cuisson_row["start_temp"] else 20,
+                "phases":            cuisson_row["phases_json"],
+            } if cuisson_row["type"] else None,
         }
 
     # ── Components ───────────────────────────────────────────────────────────
@@ -1586,11 +1586,20 @@ def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _v
     raw_components = cur.fetchall()
     components = []
     for r in raw_components:
-        (comp_id, component_name, qty, unit, metadata,
-         matiere_id, sub_bm_id, sub_nuance_id,
-         matiere_ref, matiere_name,
-         sub_bm_ref, sub_bm_name,
-         sub_nuance_ref, sub_nuance_name) = r
+        comp_id = r["id"]
+        component_name = r["component_name"]
+        qty = r["quantity_value"]
+        unit = r["quantity_unit"]
+        metadata = r["metadata"]
+        matiere_id = r["matiere_id"]
+        sub_bm_id = r["sub_black_mix_id"]
+        sub_nuance_id = r["sub_nuance_id"]
+        matiere_ref = r["matiere_reference"]
+        matiere_name = r["matiere_name"]
+        sub_bm_ref = r["sub_bm_reference"]
+        sub_bm_name = r["sub_bm_name"]
+        sub_nuance_ref = r["sub_nuance_reference"]
+        sub_nuance_name = r["sub_nuance_name"]
         if sub_nuance_id is not None:
             comp_type, ref, name = "nuance",    sub_nuance_ref, sub_nuance_name
         elif sub_bm_id is not None:
@@ -1611,7 +1620,11 @@ def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _v
     steps_raw = cur.fetchall()
     process_steps = []
     for s in steps_raw:
-        step_id, step_order, step_name, machine, parameters = s
+        step_id = s["id"]
+        step_order = s["step_order"]
+        step_name = s["step_name"]
+        machine = s["machine_name"]
+        parameters = s["parameters"]
         cur.execute("""
             SELECT sm.matiere_id, sm.sub_black_mix_id, sm.sub_nuance_id,
                    m.reference AS matiere_ref, bm.reference AS sub_bm_ref, sn.reference AS sub_nuance_ref
@@ -1623,14 +1636,14 @@ def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _v
         """, (step_id,))
         step_mat_refs = []
         for sm in cur.fetchall():
-            ref = sm[5] if sm[2] is not None else (sm[4] if sm[1] is not None else sm[3])
+            ref = sm["sub_nuance_ref"] if sm["sub_nuance_id"] is not None else (sm["sub_bm_ref"] if sm["sub_black_mix_id"] is not None else sm["matiere_ref"])
             if ref:
                 step_mat_refs.append(ref)
         process_steps.append({"step_order": step_order, "step_name": step_name, "machine": machine, "parameters": parameters, "materials": step_mat_refs})
 
     # ── Control plan ─────────────────────────────────────────────────────────
     cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit FROM public.nuance_control_plan WHERE nuance_id = %s ORDER BY parameter_name", (nuance_id,))
-    control_plan = [{"parameter_name": r[0], "target_value": float(r[1]) if r[1] is not None else None, "min_value": float(r[2]) if r[2] is not None else None, "max_value": float(r[3]) if r[3] is not None else None, "unit": r[4]} for r in cur.fetchall()]
+    control_plan = [{"parameter_name": r["parameter_name"], "target_value": float(r["target_value"]) if r["target_value"] is not None else None, "min_value": float(r["min_value"]) if r["min_value"] is not None else None, "max_value": float(r["max_value"]) if r["max_value"] is not None else None, "unit": r["unit"]} for r in cur.fetchall()]
 
     # ── Images + expert notes ─────────────────────────────────────────────────
     cur.execute("""
@@ -1639,7 +1652,7 @@ def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _v
         LEFT JOIN public.nuance_expert_notes ne ON ne.nuance_image_id = ni.id
         WHERE ni.nuance_id = %s ORDER BY ni.id
     """, (nuance_id,))
-    images = [{"image_id": r[0], "image_path": r[1], "expert_note": {"note_json": r[2], "created_at": r[3].isoformat() if r[3] else None} if r[2] else None} for r in cur.fetchall()]
+    images = [{"image_id": r["id"], "image_path": r["image_path"], "expert_note": {"note_json": r["note_json"], "created_at": r["note_created_at"].isoformat() if r["note_created_at"] else None} if r["note_json"] else None} for r in cur.fetchall()]
 
     def flatten(comp_list, depth=0):
         flat = []
@@ -1790,7 +1803,7 @@ def submit_nuance():
                         prog_row = cur.fetchone()
 
                         if prog_row:
-                            cuisson_program_id = prog_row[0]
+                            cuisson_program_id = prog_row["id"]
 
                 # ───────── INSERT NUANCE ─────────
                 cur.execute("""
@@ -1896,13 +1909,15 @@ def submit_nuance():
                 adn_snapshot = build_nuance_adn_snapshot(
                     cur, nuance_id, product_reference, nuance_name
                 )
+                adn_snapshot = serialize_to_json_compatible(adn_snapshot)
+                adn_json_str = json.dumps(adn_snapshot, default=str)
 
                 cur.execute("""
                     INSERT INTO public.nuance_adn
                         (nuance_id, adn_text, version, created_at)
-                    VALUES (%s, %s, 1, NOW())
+                    VALUES (%s, %s::jsonb, 1, NOW())
                     RETURNING id
-                """, (nuance_id, Json(adn_snapshot)))
+                """, (nuance_id, adn_json_str))
 
                 adn_id = cur.fetchone()["id"]
 
@@ -1917,12 +1932,15 @@ def submit_nuance():
 
     except Exception as e:
         conn.rollback()
+        import traceback
+        tb = traceback.format_exc()
         logging.error("🔥 ERROR submit_nuance", exc_info=True)
 
         return jsonify({
             "success": False,
             "error": str(e),
-            "type": type(e).__name__
+            "type": type(e).__name__,
+            "traceback": tb
         }), 500
 
     finally:
