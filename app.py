@@ -1064,7 +1064,7 @@ def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name,
     _visited.add(black_mix_id)
     cur.execute("SELECT document_revision_history FROM public.black_mixes WHERE id = %s", (black_mix_id,))
     bm_row = cur.fetchone()
-    revision_history = bm_row[0] if bm_row and bm_row[0] else None
+    revision_history = bm_row["document_revision_history"] if bm_row and bm_row["document_revision_history"] else None
     cur.execute("""
         SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit, c.metadata,
                c.matiere_id, c.sub_black_mix_id,
@@ -1078,28 +1078,26 @@ def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name,
     raw_components = cur.fetchall()
     components = []
     for r in raw_components:
-        (comp_id, component_name, qty, unit, metadata, matiere_id, sub_bm_id, matiere_ref, matiere_name, sub_bm_ref, sub_bm_name) = r
-        is_sub = sub_bm_id is not None
-        entry = {"id": comp_id, "component_name": component_name, "quantity": float(qty) if qty is not None else None, "unit": unit, "metadata": metadata, "is_sub_black_mix": is_sub, "reference": sub_bm_ref if is_sub else matiere_ref, "material_name": sub_bm_name if is_sub else matiere_name, "sub_black_mix_id": sub_bm_id, "matiere_id": matiere_id, "sub_black_mix_adn": None}
+        is_sub = r["sub_black_mix_id"] is not None
+        entry = {"id": r["id"], "component_name": r["component_name"], "quantity": float(r["quantity_value"]) if r["quantity_value"] is not None else None, "unit": r["quantity_unit"], "metadata": r["metadata"], "is_sub_black_mix": is_sub, "reference": r["sub_bm_reference"] if is_sub else r["matiere_reference"], "material_name": r["sub_bm_name"] if is_sub else r["matiere_name"], "sub_black_mix_id": r["sub_black_mix_id"], "matiere_id": r["matiere_id"], "sub_black_mix_adn": None}
         if is_sub:
-            entry["sub_black_mix_adn"] = build_black_mix_adn_snapshot(cur, sub_bm_id, sub_bm_ref, sub_bm_name, _visited=set(_visited))
+            entry["sub_black_mix_adn"] = build_black_mix_adn_snapshot(cur, r["sub_black_mix_id"], r["sub_bm_reference"], r["sub_bm_name"], _visited=set(_visited))
         components.append(entry)
     cur.execute("SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters FROM public.black_mix_process_steps s WHERE s.black_mix_id = %s ORDER BY s.step_order", (black_mix_id,))
     steps_raw = cur.fetchall()
     process_steps = []
     for s in steps_raw:
-        step_id, step_order, step_name, machine, parameters = s
         cur.execute("""
             SELECT sm.matiere_id, sm.sub_black_mix_id, m.reference AS matiere_ref, bm.reference AS sub_bm_ref
             FROM public.black_mix_step_materials sm
             LEFT JOIN public.matieres m ON m.matiere_id = sm.matiere_id
             LEFT JOIN public.black_mixes bm ON bm.id = sm.sub_black_mix_id
             WHERE sm.process_step_id = %s
-        """, (step_id,))
-        step_mat_refs = [sm[3] if sm[1] is not None else sm[2] for sm in cur.fetchall() if (sm[3] if sm[1] is not None else sm[2])]
-        process_steps.append({"step_order": step_order, "step_name": step_name, "machine": machine, "parameters": parameters, "materials": step_mat_refs})
+        """, (s["id"],))
+        step_mat_refs = [sm["sub_bm_ref"] if sm["sub_black_mix_id"] is not None else sm["matiere_ref"] for sm in cur.fetchall() if (sm["sub_bm_ref"] if sm["sub_black_mix_id"] is not None else sm["matiere_ref"])]
+        process_steps.append({"step_order": s["step_order"], "step_name": s["step_name"], "machine": s["machine_name"], "parameters": s["parameters"], "materials": step_mat_refs})
     cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit FROM public.black_mix_control_plan WHERE black_mix_id = %s ORDER BY parameter_name", (black_mix_id,))
-    control_plan = [{"parameter_name": r[0], "target_value": float(r[1]) if r[1] is not None else None, "min_value": float(r[2]) if r[2] is not None else None, "max_value": float(r[3]) if r[3] is not None else None, "unit": r[4]} for r in cur.fetchall()]
+    control_plan = [{"parameter_name": r["parameter_name"], "target_value": float(r["target_value"]) if r["target_value"] is not None else None, "min_value": float(r["min_value"]) if r["min_value"] is not None else None, "max_value": float(r["max_value"]) if r["max_value"] is not None else None, "unit": r["unit"]} for r in cur.fetchall()]
 
     def flatten(comp_list, depth=0):
         flat = []
@@ -1867,11 +1865,6 @@ def submit_nuance():
                     process_step_id = cur.fetchone()["id"]
 
                     refs_for_step = step_materials_map.get(str(step_order), [])
-
-                    if not refs_for_step:
-                        raise ValueError(
-                            f"Step '{step.get('step_name')}' has no materials"
-                        )
 
                     for ref in refs_for_step:
                         resolved = ref_lookup.get(ref)
