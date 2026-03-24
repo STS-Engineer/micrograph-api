@@ -717,6 +717,168 @@ def download_fiche_adn_docx(filename):
         return jsonify({"success": False, "error": "download_failed", "message": str(e)}), 500
 
 
+# =============================================================================
+# DOCX GENERATION — BLACK MIX
+# =============================================================================
+
+@app.route("/generate_black_mix_adn_docx", methods=["GET"])
+def generate_black_mix_adn_docx():
+    mix_id = request.args.get("mix_id", "").strip()
+    if not mix_id:
+        return jsonify({"success": False, "error": "missing mix_id parameter"}), 400
+    conn = None
+    try:
+        conn = psycopg2.connect(DB_DSN)
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, reference, name, status, created_at, document_revision_history FROM public.black_mixes WHERE id = %s", (int(mix_id),))
+            bm = cur.fetchone()
+            if not bm:
+                return jsonify({"success": False, "error": "black_mix_not_found"}), 404
+            snapshot = build_black_mix_adn_snapshot(cur, bm["id"], bm["reference"], bm["name"])
+            snapshot = serialize_to_json_compatible(snapshot)
+        prompt = f"""Tu es un expert en formulation industrielle de matériaux carbone et graphite.
+Génère un "Rapport Technique BLACK MIX ADN" COMPLET en suivant cette structure:
+#### 1. Identité du Black Mix
+#### 2. Composition et ADN des Composants
+#### 3. Processus de Fabrication (Mischkarte)
+#### 4. Plan de Contrôle
+#### 5. Synthèse de l'Identité Structurelle
+RÈGLES: Aucune hallucination. Langue: Français. Style professionnel.
+### DONNÉES SOURCE (JSON):
+{json.dumps(snapshot, indent=2, ensure_ascii=False, default=str)}"""
+        ai_content = call_groq_with_retry(
+            messages=[{"role": "system", "content": "Tu es un expert en formulation industrielle."},
+                      {"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile", temperature=0.2, max_tokens=6000
+        )
+        content = ai_content.choices[0].message.content if ai_content.choices else ""
+        doc = Document()
+        title = doc.add_heading(f"RAPPORT ADN — BLACK MIX {bm['name']}", level=1)
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        info = doc.add_paragraph()
+        info.add_run(f"Référence: {bm['reference']}\n").bold = True
+        info.add_run(f"Statut: {bm['status']}\n")
+        info.add_run(f"Généré le: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+        doc.add_paragraph()
+        add_formatted_markdown_to_docx(doc, content)
+        timestamp = int(time.time())
+        random_id = uuid.uuid4().hex[:8]
+        filename = f"ADN_BlackMix_{bm['reference']}_{timestamp}_{random_id}.docx"
+        filepath = DOCX_TEMP_DIR / filename
+        doc.save(str(filepath))
+        host = request.host or os.getenv("API_HOST", "localhost:5000")
+        protocol = request.headers.get("X-Forwarded-Proto", request.scheme)
+        if ".azurewebsites.net" in host or ".azure" in host:
+            protocol = "https"
+        absolute_url = f"{protocol}://{host}/download_fiche_adn_docx/{filename}"
+        return jsonify({"success": True, "file_name": filename, "download_url": f"/download_fiche_adn_docx/{filename}", "absolute_url": absolute_url, "expires_in": "1 hour"}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": "generation_failed", "message": str(e)}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+# =============================================================================
+# DOCX GENERATION — NUANCE
+# =============================================================================
+
+@app.route("/generate_nuance_adn_docx", methods=["GET"])
+def generate_nuance_adn_docx():
+    nuance_id = request.args.get("nuance_id", "").strip()
+    if not nuance_id:
+        return jsonify({"success": False, "error": "missing nuance_id parameter"}), 400
+    conn = None
+    try:
+        conn = psycopg2.connect(DB_DSN)
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, reference, name, status, created_at, document_revision_history FROM public.nuances WHERE id = %s", (int(nuance_id),))
+            nuance = cur.fetchone()
+            if not nuance:
+                return jsonify({"success": False, "error": "nuance_not_found"}), 404
+            snapshot = build_nuance_adn_snapshot(cur, nuance["id"], nuance["reference"], nuance["name"])
+            snapshot = serialize_to_json_compatible(snapshot)
+            for img in snapshot.get("images", []):
+                if img.get("image_path"):
+                    try:
+                        img["image_url"] = build_image_url(img["image_path"])
+                    except RuntimeError:
+                        img["image_url"] = None
+        prompt = f"""Tu es un expert en formulation industrielle de matériaux carbone et graphite.
+Génère un "Rapport Technique NUANCE ADN" COMPLET en suivant cette structure:
+#### 1. Identité de la Nuance
+#### 2. Programme de Cuisson (Wärme-Nachbehandlung)
+#### 3. Composition et ADN des Composants
+#### 4. Processus de Fabrication (Mischkarte)
+#### 5. Plan de Contrôle
+#### 6. Historique des Révisions
+#### 7. Synthèse de l'Identité Structurelle
+RÈGLES: Aucune hallucination. Langue: Français. Style professionnel.
+### DONNÉES SOURCE (JSON):
+{json.dumps(snapshot, indent=2, ensure_ascii=False, default=str)}"""
+        ai_content = call_groq_with_retry(
+            messages=[{"role": "system", "content": "Tu es un expert en formulation industrielle."},
+                      {"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile", temperature=0.2, max_tokens=6000
+        )
+        content = ai_content.choices[0].message.content if ai_content.choices else ""
+        doc = Document()
+        title = doc.add_heading(f"RAPPORT ADN — NUANCE {nuance['name']}", level=1)
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        info = doc.add_paragraph()
+        info.add_run(f"Référence: {nuance['reference']}\n").bold = True
+        info.add_run(f"Statut: {nuance['status']}\n")
+        info.add_run(f"Généré le: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+        doc.add_paragraph()
+        doc.add_heading("CONTENU", level=2)
+        add_formatted_markdown_to_docx(doc, content)
+        images = snapshot.get("images", [])
+        if images:
+            doc.add_page_break()
+            img_title = doc.add_heading("Micrographies de la Nuance", level=2)
+            img_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for img_data in images[:4]:
+                image_path = img_data.get("image_path")
+                if not image_path:
+                    continue
+                normalized = image_path.replace("\\\\", "/")
+                fname = Path(normalized).name
+                img_obj = None
+                for fpath in [Path(normalized), BASE_DIR / normalized, IMAGES_DIR / fname, BASE_DIR / "output_v3" / "images" / fname, BASE_DIR / "output_v4" / "images" / fname]:
+                    try:
+                        if fpath.exists():
+                            img_obj = Image.open(fpath).convert("RGB")
+                            break
+                    except Exception:
+                        pass
+                if img_obj:
+                    img_stream = io.BytesIO()
+                    img_obj.save(img_stream, format="PNG")
+                    img_stream.seek(0)
+                    try:
+                        doc.add_picture(img_stream, width=Inches(5))
+                        doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    except Exception as e:
+                        print(f"⚠️ Could not add image: {e}")
+                    doc.add_paragraph()
+        timestamp = int(time.time())
+        random_id = uuid.uuid4().hex[:8]
+        filename = f"ADN_Nuance_{nuance['reference']}_{timestamp}_{random_id}.docx"
+        filepath = DOCX_TEMP_DIR / filename
+        doc.save(str(filepath))
+        host = request.host or os.getenv("API_HOST", "localhost:5000")
+        protocol = request.headers.get("X-Forwarded-Proto", request.scheme)
+        if ".azurewebsites.net" in host or ".azure" in host:
+            protocol = "https"
+        absolute_url = f"{protocol}://{host}/download_fiche_adn_docx/{filename}"
+        return jsonify({"success": True, "file_name": filename, "download_url": f"/download_fiche_adn_docx/{filename}", "absolute_url": absolute_url, "expires_in": "1 hour"}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": "generation_failed", "message": str(e)}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
 @app.route("/populate_fiches_adn_table", methods=["POST"])
 def populate_fiches_adn_table():
     try:
@@ -2555,6 +2717,477 @@ def update_nuance(nuance_id):
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
         conn.close()
+
+# =============================================================================
+# XLS → XLSX CONVERSION + SHEET EXTRACTION TO JSON
+# =============================================================================
+
+def _xlrd_cell_to_str(cell, book):
+    """Convert an xlrd cell to a clean string value."""
+    import xlrd
+    value = cell.value
+    if cell.ctype == xlrd.XL_CELL_DATE:
+        try:
+            dt_tuple = xlrd.xldate_as_tuple(value, book.datemode)
+            return datetime(*dt_tuple).strftime("%Y-%m-%d")
+        except Exception:
+            return str(value)
+    elif cell.ctype == xlrd.XL_CELL_NUMBER:
+        if value == int(value):
+            return str(int(value))
+        return str(value)
+    elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
+        return "TRUE" if value else "FALSE"
+    elif cell.ctype == xlrd.XL_CELL_EMPTY:
+        return ""
+    return str(value).strip()
+
+
+def _extract_sheet_raw(xls_sheet, book):
+    """Extract all non-empty cells from an xlrd sheet."""
+    cells = []
+    all_text_parts = []
+    rows_compact = []
+    for row_idx in range(xls_sheet.nrows):
+        row_dict = {}
+        for col_idx in range(xls_sheet.ncols):
+            value = _xlrd_cell_to_str(xls_sheet.cell(row_idx, col_idx), book)
+            if value != "":
+                cells.append({"row": row_idx + 1, "col": col_idx + 1, "value": value})
+                all_text_parts.append(value)
+                row_dict[f"col_{col_idx + 1}"] = value
+        if row_dict:
+            row_dict["_row"] = row_idx + 1
+            rows_compact.append(row_dict)
+    return cells, all_text_parts, rows_compact
+
+
+def _parse_sollwerte(xls_sheet, book):
+    """Parse the Sollwerte sheet into structured specification data."""
+    import xlrd
+    result = {
+        "vormischung": "",
+        "reference": "",
+        "revisions": []
+    }
+    # Row 0: Vormischung / reference
+    if xls_sheet.nrows > 0:
+        if xls_sheet.ncols > 0:
+            result["vormischung"] = _xlrd_cell_to_str(xls_sheet.cell(0, 0), book)
+        if xls_sheet.ncols > 1:
+            result["reference"] = _xlrd_cell_to_str(xls_sheet.cell(0, 1), book)
+
+    # Parse revision blocks. A new block starts at "geändert am/von", "erstellt am",
+    # or "Änderungsgrund". The topmost block in the sheet is the latest revision.
+    current_revision = None
+    i = 1
+    while i < xls_sheet.nrows:
+        col0 = _xlrd_cell_to_str(xls_sheet.cell(i, 0), book).lower()
+
+        if "geändert am" in col0 or "erstellt am" in col0:
+            if current_revision:
+                result["revisions"].append(current_revision)
+            date_val = _xlrd_cell_to_str(xls_sheet.cell(i, 1), book) if xls_sheet.ncols > 1 else ""
+            author = _xlrd_cell_to_str(xls_sheet.cell(i, 2), book) if xls_sheet.ncols > 2 else ""
+            current_revision = {
+                "date": date_val,
+                "author": author,
+                "change_reason": "",
+                "specifications": []
+            }
+            i += 1
+            continue
+
+        if "änderungsgrund" in col0:
+            # Each Änderungsgrund starts a new spec block
+            if current_revision and current_revision["specifications"]:
+                result["revisions"].append(current_revision)
+            reason = _xlrd_cell_to_str(xls_sheet.cell(i, 1), book) if xls_sheet.ncols > 1 else ""
+            if not current_revision:
+                current_revision = {"date": "", "author": "", "change_reason": reason, "specifications": []}
+            else:
+                current_revision = {
+                    "date": current_revision.get("date", ""),
+                    "author": current_revision.get("author", ""),
+                    "change_reason": reason,
+                    "specifications": []
+                }
+            i += 1
+            continue
+
+        # Check for min/max header row
+        col1 = _xlrd_cell_to_str(xls_sheet.cell(i, 1), book).lower() if xls_sheet.ncols > 1 else ""
+        if col1 == "min":
+            i += 1
+            continue
+
+        # Spec rows (e.g. "Schüttdichte [g/L]", "> 630 µm [%]", etc.)
+        if col0 and ("µm" in col0 or "schüttdichte" in col0 or "dichte" in col0):
+            name = _xlrd_cell_to_str(xls_sheet.cell(i, 0), book)
+            min_val = _xlrd_cell_to_str(xls_sheet.cell(i, 1), book) if xls_sheet.ncols > 1 else ""
+            max_val = _xlrd_cell_to_str(xls_sheet.cell(i, 2), book) if xls_sheet.ncols > 2 else ""
+            spec = {"parameter": name, "min": min_val, "max": max_val}
+            if current_revision:
+                current_revision["specifications"].append(spec)
+            i += 1
+            continue
+
+        i += 1
+
+    if current_revision:
+        result["revisions"].append(current_revision)
+
+    # Active specs = first revision block that has specs with actual min/max values
+    result["active_specifications"] = []
+    for rev in result["revisions"]:
+        specs = [s for s in rev.get("specifications", []) if s.get("min") or s.get("max")]
+        if specs:
+            result["active_specifications"] = specs
+            break
+
+    return result
+
+
+def _parse_data_sheet(xls_sheet, book):
+    """Parse the reference/data sheet (e.g. '049 91') into structured measurement records."""
+    import xlrd
+    result = {
+        "type": "",
+        "reference": "",
+        "method": "",
+        "headers": [],
+        "measurements": []
+    }
+
+    if xls_sheet.nrows < 7:
+        return result
+
+    # Row 0: VM/HM, reference, method
+    result["type"] = _xlrd_cell_to_str(xls_sheet.cell(0, 0), book)
+    result["reference"] = _xlrd_cell_to_str(xls_sheet.cell(0, 1), book)
+    if xls_sheet.ncols > 4:
+        result["method"] = _xlrd_cell_to_str(xls_sheet.cell(0, 4), book)
+
+    # Data rows start at row 7 (index 7) based on structure:
+    # Row 3: top headers (Datum, Charge, Prüfer, Schüttdichte, Siebe)
+    # Row 4: sub-headers (FREI, sieve labels)
+    # Row 5: IST/SOLL labels
+    # Row 6: min/max labels
+    # Row 7+: data
+    for row_idx in range(7, xls_sheet.nrows):
+        row_num = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 0), book)
+        if not row_num:
+            continue
+
+        datum = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 1), book)
+        charge = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 2), book)
+        pruefer = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 3), book)
+
+        record = {
+            "nr": row_num,
+            "datum": datum,
+            "charge": charge,
+            "pruefer": pruefer,
+            "schuettdichte": _xlrd_cell_to_str(xls_sheet.cell(row_idx, 4), book),
+        }
+
+        # Sieve IST values only (SOLL is already in Sollwerte)
+        if xls_sheet.ncols > 10:
+            record["sieve_630"] = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 10), book)
+        if xls_sheet.ncols > 13:
+            record["sieve_355"] = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 13), book)
+        if xls_sheet.ncols > 16:
+            record["sieve_90"] = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 16), book)
+        if xls_sheet.ncols > 19:
+            record["sieve_lt90"] = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 19), book)
+
+        # Remove empty values to save space
+        record = {k: v for k, v in record.items() if v}
+
+        result["measurements"].append(record)
+
+    return result
+
+
+def _compute_measurement_stats(measurements, active_specs=None):
+    """Compute summary statistics for measurement data to avoid sending all rows."""
+    if not measurements:
+        return {"count": 0}
+
+    # Numeric fields to aggregate
+    fields = ["schuettdichte", "sieve_630", "sieve_355", "sieve_90", "sieve_lt90"]
+    stats = {"count": len(measurements)}
+
+    for field in fields:
+        values = []
+        for m in measurements:
+            raw = m.get(field, "")
+            if raw:
+                try:
+                    values.append(float(str(raw).replace(",", ".")))
+                except (ValueError, TypeError):
+                    pass
+        if values:
+            avg = sum(values) / len(values)
+            stats[field] = {
+                "count": len(values),
+                "min": round(min(values), 2),
+                "max": round(max(values), 2),
+                "mean": round(avg, 2),
+                "std": round((sum((x - avg) ** 2 for x in values) / len(values)) ** 0.5, 2)
+            }
+            # Count out-of-spec if specs are available
+            if active_specs:
+                spec = None
+                spec_map = {
+                    "schuettdichte": "schüttdichte",
+                    "sieve_630": "630",
+                    "sieve_355": "355",
+                    "sieve_90": "> 90",
+                    "sieve_lt90": "< 90"
+                }
+                search_key = spec_map.get(field, "")
+                for s in active_specs:
+                    if search_key in s.get("parameter", "").lower():
+                        spec = s
+                        break
+                if spec:
+                    spec_min = None
+                    spec_max = None
+                    try:
+                        if spec.get("min"):
+                            spec_min = float(str(spec["min"]).replace(",", "."))
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        if spec.get("max"):
+                            spec_max = float(str(spec["max"]).replace(",", "."))
+                    except (ValueError, TypeError):
+                        pass
+                    oos = 0
+                    for v in values:
+                        if (spec_min is not None and v < spec_min) or (spec_max is not None and v > spec_max):
+                            oos += 1
+                    stats[field]["out_of_spec"] = oos
+
+    # Date range
+    dates = [m.get("datum", "") for m in measurements if m.get("datum")]
+    if dates:
+        stats["date_range"] = {"first": dates[0], "last": dates[-1]}
+
+    return stats
+
+
+def _find_non_conformities(measurements, active_specs):
+    """Find charges (lots) whose measurement values exceed min/max from Sollwerte.
+    A charge may appear multiple times if it was re-tested after a non-conformity."""
+    if not measurements or not active_specs:
+        return []
+
+    # Build spec lookup: field_name -> (min, max)
+    spec_map = {
+        "schuettdichte": "schüttdichte",
+        "sieve_630": "630",
+        "sieve_355": "355",
+        "sieve_90": "> 90",
+        "sieve_lt90": "< 90"
+    }
+    spec_limits = {}
+    for field, search_key in spec_map.items():
+        for s in active_specs:
+            if search_key in s.get("parameter", "").lower():
+                spec_min = None
+                spec_max = None
+                try:
+                    if s.get("min"):
+                        spec_min = float(str(s["min"]).replace(",", "."))
+                except (ValueError, TypeError):
+                    pass
+                try:
+                    if s.get("max"):
+                        spec_max = float(str(s["max"]).replace(",", "."))
+                except (ValueError, TypeError):
+                    pass
+                if spec_min is not None or spec_max is not None:
+                    spec_limits[field] = (spec_min, spec_max, s.get("parameter", ""))
+                break
+
+    non_conf = []
+    for m in measurements:
+        charge = m.get("charge", "")
+        if not charge:
+            continue
+        failures = []
+        for field, (s_min, s_max, param_name) in spec_limits.items():
+            raw = m.get(field, "")
+            if not raw:
+                continue
+            try:
+                val = float(str(raw).replace(",", "."))
+            except (ValueError, TypeError):
+                continue
+            if (s_min is not None and val < s_min) or (s_max is not None and val > s_max):
+                failures.append({
+                    "parameter": param_name,
+                    "value": val,
+                    "min": s_min,
+                    "max": s_max
+                })
+        if failures:
+            non_conf.append({
+                "charge": charge,
+                "nr": m.get("nr", ""),
+                "datum": m.get("datum", ""),
+                "failures": failures
+            })
+
+    return non_conf
+
+
+@app.route("/convert_xls_to_json", methods=["POST"])
+def convert_xls_to_json():
+    """
+    Accepts an .xls file via JSON (OpenAI GPT integration), parses and extracts content.
+
+    For VM/HM files (filename starts with VM or HM): parses the 'Sollwerte' sheet
+    (specifications) and the reference data sheet (next to Sollwerte) into structured JSON.
+
+    For other files: extracts all cells as raw data.
+
+    JSON body:
+        openaiFileIdRefs – list of file refs with download_link, name, id (required)
+        sheet_name       – name of the sheet to extract (optional, default first sheet)
+        mode             – 'summary' (default, stats + last N rows) or 'full' (all rows)
+        max_rows         – max measurement rows to include (default 5 in summary mode)
+    """
+    import xlrd
+
+    data = request.get_json(silent=True) or {}
+    refs = data.get("openaiFileIdRefs")
+    sheet_name = data.get("sheet_name", None)
+    mode = str(data.get("mode", "summary")).lower()
+    max_rows = int(data.get("max_rows", 5))
+
+    if not refs or not isinstance(refs, list) or len(refs) == 0:
+        return jsonify({"success": False, "error": "Missing openaiFileIdRefs. Send a JSON body with openaiFileIdRefs list."}), 400
+
+    file_ref = refs[0]
+    download_link = file_ref.get("download_link")
+    original_name = file_ref.get("name") or "uploaded_file.xls"
+    file_id = file_ref.get("id")
+
+    if not original_name.lower().endswith(".xls"):
+        return jsonify({"success": False, "error": "Only .xls files are accepted."}), 400
+
+    # Download the file
+    xls_bytes = None
+    if download_link:
+        try:
+            r = requests.get(download_link, timeout=30)
+            r.raise_for_status()
+            xls_bytes = r.content
+        except Exception as e:
+            return jsonify({"success": False, "error": f"download_link failed: {e}"}), 400
+
+    if xls_bytes is None and file_id and client:
+        try:
+            xls_bytes = client.files.content(file_id).read()
+        except Exception as e:
+            return jsonify({"success": False, "error": f"OpenAI file download failed: {e}"}), 400
+
+    if xls_bytes is None:
+        return jsonify({"success": False, "error": "Could not download file. Provide a valid download_link or file id."}), 400
+
+    original_name = secure_filename(original_name)
+
+    try:
+        xls_book = xlrd.open_workbook(file_contents=xls_bytes, formatting_info=False)
+        all_sheets = xls_book.sheet_names()
+
+        # --- Detect VM/HM files ---
+        is_vm_hm = original_name.upper().startswith("VM") or original_name.upper().startswith("HM")
+        has_sollwerte = "Sollwerte" in all_sheets
+
+        if is_vm_hm and has_sollwerte:
+            # Structured parsing for VM/HM files
+            sollwerte_sheet = xls_book.sheet_by_name("Sollwerte")
+            sollwerte_data = _parse_sollwerte(sollwerte_sheet, xls_book)
+
+            # The data sheet is the one right after Sollwerte
+            sollwerte_idx = all_sheets.index("Sollwerte")
+            data_sheet_name = all_sheets[sollwerte_idx + 1] if sollwerte_idx + 1 < len(all_sheets) else None
+
+            data_sheet_result = None
+            if data_sheet_name:
+                data_sheet = xls_book.sheet_by_name(data_sheet_name)
+                data_sheet_result = _parse_data_sheet(data_sheet, xls_book)
+
+
+
+            # Build data_sheet response based on mode
+            ds_response = None
+            non_conformities = []
+            if data_sheet_name and data_sheet_result:
+                all_measurements = data_sheet_result["measurements"]
+                active_specs = sollwerte_data.get("active_specifications", [])
+
+                # Find charges with values outside spec
+                non_conformities = _find_non_conformities(all_measurements, active_specs)
+
+                ds_response = {
+                    "sheet_name": data_sheet_name,
+                    "type": data_sheet_result["type"],
+                    "reference": data_sheet_result["reference"],
+                    "method": data_sheet_result["method"],
+                    "total_measurements": len(all_measurements),
+                }
+                if mode == "full":
+                    ds_response["measurements"] = all_measurements
+                else:
+                    # Summary mode: stats + last N rows
+                    ds_response["statistics"] = _compute_measurement_stats(all_measurements, active_specs)
+                    ds_response["last_measurements"] = all_measurements[-max_rows:]
+
+            return jsonify({
+                "success": True,
+                "file_type": "VM/HM",
+                "source_file": original_name,
+                "available_sheets": all_sheets,
+                "mode": mode,
+                "sollwerte": sollwerte_data,
+                "non_conformities": non_conformities,
+                "data_sheet": ds_response
+            }), 200
+
+        # --- Generic parsing for non-VM/HM files ---
+        if sheet_name:
+            if sheet_name not in all_sheets:
+                return jsonify({
+                    "success": False,
+                    "error": f"Sheet '{sheet_name}' not found. Available sheets: {all_sheets}"
+                }), 400
+            xls_sheet = xls_book.sheet_by_name(sheet_name)
+        else:
+            xls_sheet = xls_book.sheet_by_index(0)
+            sheet_name = xls_sheet.name
+
+        cells, all_text_parts, rows_compact = _extract_sheet_raw(xls_sheet, xls_book)
+
+        return jsonify({
+            "success": True,
+            "file_type": "generic",
+            "source_file": original_name,
+            "sheet": sheet_name,
+            "available_sheets": all_sheets,
+            "rows": rows_compact
+        }), 200
+
+    except xlrd.biffh.XLRDError as e:
+        return jsonify({"success": False, "error": f"Invalid or corrupt .xls file: {e}"}), 400
+    except Exception as e:
+        logging.error(f"convert_xls_to_json error: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
 # =============================================================================
 # MAIN
 # =============================================================================
