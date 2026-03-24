@@ -219,6 +219,83 @@ def build_image_url(image_path: str) -> str:
     return url
 
 
+# =============================================================================
+# SHARED HELPERS — DRY
+# =============================================================================
+
+def _load_image_from_source(download_link=None, temp_filename=None, file_id=None):
+    """Load a PIL image from one of three sources. Returns (Image, error_tuple_or_None)."""
+    if download_link:
+        try:
+            r = requests.get(download_link, timeout=20)
+            r.raise_for_status()
+            return Image.open(io.BytesIO(r.content)).convert("RGB"), None
+        except Exception as e:
+            return None, ({"success": False, "error": "download_link_failed", "message": str(e)}, 400)
+    elif temp_filename:
+        file_path = TEMP_UPLOAD_DIR / temp_filename
+        if not file_path.exists():
+            return None, ({"success": False, "error": "temp_file_not_found"}, 404)
+        return Image.open(file_path).convert("RGB"), None
+    elif file_id:
+        if not client:
+            return None, ({"success": False, "error": "openai_not_configured"}, 400)
+        return Image.open(io.BytesIO(client.files.content(file_id).read())).convert("RGB"), None
+    return None, ({"success": False, "error": "No image source provided"}, 400)
+
+
+def _save_docx_and_build_url(doc, filename_prefix, reference):
+    """Save a Document to temp dir and return (filename, download_url, absolute_url)."""
+    timestamp = int(time.time())
+    random_id = uuid.uuid4().hex[:8]
+    ref_safe = secure_filename(reference) or "doc"
+    filename = f"{filename_prefix}_{ref_safe}_{timestamp}_{random_id}.docx"
+    filepath = DOCX_TEMP_DIR / filename
+    doc.save(str(filepath))
+    host = request.host or os.getenv("API_HOST", "localhost:5000")
+    protocol = request.headers.get("X-Forwarded-Proto", request.scheme)
+    if ".azurewebsites.net" in host or ".azure" in host:
+        protocol = "https"
+    absolute_url = f"{protocol}://{host}/download_fiche_adn_docx/{filename}"
+    return filename, f"/download_fiche_adn_docx/{filename}", absolute_url
+
+
+def _resolve_cuisson_program(cur, warne_raw):
+    """Parse warne_nachbehandlung and resolve the cuisson program. Returns (number, h2, program_id)."""
+    if not warne_raw or not warne_raw.strip():
+        return None, None, None
+    program_number, h2_percent = parse_warne_nachbehandlung(warne_raw.strip())
+    program_id = None
+    if program_number:
+        cur.execute("SELECT id FROM public.cuisson_programs WHERE program_number = %s LIMIT 1", (program_number,))
+        prog_row = cur.fetchone()
+        if prog_row:
+            program_id = prog_row["id"] if isinstance(prog_row, dict) else prog_row[0]
+    return program_number, h2_percent, program_id
+
+
+def _get_fiche_adn(cur, reference=None, matiere_id=None):
+    """Retrieve a fiche ADN by reference or matiere_id. Returns dict or None."""
+    if reference:
+        cur.execute("""
+            SELECT fiche_adn_id, matiere_id, nom_matiere, reference, type_matiere,
+                   specifications, num_specifications, date_creation, derniere_modification
+            FROM public.fiches_adn_matieres
+            WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
+            LIMIT 1
+        """, (reference,))
+    elif matiere_id:
+        cur.execute("""
+            SELECT fiche_adn_id, matiere_id, nom_matiere, reference, type_matiere,
+                   specifications, num_specifications, date_creation, derniere_modification
+            FROM public.fiches_adn_matieres WHERE matiere_id = %s LIMIT 1
+        """, (matiere_id,))
+    else:
+        return None
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
 def generate_fiche_adn_content_with_groq(fiche_data, material_name, reference, type_matiere, specifications):
     if not groq_client:
         return generate_fallback_fiche_adn_content(material_name, reference, type_matiere, specifications)
@@ -567,47 +644,19 @@ def get_material_details(matiere_id):
 # =============================================================================
 
 @app.route("/fiche_adn", methods=["GET"])
-def get_fiche_adn():
-    reference = request.args.get("reference", "").strip()
-    if not reference:
+@app.route("/fiche_adn/<int:matiere_id>", methods=["GET"])
+def get_fiche_adn(matiere_id=None):
+    reference = request.args.get("reference", "").strip() if matiere_id is None else None
+    if not matiere_id and not reference:
         return jsonify({"success": False, "error": "missing_parameters"}), 400
     conn = None
     try:
         conn = get_db_conn()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT fiche_adn_id, matiere_id, nom_matiere, reference, type_matiere,
-                       specifications, num_specifications, date_creation, derniere_modification
-                FROM public.fiches_adn_matieres
-                WHERE UPPER(REPLACE(TRIM(reference), ' ', '')) = UPPER(REPLACE(%s, ' ', ''))
-                LIMIT 1
-            """, (reference,))
-            result = cur.fetchone()
+            result = _get_fiche_adn(cur, reference=reference, matiere_id=matiere_id)
             if not result:
                 return jsonify({"success": False, "error": "fiche_adn_not_found"}), 404
-            return jsonify({"success": True, "fiche_adn": dict(result)}), 200
-    except Exception as e:
-        return jsonify({"success": False, "error": "retrieval_failed", "message": str(e)}), 500
-    finally:
-        if conn:
-            conn.close()
-
-
-@app.route("/fiche_adn/<int:matiere_id>", methods=["GET"])
-def get_fiche_adn_by_id(matiere_id):
-    conn = None
-    try:
-        conn = get_db_conn()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT fiche_adn_id, matiere_id, nom_matiere, reference, type_matiere,
-                       specifications, num_specifications, date_creation, derniere_modification
-                FROM public.fiches_adn_matieres WHERE matiere_id = %s LIMIT 1
-            """, (matiere_id,))
-            result = cur.fetchone()
-            if not result:
-                return jsonify({"success": False, "error": "fiche_adn_not_found"}), 404
-            return jsonify({"success": True, "fiche_adn": dict(result)}), 200
+            return jsonify({"success": True, "fiche_adn": result}), 200
     except Exception as e:
         return jsonify({"success": False, "error": "retrieval_failed", "message": str(e)}), 500
     finally:
@@ -686,17 +735,8 @@ def generate_fiche_adn_docx():
                     except Exception as e:
                         print(f"⚠️ Could not add image {idx}: {e}")
                     doc.add_paragraph()
-        timestamp = int(time.time())
-        random_id = uuid.uuid4().hex[:8]
-        filename = f"Fiche_ADN_{reference}_{timestamp}_{random_id}.docx"
-        filepath = DOCX_TEMP_DIR / filename
-        doc.save(str(filepath))
-        host = request.host or os.getenv("API_HOST", "localhost:5000")
-        protocol = request.headers.get("X-Forwarded-Proto", request.scheme)
-        if ".azurewebsites.net" in host or ".azure" in host:
-            protocol = "https"
-        absolute_download_url = f"{protocol}://{host}/download_fiche_adn_docx/{filename}"
-        return jsonify({"success": True, "file_name": filename, "download_url": f"/download_fiche_adn_docx/{filename}", "absolute_url": absolute_download_url, "expires_in": "1 hour"}), 200
+        filename, download_url, absolute_download_url = _save_docx_and_build_url(doc, "Fiche_ADN", reference)
+        return jsonify({"success": True, "file_name": filename, "download_url": download_url, "absolute_url": absolute_download_url, "expires_in": "1 hour"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": "generation_failed", "message": str(e)}), 500
     finally:
@@ -761,17 +801,8 @@ RÈGLES: Aucune hallucination. Langue: Français. Style professionnel.
         info.add_run(f"Généré le: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
         doc.add_paragraph()
         add_formatted_markdown_to_docx(doc, content)
-        timestamp = int(time.time())
-        random_id = uuid.uuid4().hex[:8]
-        filename = f"ADN_BlackMix_{bm['reference']}_{timestamp}_{random_id}.docx"
-        filepath = DOCX_TEMP_DIR / filename
-        doc.save(str(filepath))
-        host = request.host or os.getenv("API_HOST", "localhost:5000")
-        protocol = request.headers.get("X-Forwarded-Proto", request.scheme)
-        if ".azurewebsites.net" in host or ".azure" in host:
-            protocol = "https"
-        absolute_url = f"{protocol}://{host}/download_fiche_adn_docx/{filename}"
-        return jsonify({"success": True, "file_name": filename, "download_url": f"/download_fiche_adn_docx/{filename}", "absolute_url": absolute_url, "expires_in": "1 hour"}), 200
+        filename, download_url, absolute_url = _save_docx_and_build_url(doc, "ADN_BlackMix", bm['reference'])
+        return jsonify({"success": True, "file_name": filename, "download_url": download_url, "absolute_url": absolute_url, "expires_in": "1 hour"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": "generation_failed", "message": str(e)}), 500
     finally:
@@ -861,17 +892,8 @@ RÈGLES: Aucune hallucination. Langue: Français. Style professionnel.
                     except Exception as e:
                         print(f"⚠️ Could not add image: {e}")
                     doc.add_paragraph()
-        timestamp = int(time.time())
-        random_id = uuid.uuid4().hex[:8]
-        filename = f"ADN_Nuance_{nuance['reference']}_{timestamp}_{random_id}.docx"
-        filepath = DOCX_TEMP_DIR / filename
-        doc.save(str(filepath))
-        host = request.host or os.getenv("API_HOST", "localhost:5000")
-        protocol = request.headers.get("X-Forwarded-Proto", request.scheme)
-        if ".azurewebsites.net" in host or ".azure" in host:
-            protocol = "https"
-        absolute_url = f"{protocol}://{host}/download_fiche_adn_docx/{filename}"
-        return jsonify({"success": True, "file_name": filename, "download_url": f"/download_fiche_adn_docx/{filename}", "absolute_url": absolute_url, "expires_in": "1 hour"}), 200
+        filename, download_url, absolute_url = _save_docx_and_build_url(doc, "ADN_Nuance", nuance['reference'])
+        return jsonify({"success": True, "file_name": filename, "download_url": download_url, "absolute_url": absolute_url, "expires_in": "1 hour"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": "generation_failed", "message": str(e)}), 500
     finally:
@@ -984,24 +1006,9 @@ def search():
     provided = [bool(download_link), bool(temp_filename), bool(file_id)]
     if sum(provided) != 1:
         return jsonify({"success": False, "error": "Provide exactly ONE of: download_link, temp_filename, file_id"}), 400
-    img = None
-    if download_link:
-        try:
-            r = requests.get(download_link, timeout=20)
-            r.raise_for_status()
-            img = Image.open(io.BytesIO(r.content)).convert("RGB")
-        except Exception as e:
-            return jsonify({"success": False, "error": "download_link_failed", "message": str(e)}), 400
-    elif temp_filename:
-        file_path = TEMP_UPLOAD_DIR / temp_filename
-        if not file_path.exists():
-            return jsonify({"success": False, "error": "temp_file_not_found"}), 404
-        img = Image.open(file_path).convert("RGB")
-    elif file_id:
-        if not client:
-            return jsonify({"success": False, "error": "openai_not_configured"}), 400
-        file_content = client.files.content(file_id).read()
-        img = Image.open(io.BytesIO(file_content)).convert("RGB")
+    img, err = _load_image_from_source(download_link=download_link, temp_filename=temp_filename, file_id=file_id)
+    if err:
+        return jsonify(err[0]), err[1]
     try:
         query_embedding = compute_embedding_from_pil(img)
         rows = search_similar_in_db(query_embedding, top_k=top_k)
@@ -1427,66 +1434,216 @@ def get_black_mix_details(mix_id):
         conn.close()
 
 
-@app.route("/black-mix/<int:mix_id>/adn", methods=["GET"])
-def get_black_mix_adn(mix_id):
+@app.route("/black-mix/<int:mix_id>/update", methods=["PUT"])
+def update_black_mix(mix_id):
+    if not request.is_json:
+        return jsonify({"success": False, "error": "Request body must be JSON"}), 400
+    data = request.get_json()
+
     conn = psycopg2.connect(DB_DSN)
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, black_mix_id, adn_text, version, created_at FROM public.black_mix_adn WHERE black_mix_id = %s ORDER BY version DESC LIMIT 1", (mix_id,))
-            row = cur.fetchone()
-            if not row:
-                return jsonify({"success": False, "error": "ADN not found for this Black Mix"}), 404
-            adn_id, black_mix_id, adn_text, version, created_at = row
-            return jsonify({"success": True, "adn": {"id": adn_id, "black_mix_id": black_mix_id, "version": version, "created_at": created_at.isoformat() if created_at else None, "snapshot": adn_text}}), 200
+        with conn:
+            with conn.cursor() as cur:
+                # ── 0. Vérifier existence ─────────────────────────────────────
+                cur.execute("SELECT id, reference FROM public.black_mixes WHERE id = %s", (mix_id,))
+                existing = cur.fetchone()
+                if not existing:
+                    return jsonify({"success": False, "error": "Black Mix not found"}), 404
+
+                # ── 1. Champs identité ────────────────────────────────────────
+                product_reference = data.get("product_reference")
+                mix_name = data.get("mix_name")
+                document_revision_history = data.get("document_revision_history")
+
+                if not product_reference or not mix_name:
+                    return jsonify({"success": False, "error": "product_reference and mix_name are required"}), 400
+
+                # ── 2. Mettre à jour la table black_mixes ────────────────────
+                cur.execute(
+                    """
+                    UPDATE public.black_mixes
+                    SET reference                 = %s,
+                        name                      = %s,
+                        document_revision_history = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        product_reference,
+                        mix_name,
+                        Json(document_revision_history) if document_revision_history else None,
+                        mix_id
+                    )
+                )
+
+                # ── 3. Résoudre et valider toutes les références ──────────────
+                components = data.get("components", [])
+                process_steps = data.get("process_steps", [])
+                step_materials_map = data.get("step_materials", {})
+                control_plan = data.get("control_plan", [])
+
+                ref_lookup, validation_errors = resolve_ref_lookup(cur, components)
+                if validation_errors:
+                    return jsonify({"success": False, "validation_errors": validation_errors}), 400
+
+                all_step_refs = {ref for refs in step_materials_map.values() for ref in refs if ref}
+                extra_refs = all_step_refs - set(ref_lookup.keys())
+                if extra_refs:
+                    extra_lookup, extra_errors = resolve_ref_lookup(cur, [{"reference": r} for r in extra_refs])
+                    if extra_errors:
+                        return jsonify({"success": False, "validation_errors": extra_errors}), 400
+                    ref_lookup.update(extra_lookup)
+
+                # ── 4. Supprimer l'ancienne composition / étapes / contrôle ──
+                cur.execute("SELECT id FROM public.black_mix_process_steps WHERE black_mix_id = %s", (mix_id,))
+                old_step_ids = [r[0] for r in cur.fetchall()]
+                if old_step_ids:
+                    cur.execute("DELETE FROM public.black_mix_step_materials WHERE process_step_id = ANY(%s)", (old_step_ids,))
+                cur.execute("DELETE FROM public.black_mix_process_steps WHERE black_mix_id = %s", (mix_id,))
+                cur.execute("DELETE FROM public.black_mix_components    WHERE black_mix_id = %s", (mix_id,))
+                cur.execute("DELETE FROM public.black_mix_control_plan  WHERE black_mix_id = %s", (mix_id,))
+
+                # ── 5. Réinsérer les composants ───────────────────────────────
+                for component in components:
+                    ref = component.get("reference")
+                    resolved = ref_lookup[ref]
+                    cur.execute(
+                        """
+                        INSERT INTO public.black_mix_components
+                            (black_mix_id, matiere_id, sub_black_mix_id,
+                             component_name, quantity_value, quantity_unit, metadata)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            mix_id,
+                            resolved["id"] if resolved["type"] == "matiere" else None,
+                            resolved["id"] if resolved["type"] == "black_mix" else None,
+                            component.get("component_name") or ref,
+                            component.get("quantity"),
+                            component.get("unit", "kg"),
+                            Json(component.get("metadata", {}))
+                        )
+                    )
+
+                # ── 6. Réinsérer les étapes + step_materials ──────────────────
+                if not process_steps:
+                    return jsonify({"success": False, "error": "At least one process_step is required"}), 400
+
+                for step in process_steps:
+                    step_order = step.get("step_order")
+                    cur.execute(
+                        """
+                        INSERT INTO public.black_mix_process_steps
+                            (black_mix_id, step_order, step_name, machine_name, parameters)
+                        VALUES (%s, %s, %s, %s, %s) RETURNING id
+                        """,
+                        (mix_id, step_order, step.get("step_name"), step.get("machine"), Json(step.get("parameters", {})))
+                    )
+                    process_step_id = cur.fetchone()[0]
+
+                    refs_for_step = step_materials_map.get(str(step_order), [])
+                    if not refs_for_step:
+                        raise ValueError(f"Step '{step.get('step_name')}' (order {step_order}) has no materials in step_materials")
+
+                    seen_ids = set()
+                    for ref in refs_for_step:
+                        if not ref:
+                            continue
+                        resolved = ref_lookup.get(ref)
+                        if not resolved:
+                            raise ValueError(f"Reference '{ref}' in step_materials not resolved")
+                        dedup_key = (resolved["type"], resolved["id"])
+                        if dedup_key in seen_ids:
+                            continue
+                        seen_ids.add(dedup_key)
+                        if resolved["type"] == "matiere":
+                            cur.execute("INSERT INTO public.black_mix_step_materials (process_step_id, matiere_id, created_at) VALUES (%s, %s, NOW())", (process_step_id, resolved["id"]))
+                        else:
+                            cur.execute("INSERT INTO public.black_mix_step_materials (process_step_id, sub_black_mix_id, created_at) VALUES (%s, %s, NOW())", (process_step_id, resolved["id"]))
+
+                # ── 7. Réinsérer le plan de contrôle ──────────────────────────
+                for param in control_plan:
+                    cur.execute(
+                        """
+                        INSERT INTO public.black_mix_control_plan
+                            (black_mix_id, parameter_name, target_value, min_value, max_value, unit)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (mix_id, param.get("parameter_name"), param.get("target_value"), param.get("min_value"), param.get("max_value"), param.get("unit"))
+                    )
+
+                # ── 8. Reconstruire et versionner l'ADN ──────────────────────
+                new_snapshot = build_black_mix_adn_snapshot(cur, mix_id, product_reference, mix_name)
+
+                cur.execute(
+                    "SELECT version FROM public.black_mix_adn WHERE black_mix_id = %s ORDER BY version DESC LIMIT 1",
+                    (mix_id,)
+                )
+                last_version_row = cur.fetchone()
+                next_version = (last_version_row[0] + 1) if last_version_row else 1
+
+                cur.execute(
+                    """
+                    INSERT INTO public.black_mix_adn
+                        (black_mix_id, adn_text, version, created_at)
+                    VALUES (%s, %s, %s, NOW()) RETURNING id
+                    """,
+                    (mix_id, Json(new_snapshot), next_version)
+                )
+                new_adn_id = cur.fetchone()[0]
+
+                return jsonify({
+                    "success": True,
+                    "message": f"Black Mix '{mix_name}' updated successfully",
+                    "black_mix_id": mix_id,
+                    "product_reference": product_reference,
+                    "component_types": {ref: info["type"] for ref, info in ref_lookup.items()},
+                    "adn": {"id": new_adn_id, "version": next_version}
+                }), 200
+
+    except ValueError as ve:
+        conn.rollback()
+        return jsonify({"success": False, "error": str(ve)}), 400
     except Exception as e:
+        conn.rollback()
+        logging.error(f"Update Black Mix error: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
         conn.close()
 
 
+@app.route("/black-mix/<int:mix_id>/adn", methods=["GET"])
 @app.route("/black-mix/<int:mix_id>/adn-enriched", methods=["GET"])
-def get_black_mix_adn_enriched(mix_id):
+@app.route("/black-mix/<int:mix_id>/adn-combined", methods=["GET"])
+def get_black_mix_adn(mix_id):
+    """Unified ADN endpoint. level=basic|enriched|combined (auto-detected from path or ?level=)."""
+    path = request.path
+    if "adn-enriched" in path:
+        level = "enriched"
+    elif "adn-combined" in path:
+        level = "combined"
+    else:
+        level = request.args.get("level", "basic").lower()
+
     conn = psycopg2.connect(DB_DSN)
     try:
-        with conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT id, reference, name, status, document_revision_history FROM black_mixes WHERE id = %s", (mix_id,))
-                black_mix = cur.fetchone()
-                if not black_mix:
-                    return jsonify({"error": "Black mix not found"}), 404
-                cur.execute("""
-                    SELECT c.matiere_id, c.sub_black_mix_id, c.component_name, c.quantity_value, c.quantity_unit, c.metadata,
-                           m.reference, m.nom_matiere, m.type_matiere,
-                           bm.reference AS sub_bm_ref, bm.name AS sub_bm_name, f.specifications
-                    FROM black_mix_components c
-                    LEFT JOIN matieres m ON m.matiere_id = c.matiere_id
-                    LEFT JOIN black_mixes bm ON bm.id = c.sub_black_mix_id
-                    LEFT JOIN fiches_adn_matieres f ON f.matiere_id = c.matiere_id
-                    WHERE c.black_mix_id = %s
-                """, (mix_id,))
-                components = cur.fetchall()
-                for c in components:
-                    if not c["specifications"]:
-                        c["specifications"] = "Information non disponible"
-                cur.execute("SELECT id, step_order, step_name, machine_name, parameters FROM black_mix_process_steps WHERE black_mix_id = %s ORDER BY step_order", (mix_id,))
-                process_steps = cur.fetchall()
-                cur.execute("""
-                    SELECT sm.process_step_id, COALESCE(bm.reference, m.reference) AS reference, COALESCE(bm.name, m.nom_matiere) AS nom_matiere
-                    FROM black_mix_step_materials sm
-                    JOIN black_mix_process_steps ps ON ps.id = sm.process_step_id
-                    LEFT JOIN matieres m ON m.matiere_id = sm.matiere_id
-                    LEFT JOIN black_mixes bm ON bm.id = sm.sub_black_mix_id
-                    WHERE ps.black_mix_id = %s
-                """, (mix_id,))
-                step_materials = cur.fetchall()
-                materials_by_step = {}
-                for row in step_materials:
-                    materials_by_step.setdefault(row["process_step_id"], []).append({"reference": row["reference"], "nom_matiere": row["nom_matiere"]})
-                for step in process_steps:
-                    step["materials"] = materials_by_step.get(step["id"], [])
-                cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit FROM black_mix_control_plan WHERE black_mix_id = %s", (mix_id,))
-                control_plan = cur.fetchall()
-                data_for_ai = {"black_mix_identity": {"reference": black_mix["reference"], "name": black_mix["name"], "status": black_mix["status"], "revision_history": black_mix["document_revision_history"]}, "components": components, "process_steps": process_steps, "step_materials": step_materials, "control_plan": control_plan}
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, reference, name, status, created_at, document_revision_history FROM public.black_mixes WHERE id = %s", (mix_id,))
+            bm = cur.fetchone()
+            if not bm:
+                return jsonify({"success": False, "error": "Black Mix not found"}), 404
+
+            # ── BASIC: return stored ADN snapshot ──
+            if level == "basic":
+                cur.execute("SELECT id, black_mix_id, adn_text, version, created_at FROM public.black_mix_adn WHERE black_mix_id = %s ORDER BY version DESC LIMIT 1", (mix_id,))
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"success": False, "error": "ADN not found for this Black Mix"}), 404
+                return jsonify({"success": True, "adn": {"id": row["id"], "black_mix_id": row["black_mix_id"], "version": row["version"], "created_at": row["created_at"].isoformat() if row["created_at"] else None, "snapshot": row["adn_text"]}}), 200
+
+            # ── ENRICHED: build live snapshot + AI analysis ──
+            if level == "enriched":
+                snapshot = build_black_mix_adn_snapshot(cur, bm["id"], bm["reference"], bm["name"])
+                data_for_ai = {"black_mix_identity": {"reference": bm["reference"], "name": bm["name"], "status": bm["status"], "revision_history": bm["document_revision_history"]}, "components": snapshot["composition"], "process_steps": snapshot["process_steps"], "control_plan": snapshot["control_plan"]}
                 prompt = f"""Tu es un expert en formulation industrielle de matériaux carbone et graphite.
 Génère un "Rapport Technique BLACK MIX ADN" en suivant STRICTEMENT cette structure:
 #### 1. Introduction
@@ -1496,41 +1653,24 @@ Génère un "Rapport Technique BLACK MIX ADN" en suivant STRICTEMENT cette struc
 #### 5. Synthèse de l'Identité Structurelle
 RÈGLES: Aucune hallucination. Langue: Français. Style professionnel.
 ### DONNÉES SOURCE (JSON):
-{json.dumps(data_for_ai, indent=2, ensure_ascii=False)}"""
+{json.dumps(serialize_to_json_compatible(data_for_ai), indent=2, ensure_ascii=False, default=str)}"""
                 ai_response = call_groq_with_retry(messages=[{"role": "system", "content": "Tu es un expert en formulation industrielle."}, {"role": "user", "content": prompt}], model="llama-3.3-70b-versatile", temperature=0.2, max_tokens=6000)
-                return jsonify({"black_mix": black_mix, "source_data": data_for_ai, "ai_analysis": ai_response.choices[0].message.content if ai_response.choices else ""}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
+                return jsonify({"success": True, "black_mix": dict(bm), "source_data": serialize_to_json_compatible(data_for_ai), "ai_analysis": ai_response.choices[0].message.content if ai_response.choices else ""}), 200
 
-
-@app.route("/black-mix/<int:mix_id>/adn-combined", methods=["GET"])
-def get_black_mix_adn_combined(mix_id):
-    conn = psycopg2.connect(DB_DSN)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, reference, name, status, created_at, document_revision_history FROM public.black_mixes WHERE id = %s", (mix_id,))
-            bm = cur.fetchone()
-            if not bm:
-                return jsonify({"success": False, "error": "Black Mix not found"}), 404
-            black_mix_info = {"id": bm[0], "product_reference": bm[1], "mix_name": bm[2], "status": bm[3], "created_at": bm[4].isoformat() if bm[4] else None, "document_revision_history": bm[5]}
+            # ── COMBINED: stored ADN + material specs for each component ──
             cur.execute("SELECT adn_text, version, created_at FROM public.black_mix_adn WHERE black_mix_id = %s ORDER BY version DESC LIMIT 1", (mix_id,))
             adn_row = cur.fetchone()
             if not adn_row:
                 return jsonify({"success": False, "error": "ADN not found for this Black Mix"}), 404
-            base_adn = adn_row[0]
-            adn_version = adn_row[1]
-            adn_created = adn_row[2].isoformat() if adn_row[2] else None
+            base_adn = adn_row["adn_text"]
             components_combined = []
             for comp in base_adn.get("composition", []):
                 ref = comp.get("reference")
                 entry = {"reference": ref, "material_name": comp.get("material_name", comp.get("component_name", "")), "quantity": comp.get("quantity"), "unit": comp.get("unit"), "metadata": comp.get("metadata", {}), "is_sub_black_mix": comp.get("is_sub_black_mix", False), "adn_matiere": None}
                 if ref and not comp.get("is_sub_black_mix"):
-                    cur.execute("SELECT fiche_adn_id, nom_matiere, type_matiere, specifications, num_specifications FROM public.fiches_adn_matieres WHERE reference = %s LIMIT 1", (ref,))
-                    adn_row2 = cur.fetchone()
-                    if adn_row2:
-                        entry["adn_matiere"] = {"fiche_adn_id": adn_row2[0], "nom_matiere": adn_row2[1], "type_matiere": adn_row2[2], "specifications": adn_row2[3], "num_specifications": adn_row2[4]}
+                    fiche = _get_fiche_adn(cur, reference=ref)
+                    if fiche:
+                        entry["adn_matiere"] = fiche
                 if comp.get("is_sub_black_mix") and comp.get("sub_black_mix_adn"):
                     entry["sub_black_mix_adn"] = comp["sub_black_mix_adn"]
                 components_combined.append(entry)
@@ -1548,7 +1688,8 @@ def get_black_mix_adn_combined(mix_id):
                             break
                     materials_detail.append(mat_info)
                 process_steps_combined.append({"step_order": step.get("step_order"), "step_name": step.get("step_name"), "machine": step.get("machine"), "parameters": step.get("parameters"), "material_references": mat_refs, "materials_detail": materials_detail})
-            return jsonify({"success": True, "black_mix": black_mix_info, "adn_version": adn_version, "adn_created_at": adn_created, "composition": components_combined, "composition_flat": base_adn.get("composition_flat", []), "process_steps": process_steps_combined, "control_plan": base_adn.get("control_plan", [])}), 200
+            black_mix_info = {"id": bm["id"], "product_reference": bm["reference"], "mix_name": bm["name"], "status": bm["status"], "created_at": bm["created_at"].isoformat() if bm["created_at"] else None, "document_revision_history": bm["document_revision_history"]}
+            return jsonify({"success": True, "black_mix": black_mix_info, "adn_version": adn_row["version"], "adn_created_at": adn_row["created_at"].isoformat() if adn_row["created_at"] else None, "composition": components_combined, "composition_flat": base_adn.get("composition_flat", []), "process_steps": process_steps_combined, "control_plan": base_adn.get("control_plan", [])}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
@@ -1948,22 +2089,7 @@ def submit_nuance():
                 logging.info(f"✅ Ref lookup: {ref_lookup}")
 
                 # ───────── CUISSON ─────────
-                cuisson_program_number = None
-                cuisson_h2_percent     = None
-                cuisson_program_id     = None
-
-                if warne_raw:
-                    cuisson_program_number, cuisson_h2_percent = parse_warne_nachbehandlung(warne_raw)
-
-                    if cuisson_program_number:
-                        cur.execute(
-                            "SELECT id FROM public.cuisson_programs WHERE program_number = %s LIMIT 1",
-                            (cuisson_program_number,)
-                        )
-                        prog_row = cur.fetchone()
-
-                        if prog_row:
-                            cuisson_program_id = prog_row["id"]
+                cuisson_program_number, cuisson_h2_percent, cuisson_program_id = _resolve_cuisson_program(cur, warne_raw)
 
                 # ───────── INSERT NUANCE ─────────
                 cur.execute("""
@@ -2139,32 +2265,39 @@ def get_nuance_details(nuance_id):
 
 
 @app.route("/nuance/<int:nuance_id>/adn", methods=["GET"])
-def get_nuance_adn(nuance_id):
-    conn = psycopg2.connect(DB_DSN)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, nuance_id, adn_text, version, created_at FROM public.nuance_adn WHERE nuance_id = %s ORDER BY version DESC LIMIT 1", (nuance_id,))
-            row = cur.fetchone()
-            if not row:
-                return jsonify({"success": False, "error": "ADN not found for this Nuance"}), 404
-            return jsonify({"success": True, "adn": {"id": row[0], "nuance_id": row[1], "version": row[3], "created_at": row[4].isoformat() if row[4] else None, "snapshot": row[2]}}), 200
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-    finally:
-        conn.close()
-
-
 @app.route("/nuance/<int:nuance_id>/adn-enriched", methods=["GET"])
-def get_nuance_adn_enriched(nuance_id):
+@app.route("/nuance/<int:nuance_id>/adn-combined", methods=["GET"])
+def get_nuance_adn(nuance_id):
+    """Unified nuance ADN endpoint. level=basic|enriched|combined (auto-detected from path or ?level=)."""
+    path = request.path
+    if "adn-enriched" in path:
+        level = "enriched"
+    elif "adn-combined" in path:
+        level = "combined"
+    else:
+        level = request.args.get("level", "basic").lower()
+
     conn = psycopg2.connect(DB_DSN)
     try:
-        with conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT id, reference, name, status, document_revision_history FROM public.nuances WHERE id = %s", (nuance_id,))
-                nuance = cur.fetchone()
-                if not nuance:
-                    return jsonify({"error": "Nuance not found"}), 404
-                snapshot = build_nuance_adn_snapshot(cur, nuance_id, nuance["reference"], nuance["name"])
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, reference, name, status, created_at, document_revision_history FROM public.nuances WHERE id = %s", (nuance_id,))
+            nuance = cur.fetchone()
+            if not nuance:
+                return jsonify({"success": False, "error": "Nuance not found"}), 404
+
+            # ── BASIC: return stored ADN snapshot ──
+            if level == "basic":
+                cur.execute("SELECT id, nuance_id, adn_text, version, created_at FROM public.nuance_adn WHERE nuance_id = %s ORDER BY version DESC LIMIT 1", (nuance_id,))
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"success": False, "error": "ADN not found for this Nuance"}), 404
+                return jsonify({"success": True, "adn": {"id": row["id"], "nuance_id": row["nuance_id"], "version": row["version"], "created_at": row["created_at"].isoformat() if row["created_at"] else None, "snapshot": row["adn_text"]}}), 200
+
+            # ── Build live snapshot (shared by enriched + combined) ──
+            snapshot = build_nuance_adn_snapshot(cur, nuance_id, nuance["reference"], nuance["name"])
+
+            # ── ENRICHED: live snapshot + AI analysis ──
+            if level == "enriched":
                 data_for_ai = {"nuance_identity": {"reference": nuance["reference"], "name": nuance["name"], "status": nuance["status"], "revision_history": nuance["document_revision_history"], "cuisson": snapshot.get("cuisson")}, "components": snapshot["composition"], "process_steps": snapshot["process_steps"], "control_plan": snapshot["control_plan"]}
                 prompt = f"""Tu es un expert en formulation industrielle de matériaux carbone et graphite.
 Génère un "Rapport Technique NUANCE ADN" en suivant STRICTEMENT cette structure:
@@ -2183,29 +2316,15 @@ Pour CHAQUE composant : Référence, Type, Fonction, Spécifications complètes.
 #### 5. Synthèse de l'Identité Structurelle
 RÈGLES: Aucune hallucination. Langue: Français. Style professionnel.
 ### DONNÉES SOURCE (JSON):
-{json.dumps(data_for_ai, indent=2, ensure_ascii=False)}"""
+{json.dumps(serialize_to_json_compatible(data_for_ai), indent=2, ensure_ascii=False, default=str)}"""
                 ai_response = call_groq_with_retry(messages=[{"role": "system", "content": "Tu es un expert en formulation industrielle."}, {"role": "user", "content": prompt}], model="llama-3.3-70b-versatile", temperature=0.2, max_tokens=6000)
-                return jsonify({"nuance": nuance, "source_data": data_for_ai, "ai_analysis": ai_response.choices[0].message.content if ai_response.choices else ""}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
+                return jsonify({"success": True, "nuance": dict(nuance), "source_data": serialize_to_json_compatible(data_for_ai), "ai_analysis": ai_response.choices[0].message.content if ai_response.choices else ""}), 200
 
-
-@app.route("/nuance/<int:nuance_id>/adn-combined", methods=["GET"])
-def get_nuance_adn_combined(nuance_id):
-    conn = psycopg2.connect(DB_DSN)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, reference, name, status, created_at, document_revision_history FROM public.nuances WHERE id = %s", (nuance_id,))
-            row = cur.fetchone()
-            if not row:
-                return jsonify({"success": False, "error": "Nuance not found"}), 404
-            nuance_info = {"id": row[0], "product_reference": row[1], "nuance_name": row[2], "status": row[3], "created_at": row[4].isoformat() if row[4] else None, "document_revision_history": row[5]}
-            snapshot = build_nuance_adn_snapshot(cur, nuance_id, nuance_info["product_reference"], nuance_info["nuance_name"])
+            # ── COMBINED: live snapshot with images ──
             for img in snapshot.get("images", []):
                 if img.get("image_path"):
                     img["image_url"] = build_image_url(img["image_path"])
+            nuance_info = {"id": nuance["id"], "product_reference": nuance["reference"], "nuance_name": nuance["name"], "status": nuance["status"], "created_at": nuance["created_at"].isoformat() if nuance["created_at"] else None, "document_revision_history": nuance["document_revision_history"]}
             return jsonify({"success": True, "nuance": nuance_info, "snapshot_version": "live", "cuisson": snapshot["cuisson"], "composition": snapshot["composition"], "composition_flat": snapshot["composition_flat"], "process_steps": snapshot["process_steps"], "control_plan": snapshot["control_plan"], "images": snapshot["images"]}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -2298,23 +2417,9 @@ def search_similar_nuances():
     provided = [bool(download_link), bool(temp_filename), bool(file_id)]
     if sum(provided) != 1:
         return jsonify({"success": False, "error": "Provide exactly ONE of: download_link, temp_filename, file_id"}), 400
-    img = None
-    if download_link:
-        try:
-            r = requests.get(download_link, timeout=20)
-            r.raise_for_status()
-            img = Image.open(io.BytesIO(r.content)).convert("RGB")
-        except Exception as e:
-            return jsonify({"success": False, "error": "download_link_failed", "message": str(e)}), 400
-    elif temp_filename:
-        file_path = TEMP_UPLOAD_DIR / temp_filename
-        if not file_path.exists():
-            return jsonify({"success": False, "error": "temp_file_not_found"}), 404
-        img = Image.open(file_path).convert("RGB")
-    elif file_id:
-        if not client:
-            return jsonify({"success": False, "error": "openai_not_configured"}), 400
-        img = Image.open(io.BytesIO(client.files.content(file_id).read())).convert("RGB")
+    img, err = _load_image_from_source(download_link=download_link, temp_filename=temp_filename, file_id=file_id)
+    if err:
+        return jsonify(err[0]), err[1]
     try:
         query_embedding = compute_embedding_from_pil(img)
         rows = search_similar_nuances_in_db(query_embedding, top_k=top_k)
@@ -2433,9 +2538,7 @@ def set_nuance_cuisson(nuance_id):
             if not nuance:
                 return jsonify({"success": False, "error": "Nuance non trouvée"}), 404
 
-            cur.execute("SELECT id FROM public.cuisson_programs WHERE program_number = %s LIMIT 1", (program_number,))
-            prog_row = cur.fetchone()
-            cuisson_program_id = prog_row["id"] if prog_row else None
+            program_number, h2_percent, cuisson_program_id = _resolve_cuisson_program(cur, raw_value)
 
             cur.execute(
                 """
@@ -2499,17 +2602,7 @@ def update_nuance(nuance_id):
                     return jsonify({"success": False, "error": "product_reference and nuance_name are required"}), 400
 
                 # ── 2. Parser le programme de cuisson ────────────────────────
-                cuisson_program_number = cuisson_h2_percent = cuisson_program_id = None
-                if warne_raw:
-                    cuisson_program_number, cuisson_h2_percent = parse_warne_nachbehandlung(warne_raw)
-                    if cuisson_program_number:
-                        cur.execute(
-                            "SELECT id FROM public.cuisson_programs WHERE program_number = %s LIMIT 1",
-                            (cuisson_program_number,)
-                        )
-                        prog_row = cur.fetchone()
-                        if prog_row:
-                            cuisson_program_id = prog_row[0]
+                cuisson_program_number, cuisson_h2_percent, cuisson_program_id = _resolve_cuisson_program(cur, warne_raw)
 
                 # ── 3. Mettre à jour la table nuances ────────────────────────
                 cur.execute(
