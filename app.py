@@ -1265,8 +1265,8 @@ def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name,
         """, (s["id"],))
         step_mat_refs = [sm["sub_bm_ref"] if sm["sub_black_mix_id"] is not None else sm["matiere_ref"] for sm in cur.fetchall() if (sm["sub_bm_ref"] if sm["sub_black_mix_id"] is not None else sm["matiere_ref"])]
         process_steps.append({"step_order": s["step_order"], "step_name": s["step_name"], "machine": s["machine_name"], "parameters": s["parameters"], "materials": step_mat_refs})
-    cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit FROM public.black_mix_control_plan WHERE black_mix_id = %s ORDER BY parameter_name", (black_mix_id,))
-    control_plan = [{"parameter_name": r["parameter_name"], "target_value": float(r["target_value"]) if r["target_value"] is not None else None, "min_value": float(r["min_value"]) if r["min_value"] is not None else None, "max_value": float(r["max_value"]) if r["max_value"] is not None else None, "unit": r["unit"]} for r in cur.fetchall()]
+    cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit, sheet_data FROM public.black_mix_control_plan WHERE black_mix_id = %s ORDER BY parameter_name", (black_mix_id,))
+    control_plan = [{"parameter_name": r["parameter_name"], "target_value": float(r["target_value"]) if r["target_value"] is not None else None, "min_value": float(r["min_value"]) if r["min_value"] is not None else None, "max_value": float(r["max_value"]) if r["max_value"] is not None else None, "unit": r["unit"], "sheet_data": r["sheet_data"]} for r in cur.fetchall()]
 
     def flatten(comp_list, depth=0):
         flat = []
@@ -1365,8 +1365,8 @@ def submit_black_mix():
                         else:
                             cur.execute("INSERT INTO public.black_mix_step_materials (process_step_id, sub_black_mix_id, created_at) VALUES (%s, %s, NOW())", (process_step_id, resolved["id"]))
                 for param in control_plan:
-                    cur.execute("INSERT INTO public.black_mix_control_plan (black_mix_id, parameter_name, target_value, min_value, max_value, unit) VALUES (%s, %s, %s, %s, %s, %s)",
-                                (black_mix_id, param.get("parameter_name"), param.get("target_value"), param.get("min_value"), param.get("max_value"), param.get("unit")))
+                    cur.execute("INSERT INTO public.black_mix_control_plan (black_mix_id, parameter_name, target_value, min_value, max_value, unit, sheet_data) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                                (black_mix_id, param.get("parameter_name"), param.get("target_value"), param.get("min_value"), param.get("max_value"), param.get("unit"), Json(param.get("sheet_data")) if param.get("sheet_data") else None))
                 adn_snapshot = build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
                 cur.execute("INSERT INTO public.black_mix_adn (black_mix_id, adn_text, version, created_at) VALUES (%s, %s, 1, NOW()) RETURNING id", (black_mix_id, Json(adn_snapshot)))
                 adn_id = cur.fetchone()[0]
@@ -1425,8 +1425,8 @@ def get_black_mix_details(mix_id):
                 WHERE s.black_mix_id = %s GROUP BY s.id ORDER BY s.step_order
             """, (mix_id,))
             result["process_steps"] = [{"step_order": r[1], "step_name": r[2], "machine": r[3], "parameters": r[4], "materials": [x for x in (r[5] or []) if x is not None]} for r in cur.fetchall()]
-            cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit FROM public.black_mix_control_plan WHERE black_mix_id = %s", (mix_id,))
-            result["control_plan"] = [{"parameter_name": r[0], "target_value": float(r[1]) if r[1] else None, "min_value": float(r[2]) if r[2] else None, "max_value": float(r[3]) if r[3] else None, "unit": r[4]} for r in cur.fetchall()]
+            cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit, sheet_data FROM public.black_mix_control_plan WHERE black_mix_id = %s", (mix_id,))
+            result["control_plan"] = [{"parameter_name": r[0], "target_value": float(r[1]) if r[1] else None, "min_value": float(r[2]) if r[2] else None, "max_value": float(r[3]) if r[3] else None, "unit": r[4], "sheet_data": r[5]} for r in cur.fetchall()]
             return jsonify({"success": True, "black_mix": result}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -1458,7 +1458,36 @@ def update_black_mix(mix_id):
                 if not product_reference or not mix_name:
                     return jsonify({"success": False, "error": "product_reference and mix_name are required"}), 400
 
-                # ── 2. Mettre à jour la table black_mixes ────────────────────
+                # ── 2. Détecter les sections fournies ─────────────────────────
+                has_components    = "components" in data
+                has_process_steps = "process_steps" in data
+                has_control_plan  = "control_plan" in data
+
+                components         = data.get("components", [])
+                process_steps      = data.get("process_steps", [])
+                step_materials_map = data.get("step_materials", {})
+                control_plan       = data.get("control_plan", [])
+
+                # ── 3. Valider AVANT toute mutation ───────────────────────────
+                if has_process_steps and not process_steps:
+                    return jsonify({"success": False, "error": "At least one process_step is required when providing process_steps"}), 400
+
+                ref_lookup = {}
+                if has_components and components:
+                    ref_lookup, validation_errors = resolve_ref_lookup(cur, components)
+                    if validation_errors:
+                        return jsonify({"success": False, "validation_errors": validation_errors}), 400
+
+                if has_process_steps:
+                    all_step_refs = {ref for refs in step_materials_map.values() for ref in refs if ref}
+                    extra_refs = all_step_refs - set(ref_lookup.keys())
+                    if extra_refs:
+                        extra_lookup, extra_errors = resolve_ref_lookup(cur, [{"reference": r} for r in extra_refs])
+                        if extra_errors:
+                            return jsonify({"success": False, "validation_errors": extra_errors}), 400
+                        ref_lookup.update(extra_lookup)
+
+                # ── 4. Mettre à jour la table black_mixes ────────────────────
                 cur.execute(
                     """
                     UPDATE public.black_mixes
@@ -1475,101 +1504,79 @@ def update_black_mix(mix_id):
                     )
                 )
 
-                # ── 3. Résoudre et valider toutes les références ──────────────
-                components = data.get("components", [])
-                process_steps = data.get("process_steps", [])
-                step_materials_map = data.get("step_materials", {})
-                control_plan = data.get("control_plan", [])
-
-                ref_lookup, validation_errors = resolve_ref_lookup(cur, components)
-                if validation_errors:
-                    return jsonify({"success": False, "validation_errors": validation_errors}), 400
-
-                all_step_refs = {ref for refs in step_materials_map.values() for ref in refs if ref}
-                extra_refs = all_step_refs - set(ref_lookup.keys())
-                if extra_refs:
-                    extra_lookup, extra_errors = resolve_ref_lookup(cur, [{"reference": r} for r in extra_refs])
-                    if extra_errors:
-                        return jsonify({"success": False, "validation_errors": extra_errors}), 400
-                    ref_lookup.update(extra_lookup)
-
-                # ── 4. Supprimer l'ancienne composition / étapes / contrôle ──
-                cur.execute("SELECT id FROM public.black_mix_process_steps WHERE black_mix_id = %s", (mix_id,))
-                old_step_ids = [r[0] for r in cur.fetchall()]
-                if old_step_ids:
-                    cur.execute("DELETE FROM public.black_mix_step_materials WHERE process_step_id = ANY(%s)", (old_step_ids,))
-                cur.execute("DELETE FROM public.black_mix_process_steps WHERE black_mix_id = %s", (mix_id,))
-                cur.execute("DELETE FROM public.black_mix_components    WHERE black_mix_id = %s", (mix_id,))
-                cur.execute("DELETE FROM public.black_mix_control_plan  WHERE black_mix_id = %s", (mix_id,))
-
-                # ── 5. Réinsérer les composants ───────────────────────────────
-                for component in components:
-                    ref = component.get("reference")
-                    resolved = ref_lookup[ref]
-                    cur.execute(
-                        """
-                        INSERT INTO public.black_mix_components
-                            (black_mix_id, matiere_id, sub_black_mix_id,
-                             component_name, quantity_value, quantity_unit, metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (
-                            mix_id,
-                            resolved["id"] if resolved["type"] == "matiere" else None,
-                            resolved["id"] if resolved["type"] == "black_mix" else None,
-                            component.get("component_name") or ref,
-                            component.get("quantity"),
-                            component.get("unit", "kg"),
-                            Json(component.get("metadata", {}))
+                # ── 5. Composants (seulement si fournis) ─────────────────────
+                if has_components:
+                    cur.execute("DELETE FROM public.black_mix_components WHERE black_mix_id = %s", (mix_id,))
+                    for component in components:
+                        ref = component.get("reference")
+                        resolved = ref_lookup[ref]
+                        cur.execute(
+                            """
+                            INSERT INTO public.black_mix_components
+                                (black_mix_id, matiere_id, sub_black_mix_id,
+                                 component_name, quantity_value, quantity_unit, metadata)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                mix_id,
+                                resolved["id"] if resolved["type"] == "matiere" else None,
+                                resolved["id"] if resolved["type"] == "black_mix" else None,
+                                component.get("component_name") or ref,
+                                component.get("quantity"),
+                                component.get("unit", "kg"),
+                                Json(component.get("metadata", {}))
+                            )
                         )
-                    )
 
-                # ── 6. Réinsérer les étapes + step_materials ──────────────────
-                if not process_steps:
-                    return jsonify({"success": False, "error": "At least one process_step is required"}), 400
+                # ── 6. Étapes + step_materials (seulement si fournis) ────────
+                if has_process_steps:
+                    cur.execute("SELECT id FROM public.black_mix_process_steps WHERE black_mix_id = %s", (mix_id,))
+                    old_step_ids = [r[0] for r in cur.fetchall()]
+                    if old_step_ids:
+                        cur.execute("DELETE FROM public.black_mix_step_materials WHERE process_step_id = ANY(%s)", (old_step_ids,))
+                    cur.execute("DELETE FROM public.black_mix_process_steps WHERE black_mix_id = %s", (mix_id,))
 
-                for step in process_steps:
-                    step_order = step.get("step_order")
-                    cur.execute(
-                        """
-                        INSERT INTO public.black_mix_process_steps
-                            (black_mix_id, step_order, step_name, machine_name, parameters)
-                        VALUES (%s, %s, %s, %s, %s) RETURNING id
-                        """,
-                        (mix_id, step_order, step.get("step_name"), step.get("machine"), Json(step.get("parameters", {})))
-                    )
-                    process_step_id = cur.fetchone()[0]
+                    for step in process_steps:
+                        step_order = step.get("step_order")
+                        cur.execute(
+                            """
+                            INSERT INTO public.black_mix_process_steps
+                                (black_mix_id, step_order, step_name, machine_name, parameters)
+                            VALUES (%s, %s, %s, %s, %s) RETURNING id
+                            """,
+                            (mix_id, step_order, step.get("step_name"), step.get("machine"), Json(step.get("parameters", {})))
+                        )
+                        process_step_id = cur.fetchone()[0]
 
-                    refs_for_step = step_materials_map.get(str(step_order), [])
-                    if not refs_for_step:
-                        raise ValueError(f"Step '{step.get('step_name')}' (order {step_order}) has no materials in step_materials")
+                        refs_for_step = step_materials_map.get(str(step_order), [])
+                        seen_ids = set()
+                        for ref in refs_for_step:
+                            if not ref:
+                                continue
+                            resolved = ref_lookup.get(ref)
+                            if not resolved:
+                                raise ValueError(f"Reference '{ref}' in step_materials not resolved")
+                            dedup_key = (resolved["type"], resolved["id"])
+                            if dedup_key in seen_ids:
+                                continue
+                            seen_ids.add(dedup_key)
+                            if resolved["type"] == "matiere":
+                                cur.execute("INSERT INTO public.black_mix_step_materials (process_step_id, matiere_id, created_at) VALUES (%s, %s, NOW())", (process_step_id, resolved["id"]))
+                            else:
+                                cur.execute("INSERT INTO public.black_mix_step_materials (process_step_id, sub_black_mix_id, created_at) VALUES (%s, %s, NOW())", (process_step_id, resolved["id"]))
 
-                    seen_ids = set()
-                    for ref in refs_for_step:
-                        if not ref:
-                            continue
-                        resolved = ref_lookup.get(ref)
-                        if not resolved:
-                            raise ValueError(f"Reference '{ref}' in step_materials not resolved")
-                        dedup_key = (resolved["type"], resolved["id"])
-                        if dedup_key in seen_ids:
-                            continue
-                        seen_ids.add(dedup_key)
-                        if resolved["type"] == "matiere":
-                            cur.execute("INSERT INTO public.black_mix_step_materials (process_step_id, matiere_id, created_at) VALUES (%s, %s, NOW())", (process_step_id, resolved["id"]))
-                        else:
-                            cur.execute("INSERT INTO public.black_mix_step_materials (process_step_id, sub_black_mix_id, created_at) VALUES (%s, %s, NOW())", (process_step_id, resolved["id"]))
-
-                # ── 7. Réinsérer le plan de contrôle ──────────────────────────
-                for param in control_plan:
-                    cur.execute(
-                        """
-                        INSERT INTO public.black_mix_control_plan
-                            (black_mix_id, parameter_name, target_value, min_value, max_value, unit)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        """,
-                        (mix_id, param.get("parameter_name"), param.get("target_value"), param.get("min_value"), param.get("max_value"), param.get("unit"))
-                    )
+                # ── 7. Plan de contrôle (seulement si fourni) ────────────────
+                if has_control_plan:
+                    cur.execute("DELETE FROM public.black_mix_control_plan WHERE black_mix_id = %s", (mix_id,))
+                    for param in control_plan:
+                        cur.execute(
+                            """
+                            INSERT INTO public.black_mix_control_plan
+                                (black_mix_id, parameter_name, target_value, min_value, max_value, unit, sheet_data)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (mix_id, param.get("parameter_name"), param.get("target_value"), param.get("min_value"), param.get("max_value"), param.get("unit"), Json(param.get("sheet_data")) if param.get("sheet_data") else None)
+                        )
 
                 # ── 8. Reconstruire et versionner l'ADN ──────────────────────
                 new_snapshot = build_black_mix_adn_snapshot(cur, mix_id, product_reference, mix_name)
@@ -1591,11 +1598,14 @@ def update_black_mix(mix_id):
                 )
                 new_adn_id = cur.fetchone()[0]
 
+                updated_sections = [s for s, p in [("components", has_components), ("process_steps", has_process_steps), ("control_plan", has_control_plan)] if p]
+
                 return jsonify({
                     "success": True,
                     "message": f"Black Mix '{mix_name}' updated successfully",
                     "black_mix_id": mix_id,
                     "product_reference": product_reference,
+                    "updated_sections": updated_sections,
                     "component_types": {ref: info["type"] for ref, info in ref_lookup.items()},
                     "adn": {"id": new_adn_id, "version": next_version}
                 }), 200
@@ -1943,8 +1953,8 @@ def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _v
         process_steps.append({"step_order": step_order, "step_name": step_name, "machine": machine, "parameters": parameters, "materials": step_mat_refs})
 
     # ── Control plan ─────────────────────────────────────────────────────────
-    cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit FROM public.nuance_control_plan WHERE nuance_id = %s ORDER BY parameter_name", (nuance_id,))
-    control_plan = [{"parameter_name": r["parameter_name"], "target_value": float(r["target_value"]) if r["target_value"] is not None else None, "min_value": float(r["min_value"]) if r["min_value"] is not None else None, "max_value": float(r["max_value"]) if r["max_value"] is not None else None, "unit": r["unit"]} for r in cur.fetchall()]
+    cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit, sheet_data FROM public.nuance_control_plan WHERE nuance_id = %s ORDER BY parameter_name", (nuance_id,))
+    control_plan = [{"parameter_name": r["parameter_name"], "target_value": float(r["target_value"]) if r["target_value"] is not None else None, "min_value": float(r["min_value"]) if r["min_value"] is not None else None, "max_value": float(r["max_value"]) if r["max_value"] is not None else None, "unit": r["unit"], "sheet_data": r["sheet_data"]} for r in cur.fetchall()]
 
     # ── Images + expert notes ─────────────────────────────────────────────────
     cur.execute("""
@@ -2175,15 +2185,16 @@ def submit_nuance():
                 for param in control_plan:
                     cur.execute("""
                         INSERT INTO public.nuance_control_plan
-                            (nuance_id, parameter_name, target_value, min_value, max_value, unit)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                            (nuance_id, parameter_name, target_value, min_value, max_value, unit, sheet_data)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """, (
                         nuance_id,
                         param.get("parameter_name"),
                         param.get("target_value"),
                         param.get("min_value"),
                         param.get("max_value"),
-                        param.get("unit")
+                        param.get("unit"),
+                        Json(param.get("sheet_data")) if param.get("sheet_data") else None
                     ))
 
                 # ───────── ADN ─────────
@@ -2601,10 +2612,41 @@ def update_nuance(nuance_id):
                 if not product_reference or not nuance_name:
                     return jsonify({"success": False, "error": "product_reference and nuance_name are required"}), 400
 
-                # ── 2. Parser le programme de cuisson ────────────────────────
+                # ── 2. Détecter les sections fournies ─────────────────────────
+                has_components    = "components" in data
+                has_process_steps = "process_steps" in data
+                has_control_plan  = "control_plan" in data
+
+                components         = data.get("components", [])
+                process_steps      = data.get("process_steps", [])
+                step_materials_map = data.get("step_materials", {})
+                control_plan       = data.get("control_plan", [])
+
+                # ── 3. Valider AVANT toute mutation ───────────────────────────
+                if has_process_steps and not process_steps:
+                    return jsonify({"success": False, "error": "At least one process_step is required when providing process_steps"}), 400
+
+                ref_lookup = {}
+                if has_components and components:
+                    ref_lookup, validation_errors = resolve_nuance_ref_lookup(cur, components)
+                    if validation_errors:
+                        return jsonify({"success": False, "validation_errors": validation_errors}), 400
+
+                if has_process_steps:
+                    all_step_refs = {ref for refs in step_materials_map.values() for ref in refs if ref}
+                    extra_refs    = all_step_refs - set(ref_lookup.keys())
+                    if extra_refs:
+                        extra_lookup, extra_errors = resolve_nuance_ref_lookup(
+                            cur, [{"reference": r} for r in extra_refs]
+                        )
+                        if extra_errors:
+                            return jsonify({"success": False, "validation_errors": extra_errors}), 400
+                        ref_lookup.update(extra_lookup)
+
+                # ── 4. Parser le programme de cuisson ────────────────────────
                 cuisson_program_number, cuisson_h2_percent, cuisson_program_id = _resolve_cuisson_program(cur, warne_raw)
 
-                # ── 3. Mettre à jour la table nuances ────────────────────────
+                # ── 5. Mettre à jour la table nuances ────────────────────────
                 cur.execute(
                     """
                     UPDATE public.nuances
@@ -2630,136 +2672,109 @@ def update_nuance(nuance_id):
                     )
                 )
 
-                # ── 4. Résoudre et valider toutes les références ──────────────
-                components         = data.get("components", [])
-                process_steps      = data.get("process_steps", [])
-                step_materials_map = data.get("step_materials", {})
-                control_plan       = data.get("control_plan", [])
-
-                ref_lookup, validation_errors = resolve_nuance_ref_lookup(cur, components)
-                if validation_errors:
-                    return jsonify({"success": False, "validation_errors": validation_errors}), 400
-
-                all_step_refs = {ref for refs in step_materials_map.values() for ref in refs if ref}
-                extra_refs    = all_step_refs - set(ref_lookup.keys())
-                if extra_refs:
-                    extra_lookup, extra_errors = resolve_nuance_ref_lookup(
-                        cur, [{"reference": r} for r in extra_refs]
-                    )
-                    if extra_errors:
-                        return jsonify({"success": False, "validation_errors": extra_errors}), 400
-                    ref_lookup.update(extra_lookup)
-
-                # ── 5. Supprimer l'ancienne composition / étapes / contrôle ──
-                # Récupérer les IDs des anciennes étapes pour supprimer leurs matières
-                cur.execute(
-                    "SELECT id FROM public.nuance_process_steps WHERE nuance_id = %s",
-                    (nuance_id,)
-                )
-                old_step_ids = [r[0] for r in cur.fetchall()]
-                if old_step_ids:
-                    cur.execute(
-                        "DELETE FROM public.nuance_step_materials WHERE process_step_id = ANY(%s)",
-                        (old_step_ids,)
-                    )
-                cur.execute("DELETE FROM public.nuance_process_steps  WHERE nuance_id = %s", (nuance_id,))
-                cur.execute("DELETE FROM public.nuance_components      WHERE nuance_id = %s", (nuance_id,))
-                cur.execute("DELETE FROM public.nuance_control_plan    WHERE nuance_id = %s", (nuance_id,))
-
-                # ── 6. Réinsérer les composants ───────────────────────────────
-                for component in components:
-                    ref      = component.get("reference")
-                    resolved = ref_lookup[ref]
-                    cur.execute(
-                        """
-                        INSERT INTO public.nuance_components
-                            (nuance_id, matiere_id, sub_black_mix_id, sub_nuance_id,
-                             component_name, quantity_value, quantity_unit, metadata)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (
-                            nuance_id,
-                            resolved["id"] if resolved["type"] == "matiere"    else None,
-                            resolved["id"] if resolved["type"] == "black_mix"  else None,
-                            resolved["id"] if resolved["type"] == "nuance"     else None,
-                            component.get("component_name") or ref,
-                            component.get("quantity"),
-                            component.get("unit", "kg"),
-                            Json(component.get("metadata", {}))
-                        )
-                    )
-
-                # ── 7. Réinsérer les étapes + step_materials ──────────────────
-                if not process_steps:
-                    return jsonify({"success": False, "error": "At least one process_step is required"}), 400
-
-                for step in process_steps:
-                    step_order = step.get("step_order")
-                    cur.execute(
-                        """
-                        INSERT INTO public.nuance_process_steps
-                            (nuance_id, step_order, step_name, machine_name, parameters)
-                        VALUES (%s, %s, %s, %s, %s) RETURNING id
-                        """,
-                        (
-                            nuance_id,
-                            step_order,
-                            step.get("step_name"),
-                            step.get("machine"),
-                            Json(step.get("parameters", {}))
-                        )
-                    )
-                    process_step_id = cur.fetchone()[0]
-
-                    refs_for_step = step_materials_map.get(str(step_order), [])
-                    if not refs_for_step:
-                        raise ValueError(
-                            f"Step '{step.get('step_name')}' (order {step_order}) "
-                            f"has no materials in step_materials"
-                        )
-
-                    seen_ids = set()
-                    for ref in refs_for_step:
-                        if not ref:
-                            continue
-                        resolved = ref_lookup.get(ref)
-                        if not resolved:
-                            raise ValueError(f"Reference '{ref}' in step_materials not resolved")
-                        dedup_key = (resolved["type"], resolved["id"])
-                        if dedup_key in seen_ids:
-                            continue
-                        seen_ids.add(dedup_key)
+                # ── 6. Composants (seulement si fournis) ─────────────────────
+                if has_components:
+                    cur.execute("DELETE FROM public.nuance_components WHERE nuance_id = %s", (nuance_id,))
+                    for component in components:
+                        ref      = component.get("reference")
+                        resolved = ref_lookup[ref]
                         cur.execute(
                             """
-                            INSERT INTO public.nuance_step_materials
-                                (process_step_id, matiere_id, sub_black_mix_id, sub_nuance_id, created_at)
-                            VALUES (%s, %s, %s, %s, NOW())
+                            INSERT INTO public.nuance_components
+                                (nuance_id, matiere_id, sub_black_mix_id, sub_nuance_id,
+                                 component_name, quantity_value, quantity_unit, metadata)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                             """,
                             (
-                                process_step_id,
-                                resolved["id"] if resolved["type"] == "matiere"   else None,
-                                resolved["id"] if resolved["type"] == "black_mix" else None,
-                                resolved["id"] if resolved["type"] == "nuance"    else None,
+                                nuance_id,
+                                resolved["id"] if resolved["type"] == "matiere"    else None,
+                                resolved["id"] if resolved["type"] == "black_mix"  else None,
+                                resolved["id"] if resolved["type"] == "nuance"     else None,
+                                component.get("component_name") or ref,
+                                component.get("quantity"),
+                                component.get("unit", "kg"),
+                                Json(component.get("metadata", {}))
                             )
                         )
 
-                # ── 8. Réinsérer le plan de contrôle ─────────────────────────
-                for param in control_plan:
+                # ── 7. Étapes + step_materials (seulement si fournis) ────────
+                if has_process_steps:
                     cur.execute(
-                        """
-                        INSERT INTO public.nuance_control_plan
-                            (nuance_id, parameter_name, target_value, min_value, max_value, unit)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        """,
-                        (
-                            nuance_id,
-                            param.get("parameter_name"),
-                            param.get("target_value"),
-                            param.get("min_value"),
-                            param.get("max_value"),
-                            param.get("unit")
-                        )
+                        "SELECT id FROM public.nuance_process_steps WHERE nuance_id = %s",
+                        (nuance_id,)
                     )
+                    old_step_ids = [r[0] for r in cur.fetchall()]
+                    if old_step_ids:
+                        cur.execute(
+                            "DELETE FROM public.nuance_step_materials WHERE process_step_id = ANY(%s)",
+                            (old_step_ids,)
+                        )
+                    cur.execute("DELETE FROM public.nuance_process_steps WHERE nuance_id = %s", (nuance_id,))
+
+                    for step in process_steps:
+                        step_order = step.get("step_order")
+                        cur.execute(
+                            """
+                            INSERT INTO public.nuance_process_steps
+                                (nuance_id, step_order, step_name, machine_name, parameters)
+                            VALUES (%s, %s, %s, %s, %s) RETURNING id
+                            """,
+                            (
+                                nuance_id,
+                                step_order,
+                                step.get("step_name"),
+                                step.get("machine"),
+                                Json(step.get("parameters", {}))
+                            )
+                        )
+                        process_step_id = cur.fetchone()[0]
+
+                        refs_for_step = step_materials_map.get(str(step_order), [])
+                        seen_ids = set()
+                        for ref in refs_for_step:
+                            if not ref:
+                                continue
+                            resolved = ref_lookup.get(ref)
+                            if not resolved:
+                                raise ValueError(f"Reference '{ref}' in step_materials not resolved")
+                            dedup_key = (resolved["type"], resolved["id"])
+                            if dedup_key in seen_ids:
+                                continue
+                            seen_ids.add(dedup_key)
+                            cur.execute(
+                                """
+                                INSERT INTO public.nuance_step_materials
+                                    (process_step_id, matiere_id, sub_black_mix_id, sub_nuance_id, created_at)
+                                VALUES (%s, %s, %s, %s, NOW())
+                                """,
+                                (
+                                    process_step_id,
+                                    resolved["id"] if resolved["type"] == "matiere"   else None,
+                                    resolved["id"] if resolved["type"] == "black_mix" else None,
+                                    resolved["id"] if resolved["type"] == "nuance"    else None,
+                                )
+                            )
+
+                # ── 8. Plan de contrôle (seulement si fourni) ────────────────
+                if has_control_plan:
+                    cur.execute("DELETE FROM public.nuance_control_plan WHERE nuance_id = %s", (nuance_id,))
+                    for param in control_plan:
+                        cur.execute(
+                            """
+                            INSERT INTO public.nuance_control_plan
+                                (nuance_id, parameter_name, target_value, min_value, max_value, unit, sheet_data)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                nuance_id,
+                                param.get("parameter_name"),
+                                param.get("target_value"),
+                                param.get("min_value"),
+                                param.get("max_value"),
+                                param.get("unit"),
+                                Json(param.get("sheet_data")) if param.get("sheet_data") else None
+                            )
+                        )
 
                 # ── 9. Reconstruire et versionner l'ADN ──────────────────────
                 new_snapshot = build_nuance_adn_snapshot(
@@ -2783,11 +2798,14 @@ def update_nuance(nuance_id):
                 )
                 new_adn_id = cur.fetchone()[0]
 
+                updated_sections = [s for s, p in [("components", has_components), ("process_steps", has_process_steps), ("control_plan", has_control_plan)] if p]
+
                 return jsonify({
                     "success":           True,
                     "message":           f"Nuance '{nuance_name}' updated successfully",
                     "nuance_id":         nuance_id,
                     "product_reference": product_reference,
+                    "updated_sections":  updated_sections,
                     "component_types":   {ref: info["type"] for ref, info in ref_lookup.items()},
                     "adn": {
                         "id":      new_adn_id,
