@@ -20,3 +20,5 @@ python-dotenv
 psycopg2-binary
 groq
 python-docx
+xlrd
+openpyxl
