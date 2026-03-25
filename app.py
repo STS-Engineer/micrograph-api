@@ -558,12 +558,8 @@ def upload_and_search():
     data = request.get_json(silent=True) or {}
     refs = data.get("openaiFileIdRefs")
     top_k = int(data.get("top_k", 5))
-    # Fallback: top-level download_link (vision mode — image shared inline, no file ID)
-    top_level_download_link = data.get("download_link")
-    if (not refs or not isinstance(refs, list) or len(refs) == 0) and top_level_download_link:
-        refs = [{"download_link": top_level_download_link, "name": "image.png", "id": None}]
     if not refs or not isinstance(refs, list) or len(refs) == 0:
-        return jsonify({"success": False, "error": "missing_openaiFileIdRefs"}), 400
+        return jsonify({"success": False, "error": "missing_openaiFileIdRefs — upload the image as a file attachment (paperclip), not inline."}), 400
     if top_k < 1 or top_k > 50:
         return jsonify({"success": False, "error": "invalid_top_k"}), 400
     final_results = []
@@ -578,7 +574,7 @@ def upload_and_search():
             original_name = file_ref.get("name") or "uploaded_file"
             mime_type = file_ref.get("mime_type")
             if not file_id and not download_link:
-                errors.append("Missing id and download_link in file reference.")
+                errors.append(f"{original_name}: missing id and download_link.")
                 continue
             file_bytes = None
             if download_link:
@@ -588,11 +584,14 @@ def upload_and_search():
                     file_bytes = r.content
                 except Exception as e:
                     print(f"⚠️ download_link failed: {e}")
-            if file_bytes is None:
+            if file_bytes is None and file_id:
                 if not client:
                     errors.append(f"{original_name}: OpenAI API key not configured.")
                     continue
                 file_bytes = client.files.content(file_id).read()
+            if file_bytes is None:
+                errors.append(f"{original_name}: Could not retrieve image bytes.")
+                continue
             filename_safe = secure_filename(original_name or "uploaded_file") or "uploaded_file"
             if "." not in filename_safe:
                 ext = guess_extension_from_mime(mime_type) or ".png"
