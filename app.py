@@ -608,6 +608,12 @@ def upload_and_search():
             download_link = file_ref.get("download_link")
             original_name = file_ref.get("name") or "uploaded_file"
             mime_type = file_ref.get("mime_type")
+            
+            # Validation du type MIME pour s'assurer que c'est une image
+            if mime_type and "application/pdf" in mime_type.lower():
+                errors.append(f"{original_name}: PDF files are not supported for this endpoint. Please upload an image.")
+                continue
+
             dl = (download_link or "").strip()
             if not file_id and not dl:
                 errors.append(
