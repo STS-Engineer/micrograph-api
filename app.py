@@ -64,6 +64,18 @@ groq_api_key = GROQ_API_KEYS[current_groq_key_index] if GROQ_API_KEYS else os.ge
 groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
 
 
+def call_openai(messages, model="gpt-4o", temperature=0.2, max_tokens=8000):
+    if not client:
+        raise Exception("OpenAI client not initialized — set OPENAI_API_KEY")
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return response
+
+
 def rotate_groq_key():
     global current_groq_key_index, groq_client, groq_api_key
     current_groq_key_index = (current_groq_key_index + 1) % len(GROQ_API_KEYS)
@@ -847,10 +859,10 @@ Génère un "Rapport Technique NUANCE ADN" COMPLET en suivant cette structure:
 RÈGLES: Aucune hallucination. Langue: Français. Style professionnel.
 ### DONNÉES SOURCE (JSON):
 {json.dumps(snapshot, indent=2, ensure_ascii=False, default=str)}"""
-        ai_content = call_groq_with_retry(
+        ai_content = call_openai(
             messages=[{"role": "system", "content": "Tu es un expert en formulation industrielle."},
                       {"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile", temperature=0.2, max_tokens=6000
+            model="gpt-4o", temperature=0.2, max_tokens=8000
         )
         content = ai_content.choices[0].message.content if ai_content.choices else ""
         doc = Document()
