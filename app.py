@@ -1198,6 +1198,58 @@ def get_application_analysis():
 
 
 # =============================================================================
+# SHARED — CONTROL PLAN NORMALIZER
+# =============================================================================
+
+def normalize_control_plan(control_plan_raw):
+    """
+    Accept control_plan in two formats:
+    - LIST (legacy):   [{parameter_name, target_value, min_value, max_value, unit, sheet_data}, ...]
+    - OBJECT (XLS):    {active_specifications: [...], data_sheet: {...}, sollwerte: {...}}
+    Returns a list of dicts ready for DB insertion.
+    """
+    if not control_plan_raw:
+        return []
+
+    if isinstance(control_plan_raw, list):
+        result = []
+        for param in control_plan_raw:
+            sd = param.get("sheet_data")
+            if not sd:
+                sd = {k: v for k, v in param.items() if k != "sheet_data"}
+            result.append({
+                "parameter_name": param.get("parameter_name"),
+                "target_value": param.get("target_value"),
+                "min_value": param.get("min_value"),
+                "max_value": param.get("max_value"),
+                "unit": param.get("unit"),
+                "sheet_data": sd
+            })
+        return result
+
+    if isinstance(control_plan_raw, dict):
+        specs = control_plan_raw.get("active_specifications") or []
+        if not specs:
+            sollwerte = control_plan_raw.get("sollwerte") or {}
+            specs = sollwerte.get("active_specifications") or []
+
+        full_sheet_data = {k: v for k, v in control_plan_raw.items() if k != "active_specifications"}
+
+        result = []
+        for spec in specs:
+            result.append({
+                "parameter_name": spec.get("parameter") or spec.get("parameter_name"),
+                "target_value": spec.get("target_value") or spec.get("target"),
+                "min_value": spec.get("min") or spec.get("min_value"),
+                "max_value": spec.get("max") or spec.get("max_value"),
+                "unit": spec.get("unit"),
+                "sheet_data": full_sheet_data
+            })
+        return result
+
+    return []
+
+# =============================================================================
 # BLACK MIX — CORE HELPERS
 # =============================================================================
 
@@ -1313,7 +1365,8 @@ def submit_black_mix():
     components = data.get("components", [])
     process_steps = data.get("process_steps", [])
     step_materials_map = data.get("step_materials", {})
-    control_plan = data.get("control_plan", [])
+    control_plan_raw = data.get("control_plan", [])
+    control_plan = normalize_control_plan(control_plan_raw)
     document_revision_history = data.get("document_revision_history")
     if not product_reference or not mix_name:
         return jsonify({"success": False, "error": "product_reference and mix_name are required"}), 400
@@ -1365,11 +1418,8 @@ def submit_black_mix():
                         else:
                             cur.execute("INSERT INTO public.black_mix_step_materials (process_step_id, sub_black_mix_id, created_at) VALUES (%s, %s, NOW())", (process_step_id, resolved["id"]))
                 for param in control_plan:
-                    sd = param.get("sheet_data")
-                    if not sd:
-                        sd = {k: v for k, v in param.items() if k != "sheet_data"}
                     cur.execute("INSERT INTO public.black_mix_control_plan (black_mix_id, parameter_name, target_value, min_value, max_value, unit, sheet_data) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                                (black_mix_id, param.get("parameter_name"), param.get("target_value"), param.get("min_value"), param.get("max_value"), param.get("unit"), Json(sd)))
+                                (black_mix_id, param["parameter_name"], param["target_value"], param["min_value"], param["max_value"], param["unit"], Json(param["sheet_data"])))
                 adn_snapshot = build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
                 cur.execute("INSERT INTO public.black_mix_adn (black_mix_id, adn_text, version, created_at) VALUES (%s, %s, 1, NOW()) RETURNING id", (black_mix_id, Json(adn_snapshot)))
                 adn_id = cur.fetchone()["id"]
@@ -1469,7 +1519,8 @@ def update_black_mix(mix_id):
                 components         = data.get("components", [])
                 process_steps      = data.get("process_steps", [])
                 step_materials_map = data.get("step_materials", {})
-                control_plan       = data.get("control_plan", [])
+                control_plan_raw   = data.get("control_plan", [])
+                control_plan       = normalize_control_plan(control_plan_raw)
 
                 # ── 3. Valider AVANT toute mutation ───────────────────────────
                 if has_process_steps and not process_steps:
@@ -1572,16 +1623,13 @@ def update_black_mix(mix_id):
                 if has_control_plan:
                     cur.execute("DELETE FROM public.black_mix_control_plan WHERE black_mix_id = %s", (mix_id,))
                     for param in control_plan:
-                        sd = param.get("sheet_data")
-                        if not sd:
-                            sd = {k: v for k, v in param.items() if k != "sheet_data"}
                         cur.execute(
                             """
                             INSERT INTO public.black_mix_control_plan
                                 (black_mix_id, parameter_name, target_value, min_value, max_value, unit, sheet_data)
                             VALUES (%s, %s, %s, %s, %s, %s, %s)
                             """,
-                            (mix_id, param.get("parameter_name"), param.get("target_value"), param.get("min_value"), param.get("max_value"), param.get("unit"), Json(sd))
+                            (mix_id, param["parameter_name"], param["target_value"], param["min_value"], param["max_value"], param["unit"], Json(param["sheet_data"]))
                         )
 
                 # ── 8. Reconstruire et versionner l'ADN ──────────────────────
@@ -2043,7 +2091,8 @@ def submit_nuance():
     components         = data.get("components", [])
     process_steps      = data.get("process_steps", [])
     step_materials_map = data.get("step_materials", {})
-    control_plan       = data.get("control_plan", [])
+    control_plan_raw   = data.get("control_plan", [])
+    control_plan       = normalize_control_plan(control_plan_raw)
 
     document_revision_history = data.get("document_revision_history")
 
@@ -2189,21 +2238,18 @@ def submit_nuance():
 
                 # ───────── CONTROL PLAN ─────────
                 for param in control_plan:
-                    sd = param.get("sheet_data")
-                    if not sd:
-                        sd = {k: v for k, v in param.items() if k != "sheet_data"}
                     cur.execute("""
                         INSERT INTO public.nuance_control_plan
                             (nuance_id, parameter_name, target_value, min_value, max_value, unit, sheet_data)
                         VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """, (
                         nuance_id,
-                        param.get("parameter_name"),
-                        param.get("target_value"),
-                        param.get("min_value"),
-                        param.get("max_value"),
-                        param.get("unit"),
-                        Json(sd)
+                        param["parameter_name"],
+                        param["target_value"],
+                        param["min_value"],
+                        param["max_value"],
+                        param["unit"],
+                        Json(param["sheet_data"])
                     ))
 
                 # ───────── ADN ─────────
@@ -2629,7 +2675,8 @@ def update_nuance(nuance_id):
                 components         = data.get("components", [])
                 process_steps      = data.get("process_steps", [])
                 step_materials_map = data.get("step_materials", {})
-                control_plan       = data.get("control_plan", [])
+                control_plan_raw   = data.get("control_plan", [])
+                control_plan       = normalize_control_plan(control_plan_raw)
 
                 # ── 3. Valider AVANT toute mutation ───────────────────────────
                 if has_process_steps and not process_steps:
@@ -2768,9 +2815,6 @@ def update_nuance(nuance_id):
                 if has_control_plan:
                     cur.execute("DELETE FROM public.nuance_control_plan WHERE nuance_id = %s", (nuance_id,))
                     for param in control_plan:
-                        sd = param.get("sheet_data")
-                        if not sd:
-                            sd = {k: v for k, v in param.items() if k != "sheet_data"}
                         cur.execute(
                             """
                             INSERT INTO public.nuance_control_plan
@@ -2779,12 +2823,12 @@ def update_nuance(nuance_id):
                             """,
                             (
                                 nuance_id,
-                                param.get("parameter_name"),
-                                param.get("target_value"),
-                                param.get("min_value"),
-                                param.get("max_value"),
-                                param.get("unit"),
-                                Json(sd)
+                                param["parameter_name"],
+                                param["target_value"],
+                                param["min_value"],
+                                param["max_value"],
+                                param["unit"],
+                                Json(param["sheet_data"])
                             )
                         )
 
