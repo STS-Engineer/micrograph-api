@@ -1214,12 +1214,12 @@ def resolve_ref_lookup(cur, components):
         cur.execute("SELECT id FROM public.black_mixes WHERE reference = %s LIMIT 1", (ref,))
         bm_row = cur.fetchone()
         if bm_row:
-            ref_lookup[ref] = {"type": "black_mix", "id": bm_row[0]}
+            ref_lookup[ref] = {"type": "black_mix", "id": bm_row["id"] if isinstance(bm_row, dict) else bm_row[0]}
             continue
         cur.execute("SELECT matiere_id FROM public.matieres WHERE reference = %s LIMIT 1", (ref,))
         mat_row = cur.fetchone()
         if mat_row:
-            ref_lookup[ref] = {"type": "matiere", "id": mat_row[0]}
+            ref_lookup[ref] = {"type": "matiere", "id": mat_row["matiere_id"] if isinstance(mat_row, dict) else mat_row[0]}
             continue
         validation_errors.append(f"Reference '{ref}' not found in black_mixes or matieres")
     return ref_lookup, validation_errors
@@ -1322,7 +1322,7 @@ def submit_black_mix():
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn:
-            with conn.cursor() as cur:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 ref_lookup, validation_errors = resolve_ref_lookup(cur, components)
                 if validation_errors:
                     return jsonify({"success": False, "validation_errors": validation_errors}), 400
@@ -1335,7 +1335,7 @@ def submit_black_mix():
                     ref_lookup.update(extra_lookup)
                 cur.execute("INSERT INTO public.black_mixes (reference, name, status, created_at, document_revision_history) VALUES (%s, %s, 'draft', NOW(), %s) RETURNING id",
                             (product_reference, mix_name, Json(document_revision_history) if document_revision_history else None))
-                black_mix_id = cur.fetchone()[0]
+                black_mix_id = cur.fetchone()["id"]
                 for component in components:
                     ref = component.get("reference")
                     resolved = ref_lookup[ref]
@@ -1345,7 +1345,7 @@ def submit_black_mix():
                     step_order = step.get("step_order")
                     cur.execute("INSERT INTO public.black_mix_process_steps (black_mix_id, step_order, step_name, machine_name, parameters) VALUES (%s, %s, %s, %s, %s) RETURNING id",
                                 (black_mix_id, step_order, step.get("step_name"), step.get("machine"), Json(step.get("parameters", {}))))
-                    process_step_id = cur.fetchone()[0]
+                    process_step_id = cur.fetchone()["id"]
                     refs_for_step = step_materials_map.get(str(step_order), [])
                     if not refs_for_step:
                         raise ValueError(f"Step '{step.get('step_name')}' (order {step_order}) has no materials in step_materials")
@@ -1369,7 +1369,7 @@ def submit_black_mix():
                                 (black_mix_id, param.get("parameter_name"), param.get("target_value"), param.get("min_value"), param.get("max_value"), param.get("unit"), Json(param.get("sheet_data")) if param.get("sheet_data") else None))
                 adn_snapshot = build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
                 cur.execute("INSERT INTO public.black_mix_adn (black_mix_id, adn_text, version, created_at) VALUES (%s, %s, 1, NOW()) RETURNING id", (black_mix_id, Json(adn_snapshot)))
-                adn_id = cur.fetchone()[0]
+                adn_id = cur.fetchone()["id"]
                 return jsonify({"success": True, "message": f"Black Mix '{mix_name}' created successfully", "black_mix_id": black_mix_id, "product_reference": product_reference, "component_types": {ref: info["type"] for ref, info in ref_lookup.items()}, "adn": {"id": adn_id, "version": 1}}), 200
     except Exception as e:
         conn.rollback()
@@ -1531,7 +1531,7 @@ def update_black_mix(mix_id):
                 # ── 6. Étapes + step_materials (seulement si fournis) ────────
                 if has_process_steps:
                     cur.execute("SELECT id FROM public.black_mix_process_steps WHERE black_mix_id = %s", (mix_id,))
-                    old_step_ids = [r[0] for r in cur.fetchall()]
+                    old_step_ids = [r["id"] for r in cur.fetchall()]
                     if old_step_ids:
                         cur.execute("DELETE FROM public.black_mix_step_materials WHERE process_step_id = ANY(%s)", (old_step_ids,))
                     cur.execute("DELETE FROM public.black_mix_process_steps WHERE black_mix_id = %s", (mix_id,))
@@ -1546,7 +1546,7 @@ def update_black_mix(mix_id):
                             """,
                             (mix_id, step_order, step.get("step_name"), step.get("machine"), Json(step.get("parameters", {})))
                         )
-                        process_step_id = cur.fetchone()[0]
+                        process_step_id = cur.fetchone()["id"]
 
                         refs_for_step = step_materials_map.get(str(step_order), [])
                         seen_ids = set()
@@ -1586,7 +1586,7 @@ def update_black_mix(mix_id):
                     (mix_id,)
                 )
                 last_version_row = cur.fetchone()
-                next_version = (last_version_row[0] + 1) if last_version_row else 1
+                next_version = (last_version_row["version"] + 1) if last_version_row else 1
 
                 cur.execute(
                     """
@@ -1596,7 +1596,7 @@ def update_black_mix(mix_id):
                     """,
                     (mix_id, Json(new_snapshot), next_version)
                 )
-                new_adn_id = cur.fetchone()[0]
+                new_adn_id = cur.fetchone()["id"]
 
                 updated_sections = [s for s, p in [("components", has_components), ("process_steps", has_process_steps), ("control_plan", has_control_plan)] if p]
 
@@ -2595,7 +2595,7 @@ def update_nuance(nuance_id):
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn:
-            with conn.cursor() as cur:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
                 # ── 0. Vérifier existence ─────────────────────────────────────
                 cur.execute("SELECT id, reference FROM public.nuances WHERE id = %s", (nuance_id,))
@@ -2703,7 +2703,7 @@ def update_nuance(nuance_id):
                         "SELECT id FROM public.nuance_process_steps WHERE nuance_id = %s",
                         (nuance_id,)
                     )
-                    old_step_ids = [r[0] for r in cur.fetchall()]
+                    old_step_ids = [r["id"] for r in cur.fetchall()]
                     if old_step_ids:
                         cur.execute(
                             "DELETE FROM public.nuance_step_materials WHERE process_step_id = ANY(%s)",
@@ -2727,7 +2727,7 @@ def update_nuance(nuance_id):
                                 Json(step.get("parameters", {}))
                             )
                         )
-                        process_step_id = cur.fetchone()[0]
+                        process_step_id = cur.fetchone()["id"]
 
                         refs_for_step = step_materials_map.get(str(step_order), [])
                         seen_ids = set()
@@ -2786,7 +2786,7 @@ def update_nuance(nuance_id):
                     (nuance_id,)
                 )
                 last_version_row = cur.fetchone()
-                next_version     = (last_version_row[0] + 1) if last_version_row else 1
+                next_version     = (last_version_row["version"] + 1) if last_version_row else 1
 
                 cur.execute(
                     """
@@ -2796,7 +2796,7 @@ def update_nuance(nuance_id):
                     """,
                     (nuance_id, Json(new_snapshot), next_version)
                 )
-                new_adn_id = cur.fetchone()[0]
+                new_adn_id = cur.fetchone()["id"]
 
                 updated_sections = [s for s, p in [("components", has_components), ("process_steps", has_process_steps), ("control_plan", has_control_plan)] if p]
 
