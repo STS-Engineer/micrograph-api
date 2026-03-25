@@ -556,10 +556,14 @@ def serve_temp_file(filename):
 @app.route("/upload_and_search", methods=["POST"])
 def upload_and_search():
     data = request.get_json(silent=True) or {}
-    refs = data.get("openaiFileIdRefs")
+    refs = data.get("openaiFileIdRefs") or []
     top_k = int(data.get("top_k", 5))
-    if not refs or not isinstance(refs, list) or len(refs) == 0:
-        return jsonify({"success": False, "error": "missing_openaiFileIdRefs — upload the image as a file attachment (paperclip), not inline."}), 400
+    # Fallback: vision-mode URL (pasted / inline image — model passes the image_url it sees)
+    vision_url = data.get("url") or ""
+    if not refs and vision_url and vision_url.startswith("https://"):
+        refs = [{"download_link": vision_url, "name": "image.png", "id": None}]
+    if not refs:
+        return jsonify({"success": False, "error": "missing_openaiFileIdRefs — pass openaiFileIdRefs (file upload) or url (vision image URL)."}), 400
     if top_k < 1 or top_k > 50:
         return jsonify({"success": False, "error": "invalid_top_k"}), 400
     final_results = []
@@ -577,7 +581,7 @@ def upload_and_search():
                 errors.append(f"{original_name}: missing id and download_link.")
                 continue
             file_bytes = None
-            if download_link:
+            if download_link and download_link.startswith("https://"):
                 try:
                     r = requests.get(download_link, timeout=20)
                     r.raise_for_status()
