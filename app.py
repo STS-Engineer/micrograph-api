@@ -223,12 +223,19 @@ def search_similar_in_db(query_embedding: np.ndarray, top_k: int = 5) -> List[Di
         conn.close()
 
 
+def _request_external_base_url() -> str:
+    """Return the external base URL, honoring Azure reverse-proxy headers."""
+    host = request.headers.get("X-Forwarded-Host") or request.host or os.getenv("API_HOST", "localhost:5000")
+    proto = request.headers.get("X-Forwarded-Proto") or request.scheme or "http"
+    if ".azurewebsites.net" in host or ".azure" in host:
+        proto = "https"
+    return f"{proto}://{host}"
+
+
 def build_image_url(image_path: str) -> str:
     filename = Path(image_path).name
-    url = f"{request.host_url.rstrip('/')}/images/{secure_filename(filename)}"
-    if url.startswith("http://"):
-        url = "https://" + url[len("http://"):]
-    return url
+    base = _request_external_base_url()
+    return f"{base}/images/{secure_filename(filename)}"
 
 
 # =============================================================================
@@ -245,8 +252,16 @@ def _load_image_from_source(download_link=None, temp_filename=None, file_id=None
         except Exception as e:
             return None, ({"success": False, "error": "download_link_failed", "message": str(e)}, 400)
     elif temp_filename:
-        file_path = TEMP_UPLOAD_DIR / temp_filename
-        if not file_path.exists():
+        # Only allow basenames inside TEMP_UPLOAD_DIR (no path traversal).
+        safe_name = secure_filename(str(temp_filename))
+        if not safe_name:
+            return None, ({"success": False, "error": "invalid_temp_filename"}, 400)
+        file_path = (TEMP_UPLOAD_DIR / safe_name).resolve()
+        try:
+            file_path.relative_to(TEMP_UPLOAD_DIR.resolve())
+        except ValueError:
+            return None, ({"success": False, "error": "temp_file_not_found"}, 404)
+        if not file_path.is_file():
             return None, ({"success": False, "error": "temp_file_not_found"}, 404)
         return Image.open(file_path).convert("RGB"), None
     elif file_id:
@@ -556,66 +571,129 @@ def serve_temp_file(filename):
 @app.route("/upload_and_search", methods=["POST"])
 def upload_and_search():
     data = request.get_json(silent=True) or {}
-    refs = data.get("openaiFileIdRefs") or []
+    refs = list(data.get("openaiFileIdRefs") or [])
     top_k = int(data.get("top_k", 5))
+    # Documented fallback: direct image URL when no attachment refs (OpenAPI note).
     if not refs:
-        return jsonify({"success": False, "error": "missing_openaiFileIdRefs — pass the file reference objects from the message attachments."}), 400
+        root_url = data.get("url") or data.get("image_url")
+        if isinstance(root_url, str) and root_url.strip():
+            refs = [
+                {
+                    "id": None,
+                    "name": "image_from_url",
+                    "download_link": root_url.strip(),
+                    "mime_type": None,
+                }
+            ]
+    if not refs:
+        return jsonify(
+            {
+                "success": False,
+                "error": "missing_openaiFileIdRefs — pass attachment refs, or a top-level url / image_url (HTTPS or HTTP).",
+            }
+        ), 400
     if top_k < 1 or top_k > 50:
         return jsonify({"success": False, "error": "invalid_top_k"}), 400
     final_results = []
     errors = []
+    base = _request_external_base_url()
     for file_ref in refs:
+        original_name = "uploaded_file"
         try:
             if not isinstance(file_ref, dict):
                 errors.append("Each item must be an object.")
                 continue
-            file_id = file_ref.get("id")
+            _fid = file_ref.get("id")
+            file_id = str(_fid).strip() if _fid is not None and str(_fid).strip() else None
             download_link = file_ref.get("download_link")
             original_name = file_ref.get("name") or "uploaded_file"
             mime_type = file_ref.get("mime_type")
-            if not file_id:
-                errors.append(f"{original_name}: missing id — each openaiFileIdRefs item must include an id.")
+            dl = (download_link or "").strip()
+            if not file_id and not dl:
+                errors.append(
+                    f"{original_name}: provide download_link and/or id (OpenAI file id) to fetch the image."
+                )
                 continue
             file_bytes = None
-            if download_link and download_link.startswith("https://"):
+            if dl and dl.lower().startswith(("http://", "https://")):
                 try:
-                    r = requests.get(download_link, timeout=20)
+                    r = requests.get(dl, timeout=30, allow_redirects=True)
                     r.raise_for_status()
+                    ct = (r.headers.get("Content-Type") or "").lower()
+                    if "image/" not in ct and ct and "octet-stream" not in ct:
+                        logging.warning(
+                            "upload_and_search: unexpected Content-Type %s for %s", ct, dl[:80]
+                        )
                     file_bytes = r.content
                 except Exception as e:
                     print(f"⚠️ download_link failed: {e}")
-            if file_bytes is None:
+            if file_bytes is None and file_id:
                 if not client:
-                    errors.append(f"{original_name}: OpenAI API key not configured.")
+                    errors.append(f"{original_name}: OpenAI API key not configured (needed for id={file_id!r}).")
                     continue
-                file_bytes = client.files.content(file_id).read()
+                try:
+                    file_bytes = client.files.content(file_id).read()
+                except Exception as e:
+                    errors.append(f"{original_name}: OpenAI file download failed: {e}")
+                    continue
             if file_bytes is None:
-                errors.append(f"{original_name}: Could not retrieve image bytes.")
+                errors.append(
+                    f"{original_name}: Could not retrieve image bytes (check download_link or OpenAI file id)."
+                )
+                continue
+            try:
+                img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+            except Exception as e:
+                errors.append(f"{original_name}: not a valid image file ({e}).")
                 continue
             filename_safe = secure_filename(original_name or "uploaded_file") or "uploaded_file"
             if "." not in filename_safe:
                 ext = guess_extension_from_mime(mime_type) or ".png"
                 filename_safe += ext
             if not allowed_file(filename_safe):
-                errors.append(f"{original_name}: File type not allowed.")
-                continue
+                ext2 = Path(filename_safe).suffix.lower().lstrip(".")
+                if ext2 not in ALLOWED_EXTENSIONS:
+                    filename_safe = f"{Path(filename_safe).stem}.png"
             unique_filename = f"{uuid.uuid4().hex}_{int(time.time())}_{filename_safe}"
             file_path = TEMP_UPLOAD_DIR / unique_filename
             with open(file_path, "wb") as f:
                 f.write(file_bytes)
-            file_url = f"{request.host_url.rstrip('/')}/temp_files/{unique_filename}"
-            if file_url.startswith("http://"):
-                file_url = "https://" + file_url[len("http://"):]
-            img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+            file_url = f"{base}/temp_files/{unique_filename}"
             query_embedding = compute_embedding_from_pil(img)
             rows = search_similar_in_db(query_embedding, top_k=top_k)
-            search_results = [{"id": r["id"], "image_url": build_image_url(r["image_path"]), "matiere_id": r["matiere_id"], "material_name": r["nom_matiere"], "reference": r["reference"], "similarity": float(r["similarity"]) if r["similarity"] is not None else None} for r in rows]
-            final_results.append({"original_name": original_name, "filename": unique_filename, "url": file_url, "expires_in": "2 hours", "search_results": search_results})
+            search_results = [
+                {
+                    "id": r["id"],
+                    "image_url": build_image_url(r["image_path"]),
+                    "matiere_id": r["matiere_id"],
+                    "material_name": r["nom_matiere"],
+                    "reference": r["reference"],
+                    "similarity": float(r["similarity"]) if r["similarity"] is not None else None,
+                }
+                for r in rows
+            ]
+            final_results.append(
+                {
+                    "original_name": original_name,
+                    "filename": unique_filename,
+                    "url": file_url,
+                    "expires_in": "2 hours",
+                    "search_results": search_results,
+                }
+            )
         except Exception as e:
-            errors.append(f"{file_ref}: {str(e)}")
+            logging.exception("upload_and_search failed for %s", original_name)
+            errors.append(f"{original_name}: {str(e)}")
     if not final_results and errors:
         return jsonify({"success": False, "message": "All operations failed", "errors": errors}), 500
-    return jsonify({"success": True, "message": f"Processed {len(final_results)} files.", "results": final_results, "errors": errors}), 200
+    return jsonify(
+        {
+            "success": True,
+            "message": f"Processed {len(final_results)} files.",
+            "results": final_results,
+            "errors": errors,
+        }
+    ), 200
 
 
 # =============================================================================
