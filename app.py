@@ -558,7 +558,11 @@ def upload_and_search():
     data = request.get_json(silent=True) or {}
     refs = data.get("openaiFileIdRefs")
     top_k = int(data.get("top_k", 5))
-    if not refs or not isinstance(refs, list):
+    # Fallback: top-level download_link (vision mode — image shared inline, no file ID)
+    top_level_download_link = data.get("download_link")
+    if (not refs or not isinstance(refs, list) or len(refs) == 0) and top_level_download_link:
+        refs = [{"download_link": top_level_download_link, "name": "image.png", "id": None}]
+    if not refs or not isinstance(refs, list) or len(refs) == 0:
         return jsonify({"success": False, "error": "missing_openaiFileIdRefs"}), 400
     if top_k < 1 or top_k > 50:
         return jsonify({"success": False, "error": "invalid_top_k"}), 400
@@ -573,8 +577,8 @@ def upload_and_search():
             download_link = file_ref.get("download_link")
             original_name = file_ref.get("name") or "uploaded_file"
             mime_type = file_ref.get("mime_type")
-            if not file_id:
-                errors.append("Missing id in file reference.")
+            if not file_id and not download_link:
+                errors.append("Missing id and download_link in file reference.")
                 continue
             file_bytes = None
             if download_link:
@@ -849,20 +853,32 @@ def generate_nuance_adn_docx():
                         img["image_url"] = None
         prompt = f"""Tu es un expert en formulation industrielle de matériaux carbone et graphite.
 Génère un "Rapport Technique NUANCE ADN" COMPLET en suivant cette structure:
+
 #### 1. Identité de la Nuance
 #### 2. Programme de Cuisson (Wärme-Nachbehandlung)
 #### 3. Composition et ADN des Composants
 #### 4. Processus de Fabrication (Mischkarte)
-#### 5. Plan de Contrôle
-#### 6. Historique des Révisions
-#### 7. Synthèse de l'Identité Structurelle
-RÈGLES: Aucune hallucination. Langue: Français. Style professionnel.
+#### 5. Plan de Contrôle — Spécifications
+#### 6. Résultats du Plan de Contrôle en Détail
+#### 7. Historique des Révisions
+#### 8. Synthèse de l'Identité Structurelle
+
+INSTRUCTIONS SPÉCIFIQUES POUR LA SECTION 6 "Résultats du Plan de Contrôle en Détail":
+- Pour chaque paramètre du plan de contrôle, extraire les données depuis le champ "sheet_data" de chaque entrée du control_plan.
+- Présenter un tableau récapitulatif des statistiques par paramètre avec les colonnes: Paramètre | Min spec | Max spec | Moyenne mesurée | Min mesuré | Max mesuré | Nb mesures | Nb non-conformités.
+- Après le tableau, rédiger un paragraphe d'analyse pour chaque paramètre qui dépasse les limites (non-conformités > 0).
+- Lister en détail TOUTES les non-conformités trouvées dans "non_conformities" avec: N° | Date | Paramètre(s) en défaut | Valeur(s) mesurée(s).
+- Terminer par un encadré "Bilan des Non-Conformités" indiquant: Nombre total de non-conformités, période couverte, et paramètres les plus critiques.
+- Si sheet_data est absent ou vide pour un paramètre, indiquer "Données statistiques non disponibles".
+
+RÈGLES GÉNÉRALES: Aucune hallucination — utiliser UNIQUEMENT les données JSON fournies. Langue: Français. Style professionnel et technique.
+
 ### DONNÉES SOURCE (JSON):
 {json.dumps(snapshot, indent=2, ensure_ascii=False, default=str)}"""
-        ai_content = call_openai(
-            messages=[{"role": "system", "content": "Tu es un expert en formulation industrielle."},
+        ai_content = call_groq_with_retry(
+            messages=[{"role": "system", "content": "Tu es un expert en formulation industrielle de matériaux carbone et graphite. Tu génères des rapports techniques détaillés avec tableaux et analyses."},
                       {"role": "user", "content": prompt}],
-            model="gpt-4o", temperature=0.2, max_tokens=8000
+            model="llama-3.3-70b-versatile", temperature=0.2, max_tokens=8000
         )
         content = ai_content.choices[0].message.content if ai_content.choices else ""
         doc = Document()
