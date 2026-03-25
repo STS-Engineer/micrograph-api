@@ -558,12 +558,8 @@ def upload_and_search():
     data = request.get_json(silent=True) or {}
     refs = data.get("openaiFileIdRefs") or []
     top_k = int(data.get("top_k", 5))
-    # Fallback: vision-mode URL (pasted / inline image — model passes the image_url it sees)
-    vision_url = data.get("url") or ""
-    if not refs and vision_url and vision_url.startswith("https://"):
-        refs = [{"download_link": vision_url, "name": "image.png", "id": None}]
     if not refs:
-        return jsonify({"success": False, "error": "missing_openaiFileIdRefs — pass openaiFileIdRefs (file upload) or url (vision image URL)."}), 400
+        return jsonify({"success": False, "error": "missing_openaiFileIdRefs — pass the file reference objects from the message attachments."}), 400
     if top_k < 1 or top_k > 50:
         return jsonify({"success": False, "error": "invalid_top_k"}), 400
     final_results = []
@@ -577,8 +573,8 @@ def upload_and_search():
             download_link = file_ref.get("download_link")
             original_name = file_ref.get("name") or "uploaded_file"
             mime_type = file_ref.get("mime_type")
-            if not file_id and not download_link:
-                errors.append(f"{original_name}: missing id and download_link.")
+            if not file_id:
+                errors.append(f"{original_name}: missing id — each openaiFileIdRefs item must include an id.")
                 continue
             file_bytes = None
             if download_link and download_link.startswith("https://"):
@@ -588,7 +584,7 @@ def upload_and_search():
                     file_bytes = r.content
                 except Exception as e:
                     print(f"⚠️ download_link failed: {e}")
-            if file_bytes is None and file_id:
+            if file_bytes is None:
                 if not client:
                     errors.append(f"{original_name}: OpenAI API key not configured.")
                     continue
