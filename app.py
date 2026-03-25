@@ -1365,8 +1365,11 @@ def submit_black_mix():
                         else:
                             cur.execute("INSERT INTO public.black_mix_step_materials (process_step_id, sub_black_mix_id, created_at) VALUES (%s, %s, NOW())", (process_step_id, resolved["id"]))
                 for param in control_plan:
+                    sd = param.get("sheet_data")
+                    if not sd:
+                        sd = {k: v for k, v in param.items() if k != "sheet_data"}
                     cur.execute("INSERT INTO public.black_mix_control_plan (black_mix_id, parameter_name, target_value, min_value, max_value, unit, sheet_data) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                                (black_mix_id, param.get("parameter_name"), param.get("target_value"), param.get("min_value"), param.get("max_value"), param.get("unit"), Json(param.get("sheet_data")) if param.get("sheet_data") else None))
+                                (black_mix_id, param.get("parameter_name"), param.get("target_value"), param.get("min_value"), param.get("max_value"), param.get("unit"), Json(sd)))
                 adn_snapshot = build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name)
                 cur.execute("INSERT INTO public.black_mix_adn (black_mix_id, adn_text, version, created_at) VALUES (%s, %s, 1, NOW()) RETURNING id", (black_mix_id, Json(adn_snapshot)))
                 adn_id = cur.fetchone()["id"]
@@ -1443,7 +1446,7 @@ def update_black_mix(mix_id):
     conn = psycopg2.connect(DB_DSN)
     try:
         with conn:
-            with conn.cursor() as cur:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 # ── 0. Vérifier existence ─────────────────────────────────────
                 cur.execute("SELECT id, reference FROM public.black_mixes WHERE id = %s", (mix_id,))
                 existing = cur.fetchone()
@@ -1569,13 +1572,16 @@ def update_black_mix(mix_id):
                 if has_control_plan:
                     cur.execute("DELETE FROM public.black_mix_control_plan WHERE black_mix_id = %s", (mix_id,))
                     for param in control_plan:
+                        sd = param.get("sheet_data")
+                        if not sd:
+                            sd = {k: v for k, v in param.items() if k != "sheet_data"}
                         cur.execute(
                             """
                             INSERT INTO public.black_mix_control_plan
                                 (black_mix_id, parameter_name, target_value, min_value, max_value, unit, sheet_data)
                             VALUES (%s, %s, %s, %s, %s, %s, %s)
                             """,
-                            (mix_id, param.get("parameter_name"), param.get("target_value"), param.get("min_value"), param.get("max_value"), param.get("unit"), Json(param.get("sheet_data")) if param.get("sheet_data") else None)
+                            (mix_id, param.get("parameter_name"), param.get("target_value"), param.get("min_value"), param.get("max_value"), param.get("unit"), Json(sd))
                         )
 
                 # ── 8. Reconstruire et versionner l'ADN ──────────────────────
@@ -2183,6 +2189,9 @@ def submit_nuance():
 
                 # ───────── CONTROL PLAN ─────────
                 for param in control_plan:
+                    sd = param.get("sheet_data")
+                    if not sd:
+                        sd = {k: v for k, v in param.items() if k != "sheet_data"}
                     cur.execute("""
                         INSERT INTO public.nuance_control_plan
                             (nuance_id, parameter_name, target_value, min_value, max_value, unit, sheet_data)
@@ -2194,7 +2203,7 @@ def submit_nuance():
                         param.get("min_value"),
                         param.get("max_value"),
                         param.get("unit"),
-                        Json(param.get("sheet_data")) if param.get("sheet_data") else None
+                        Json(sd)
                     ))
 
                 # ───────── ADN ─────────
@@ -2759,6 +2768,9 @@ def update_nuance(nuance_id):
                 if has_control_plan:
                     cur.execute("DELETE FROM public.nuance_control_plan WHERE nuance_id = %s", (nuance_id,))
                     for param in control_plan:
+                        sd = param.get("sheet_data")
+                        if not sd:
+                            sd = {k: v for k, v in param.items() if k != "sheet_data"}
                         cur.execute(
                             """
                             INSERT INTO public.nuance_control_plan
@@ -2772,7 +2784,7 @@ def update_nuance(nuance_id):
                                 param.get("min_value"),
                                 param.get("max_value"),
                                 param.get("unit"),
-                                Json(param.get("sheet_data")) if param.get("sheet_data") else None
+                                Json(sd)
                             )
                         )
 
