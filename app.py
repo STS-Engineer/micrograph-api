@@ -175,6 +175,27 @@ def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+def guess_extension_from_mime(mime_type: Optional[str]) -> Optional[str]:
+    if not mime_type:
+        return None
+    mt = mime_type.lower()
+    if "png" in mt:
+        return ".png"
+    if "webp" in mt:
+        return ".webp"
+    if "jpeg" in mt or "jpg" in mt:
+        return ".jpg"
+    return None
+
+
+def is_supported_image_ref(filename: Optional[str], mime_type: Optional[str]) -> bool:
+    mt = (mime_type or "").strip().lower()
+    if mt:
+        return mt in {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+    suffix = Path(filename or "").suffix.lower()
+    return suffix in {".png", ".jpg", ".jpeg", ".webp"}
+
+
 def infer_filename_from_url(raw_url: str) -> str:
     try:
         parsed = urlparse(raw_url)
@@ -182,6 +203,150 @@ def infer_filename_from_url(raw_url: str) -> str:
         return candidate or "image_from_url"
     except Exception:
         return "image_from_url"
+
+
+def _normalize_openai_file_ref(file_ref: Any) -> Optional[Dict[str, Any]]:
+    """
+    Normalize OpenAI file references to a dict with at least:
+      - id (required)
+      - name (optional)
+      - download_link (optional)
+      - mime_type (optional)
+    """
+    if isinstance(file_ref, dict):
+        file_id = str(file_ref.get("id") or "").strip()
+        if not file_id:
+            return None
+        download_link = str(file_ref.get("download_link") or "").strip() or None
+        return {
+            "id": file_id,
+            "name": file_ref.get("name") or "uploaded_file",
+            "download_link": download_link,
+            "mime_type": file_ref.get("mime_type"),
+        }
+
+    if isinstance(file_ref, str):
+        file_id = file_ref.strip()
+        if not file_id:
+            return None
+        return {
+            "id": file_id,
+            "name": "uploaded_file",
+            "download_link": None,
+            "mime_type": None,
+        }
+
+    return None
+
+
+def _build_upload_debug_payload(data: Dict[str, Any], refs: List[Any]) -> Dict[str, Any]:
+    sample_items = []
+    for item in refs[:2]:
+        if isinstance(item, dict):
+            sample_items.append(
+                {
+                    "type": "dict",
+                    "has_id": bool(item.get("id")),
+                    "has_name": bool(item.get("name")),
+                    "has_mime_type": bool(item.get("mime_type")),
+                    "has_download_link": bool(item.get("download_link")),
+                }
+            )
+        else:
+            sample_items.append(
+                {
+                    "type": type(item).__name__,
+                    "preview": str(item)[:80] if item is not None else None,
+                }
+            )
+    return {
+        "received_keys": sorted(list(data.keys())),
+        "openaiFileIdRefs_present": "openaiFileIdRefs" in data,
+        "openaiFileIdRefs_count": len(refs),
+        "openaiFileIdRefs_item_types": [type(item).__name__ for item in refs[:5]],
+        "has_file_id": bool(str(data.get("file_id") or data.get("openai_file_id") or "").strip()),
+        "has_download_link": bool(str(data.get("download_link") or "").strip()),
+        "has_url": bool(str(data.get("url") or "").strip()),
+        "has_image_url": bool(str(data.get("image_url") or "").strip()),
+        "sample_items": sample_items,
+    }
+
+
+def _parse_top_k(raw_value: Any, default: int = 5) -> int:
+    try:
+        top_k = int(raw_value if raw_value is not None else default)
+    except (TypeError, ValueError):
+        raise ValueError("invalid_top_k")
+    if top_k < 1 or top_k > 50:
+        raise ValueError("invalid_top_k")
+    return top_k
+
+
+def _resolve_image_source_from_payload(data: Dict[str, Any], allow_temp_filename: bool = False):
+    refs = data.get("openaiFileIdRefs")
+    if refs is not None:
+        if not isinstance(refs, list):
+            return None, ({"success": False, "error": "Invalid openaiFileIdRefs"}, 400)
+        if len(refs) != 1:
+            return None, ({"success": False, "error": "Invalid openaiFileIdRefs length"}, 400)
+        file_ref = _normalize_openai_file_ref(refs[0])
+        if not file_ref:
+            return None, ({"success": False, "error": "Invalid openaiFileIdRefs entry"}, 400)
+        return {
+            "download_link": str(file_ref.get("download_link") or "").strip() or None,
+            "temp_filename": None,
+            "file_id": str(file_ref.get("id") or "").strip() or None,
+            "original_name": file_ref.get("name") or "uploaded_image.jpg",
+            "mime_type": file_ref.get("mime_type"),
+        }, None
+
+    download_link = str(
+        data.get("download_link")
+        or data.get("url")
+        or data.get("image_url")
+        or ""
+    ).strip() or None
+    file_id = str(data.get("file_id") or data.get("openai_file_id") or "").strip() or None
+    temp_filename = str(data.get("temp_filename") or "").strip() or None
+
+    provided_sources = [bool(download_link), bool(file_id)]
+    if allow_temp_filename:
+        provided_sources.append(bool(temp_filename))
+
+    if sum(provided_sources) != 1:
+        allowed = "download_link, url, image_url, file_id, openai_file_id"
+        if allow_temp_filename:
+            allowed += ", temp_filename"
+        return None, ({"success": False, "error": f"Provide exactly ONE of: openaiFileIdRefs, {allowed}"}, 400)
+
+    if download_link:
+        original_name = infer_filename_from_url(download_link)
+    elif temp_filename:
+        original_name = temp_filename
+    else:
+        original_name = "uploaded_image.jpg"
+
+    return {
+        "download_link": download_link,
+        "temp_filename": temp_filename if allow_temp_filename else None,
+        "file_id": file_id,
+        "original_name": original_name,
+        "mime_type": data.get("mime_type"),
+    }, None
+
+
+def _load_image_with_fallback(*, download_link=None, temp_filename=None, file_id=None):
+    if download_link:
+        img, err = _load_image_from_source(download_link=download_link)
+        if not err:
+            return img, None
+        if not file_id:
+            return None, err
+    if temp_filename:
+        return _load_image_from_source(temp_filename=temp_filename)
+    if file_id:
+        return _load_image_from_source(file_id=file_id)
+    return None, ({"success": False, "error": "No image source provided"}, 400)
 
 
 def _format_material_search_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -210,6 +375,37 @@ def _format_nuance_search_results(rows: List[Dict[str, Any]]) -> List[Dict[str, 
         }
         for r in rows
     ]
+
+
+def _fuse_image_search_results(*, matieres: List[Dict[str, Any]], nuances: List[Dict[str, Any]], top_k: int):
+    fused: List[Dict[str, Any]] = []
+
+    for r in matieres:
+        fused.append({
+            "type": "matiere",
+            "id": r.get("id"),
+            "image_url": r.get("image_url"),
+            "reference": r.get("reference"),
+            "label": r.get("material_name"),
+            "matiere_id": r.get("matiere_id"),
+            "nuance_id": None,
+            "similarity": r.get("similarity"),
+        })
+
+    for r in nuances:
+        fused.append({
+            "type": "nuance",
+            "id": r.get("id"),
+            "image_url": r.get("image_url"),
+            "reference": r.get("reference"),
+            "label": r.get("nuance_name"),
+            "matiere_id": None,
+            "nuance_id": r.get("nuance_id"),
+            "similarity": r.get("similarity"),
+        })
+
+    fused.sort(key=lambda x: (x.get("similarity") is not None, x.get("similarity") or -1.0), reverse=True)
+    return fused[:top_k]
 
 
 def cleanup_old_files(interval: int = 1800, max_age_seconds: int = 2 * 3600):
@@ -304,16 +500,41 @@ def build_image_url(image_path: str) -> str:
 
 def _load_image_from_source(download_link=None, temp_filename=None, file_id=None):
     """Load a PIL image from one of three sources. Returns (Image, error_tuple_or_None)."""
+    _agent_log(
+        hypothesis_id="C",
+        location="app.py:_load_image_from_source",
+        message="Load image from source (sanitized)",
+        data={
+            "has_download_link": bool(download_link),
+            "download_host": (urlparse(download_link).netloc if download_link else None),
+            "has_temp_filename": bool(temp_filename),
+            "has_file_id": bool(file_id),
+            "openai_client_configured": client is not None,
+        },
+    )
     if download_link:
         try:
             r = requests.get(download_link, timeout=20)
             r.raise_for_status()
             return Image.open(io.BytesIO(r.content)).convert("RGB"), None
         except UnidentifiedImageError:
+            _agent_log(
+                hypothesis_id="C",
+                location="app.py:_load_image_from_source",
+                message="Downloaded content is not a valid image",
+                data={"download_host": urlparse(download_link).netloc if download_link else None},
+            )
             return None, ({"success": False, "error": "not_an_image", "message": "Downloaded content is not a valid image"}, 400)
         except Exception as e:
+            _agent_log(
+                hypothesis_id="C",
+                location="app.py:_load_image_from_source",
+                message="download_link image load failed",
+                data={"error_type": type(e).__name__, "message": str(e)[:300]},
+            )
             return None, ({"success": False, "error": "download_link_failed", "message": str(e)}, 400)
     elif temp_filename:
+        # Only allow basenames inside TEMP_UPLOAD_DIR (no path traversal).
         safe_name = secure_filename(str(temp_filename))
         if not safe_name:
             return None, ({"success": False, "error": "invalid_temp_filename"}, 400)
@@ -330,12 +551,30 @@ def _load_image_from_source(download_link=None, temp_filename=None, file_id=None
             return None, ({"success": False, "error": "not_an_image", "message": "Temp file is not a valid image"}, 400)
     elif file_id:
         if not client:
+            _agent_log(
+                hypothesis_id="D",
+                location="app.py:_load_image_from_source",
+                message="OpenAI client not configured; cannot fetch file_id",
+                data={},
+            )
             return None, ({"success": False, "error": "openai_not_configured"}, 400)
         try:
             return Image.open(io.BytesIO(client.files.content(file_id).read())).convert("RGB"), None
         except UnidentifiedImageError:
+            _agent_log(
+                hypothesis_id="D",
+                location="app.py:_load_image_from_source",
+                message="OpenAI file content is not a valid image",
+                data={},
+            )
             return None, ({"success": False, "error": "not_an_image", "message": "OpenAI file content is not a valid image"}, 400)
         except Exception as e:
+            _agent_log(
+                hypothesis_id="D",
+                location="app.py:_load_image_from_source",
+                message="file_id image load failed",
+                data={"error_type": type(e).__name__, "message": str(e)[:300]},
+            )
             return None, ({"success": False, "error": "file_id_failed", "message": str(e)}, 400)
     return None, ({"success": False, "error": "No image source provided"}, 400)
 
@@ -678,8 +917,10 @@ def __debug_agent_log_get():
         return jsonify({"success": True, "exists": True, "lines": lines, "count": len(lines)}), 200
     except Exception as e:
         return jsonify({"success": False, "error": "read_failed", "message": str(e)}), 500
+# endregion agent log (debug mode)
 
 
+# region agent log (debug mode)
 @app.route("/__debug/ping", methods=["GET"])
 def __debug_ping():
     token = (request.headers.get("X-Agent-Debug-Token") or request.args.get("token") or "").strip()
@@ -691,35 +932,147 @@ def __debug_ping():
 
 
 # =============================================================================
-# SEARCH (MATIERES) — via download_link / temp_filename / file_id
+# UPLOAD AND SEARCH (MATIERES)
 # =============================================================================
 
-@app.route("/search", methods=["POST"])
-def search():
+@app.route("/upload_and_search", methods=["POST"])
+def upload_and_search():
+    if not request.is_json:
+        _agent_log(
+            hypothesis_id="E",
+            location="app.py:upload_and_search",
+            message="Reject non-JSON request",
+            data={"content_type": request.content_type, "mimetype": request.mimetype},
+        )
+        return jsonify({"success": False, "error": "JSON required"}), 400
+
     data = request.get_json(silent=True) or {}
-    if not data:
-        return jsonify({"success": False, "error": "missing_json_body"}), 400
-    top_k = int(data.get("top_k", 5))
-    if top_k < 1 or top_k > 50:
-        return jsonify({"success": False, "error": "invalid_top_k"}), 400
-    temp_filename = data.get("temp_filename")
-    file_id = data.get("file_id")
-    download_link = data.get("download_link")
-    provided = [bool(download_link), bool(temp_filename), bool(file_id)]
-    if sum(provided) != 1:
-        return jsonify({"success": False, "error": "Provide exactly ONE of: download_link, temp_filename, file_id"}), 400
-    img, err = _load_image_from_source(download_link=download_link, temp_filename=temp_filename, file_id=file_id)
+    refs_raw = data.get("openaiFileIdRefs")
+    refs_list = refs_raw if isinstance(refs_raw, list) else []
+    _agent_log(
+        hypothesis_id="A",
+        location="app.py:upload_and_search",
+        message="Received upload_and_search payload (sanitized)",
+        data={
+            "content_type": request.content_type,
+            "payload_debug": _build_upload_debug_payload(data, refs_list),
+        },
+    )
+    # Hard requirement: this endpoint must use the user's current attachment.
+    # Do not allow alternate sources (url/download_link/file_id), because they can drift
+    # from what the user actually uploaded in the current message.
+    if "openaiFileIdRefs" not in data:
+        _agent_log(
+            hypothesis_id="A",
+            location="app.py:upload_and_search",
+            message="Missing openaiFileIdRefs key",
+            data={"received_keys": sorted(list(data.keys()))},
+        )
+        return jsonify({
+            "success": False,
+            "error": "missing_openaiFileIdRefs",
+            "message": "uploadAndSearch requires the user's uploaded IMAGE from the current message (openaiFileIdRefs).",
+            "action": "Please attach exactly ONE micrograph image (PNG/JPG/JPEG/WEBP) and retry."
+        }), 400
+    source, err = _resolve_image_source_from_payload(data)
     if err:
+        _agent_log(
+            hypothesis_id="B",
+            location="app.py:upload_and_search",
+            message="Failed to resolve image source from payload",
+            data={"error": err[0], "status_code": err[1]},
+        )
         return jsonify(err[0]), err[1]
+    _agent_log(
+        hypothesis_id="B",
+        location="app.py:upload_and_search",
+        message="Resolved image source (sanitized)",
+        data={
+            "has_download_link": bool(source.get("download_link")),
+            "download_host": (urlparse(source.get("download_link") or "").netloc or None),
+            "has_temp_filename": bool(source.get("temp_filename")),
+            "has_file_id": bool(source.get("file_id")),
+            "original_name": source.get("original_name"),
+            "mime_type": source.get("mime_type"),
+            "openai_client_configured": client is not None,
+        },
+    )
+
     try:
+        top_k = _parse_top_k(data.get("top_k", 5))
+        scope = str(data.get("scope") or "auto").strip().lower()
+        if scope not in {"auto", "matieres", "nuances"}:
+            return jsonify({"success": False, "error": "invalid_scope", "allowed": ["auto", "matieres", "nuances"]}), 400
+        mime_type = source.get("mime_type")
+        original_name = source.get("original_name") or "uploaded_image.jpg"
+
+        # Strict guardrail: reject obvious non-image attachments early (e.g. KB .md).
+        ext = (Path(str(original_name)).suffix or "").lower()
+        if mime_type:
+            if not str(mime_type).lower().startswith("image/"):
+                return jsonify({
+                    "success": False,
+                    "error": "invalid_file_type",
+                    "message": "uploadAndSearch expects exactly one IMAGE attachment (PNG/JPG/JPEG/WEBP).",
+                    "received": {"name": original_name, "mime_type": mime_type},
+                    "action": "Please re-upload ONLY the micrograph image (no .md/.pdf/.xls attachments) and retry."
+                }), 400
+        else:
+            # Some runtimes may omit mime_type; still block clearly non-image filenames.
+            if ext in {".md", ".markdown", ".pdf", ".xls", ".xlsx", ".doc", ".docx", ".txt"}:
+                return jsonify({
+                    "success": False,
+                    "error": "invalid_file_type",
+                    "message": "uploadAndSearch expects exactly one IMAGE attachment (PNG/JPG/JPEG/WEBP).",
+                    "received": {"name": original_name, "mime_type": None},
+                    "action": "Please re-upload ONLY the micrograph image and retry."
+                }), 400
+
+        img, err = _load_image_with_fallback(
+            download_link=source.get("download_link"),
+            temp_filename=source.get("temp_filename"),
+            file_id=source.get("file_id"),
+        )
+        if err:
+            return jsonify(err[0]), err[1]
+
+        safe_name = secure_filename(original_name) or "uploaded_image"
+        image_stem = Path(safe_name).stem or "uploaded_image"
+        image_filename = f"{image_stem}_{int(time.time())}_{uuid.uuid4().hex}.jpg"
+        image_path = IMAGES_DIR / image_filename
+        img.save(image_path, format="JPEG", quality=95)
+
         query_embedding = compute_embedding_from_pil(img)
-        rows = search_similar_in_db(query_embedding, top_k=top_k)
-        results = [{"id": r["id"], "image_url": build_image_url(r["image_path"]), "matiere_id": r["matiere_id"], "material_name": r["nom_matiere"], "reference": r["reference"], "similarity": float(r["similarity"]) if r["similarity"] is not None else None} for r in rows]
-        return jsonify({"success": True, "results": results}), 200
+        if scope == "auto":
+            # Fetch more from each table, then fuse into a single global top_k.
+            k_each = min(50, max(top_k * 2, top_k))
+            mat_rows = search_similar_in_db(query_embedding, top_k=k_each)
+            nu_rows = search_similar_nuances_in_db(query_embedding, top_k=k_each)
+            mat_results = _format_material_search_results(mat_rows)
+            nu_results = _format_nuance_search_results(nu_rows)
+            results = _fuse_image_search_results(matieres=mat_results, nuances=nu_results, top_k=top_k)
+        elif scope == "nuances":
+            rows = search_similar_nuances_in_db(query_embedding, top_k=top_k)
+            results = _format_nuance_search_results(rows)
+        else:
+            rows = search_similar_in_db(query_embedding, top_k=top_k)
+            results = _format_material_search_results(rows)
+
+        return jsonify({
+            "success": True,
+            "scope": scope,
+            "image_filename": image_filename,
+            "results": results,
+            "image_url": build_image_url(str(image_path))
+        }), 200
+
+    except ValueError as e:
+        if str(e) == "invalid_top_k":
+            return jsonify({"success": False, "error": "invalid_top_k"}), 400
+        return jsonify({"success": False, "error": str(e)}), 400
     except Exception as e:
-        return jsonify({"success": False, "error": "search_failed", "message": str(e)}), 500
-
-
+        logging.error(f"Upload and search failed: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
 # =============================================================================
 # MATERIAL DETAILS
 # =============================================================================
@@ -1118,6 +1471,32 @@ def verify_fiches_adn_table():
     finally:
         if conn:
             conn.close()
+
+
+@app.route("/search", methods=["POST"])
+def search():
+    data = request.get_json(silent=True) or {}
+    if not data:
+        return jsonify({"success": False, "error": "missing_json_body"}), 400
+    top_k = int(data.get("top_k", 5))
+    if top_k < 1 or top_k > 50:
+        return jsonify({"success": False, "error": "invalid_top_k"}), 400
+    temp_filename = data.get("temp_filename")
+    file_id = data.get("file_id")
+    download_link = data.get("download_link")
+    provided = [bool(download_link), bool(temp_filename), bool(file_id)]
+    if sum(provided) != 1:
+        return jsonify({"success": False, "error": "Provide exactly ONE of: download_link, temp_filename, file_id"}), 400
+    img, err = _load_image_from_source(download_link=download_link, temp_filename=temp_filename, file_id=file_id)
+    if err:
+        return jsonify(err[0]), err[1]
+    try:
+        query_embedding = compute_embedding_from_pil(img)
+        rows = search_similar_in_db(query_embedding, top_k=top_k)
+        results = [{"id": r["id"], "image_url": build_image_url(r["image_path"]), "matiere_id": r["matiere_id"], "material_name": r["nom_matiere"], "reference": r["reference"], "similarity": float(r["similarity"]) if r["similarity"] is not None else None} for r in rows]
+        return jsonify({"success": True, "results": results}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": "search_failed", "message": str(e)}), 500
 
 
 # =============================================================================
@@ -1602,11 +1981,13 @@ def update_black_mix(mix_id):
     try:
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # ── 0. Vérifier existence ─────────────────────────────────────
                 cur.execute("SELECT id, reference FROM public.black_mixes WHERE id = %s", (mix_id,))
                 existing = cur.fetchone()
                 if not existing:
                     return jsonify({"success": False, "error": "Black Mix not found"}), 404
 
+                # ── 1. Champs identité ────────────────────────────────────────
                 product_reference = data.get("product_reference")
                 mix_name = data.get("mix_name")
                 document_revision_history = data.get("document_revision_history")
@@ -1614,6 +1995,7 @@ def update_black_mix(mix_id):
                 if not product_reference or not mix_name:
                     return jsonify({"success": False, "error": "product_reference and mix_name are required"}), 400
 
+                # ── 2. Détecter les sections fournies ─────────────────────────
                 has_components    = "components" in data
                 has_process_steps = "process_steps" in data
                 has_control_plan  = "control_plan" in data
@@ -1624,6 +2006,7 @@ def update_black_mix(mix_id):
                 control_plan_raw   = data.get("control_plan", [])
                 control_plan       = normalize_control_plan(control_plan_raw)
 
+                # ── 3. Valider AVANT toute mutation ───────────────────────────
                 if has_process_steps and not process_steps:
                     return jsonify({"success": False, "error": "At least one process_step is required when providing process_steps"}), 400
 
@@ -1642,6 +2025,7 @@ def update_black_mix(mix_id):
                             return jsonify({"success": False, "validation_errors": extra_errors}), 400
                         ref_lookup.update(extra_lookup)
 
+                # ── 4. Mettre à jour la table black_mixes ────────────────────
                 cur.execute(
                     """
                     UPDATE public.black_mixes
@@ -1650,9 +2034,15 @@ def update_black_mix(mix_id):
                         document_revision_history = %s
                     WHERE id = %s
                     """,
-                    (product_reference, mix_name, Json(document_revision_history) if document_revision_history else None, mix_id)
+                    (
+                        product_reference,
+                        mix_name,
+                        Json(document_revision_history) if document_revision_history else None,
+                        mix_id
+                    )
                 )
 
+                # ── 5. Composants (seulement si fournis) ─────────────────────
                 if has_components:
                     cur.execute("DELETE FROM public.black_mix_components WHERE black_mix_id = %s", (mix_id,))
                     for component in components:
@@ -1665,9 +2055,18 @@ def update_black_mix(mix_id):
                                  component_name, quantity_value, quantity_unit, metadata)
                             VALUES (%s, %s, %s, %s, %s, %s, %s)
                             """,
-                            (black_mix_id if False else mix_id, resolved["id"] if resolved["type"] == "matiere" else None, resolved["id"] if resolved["type"] == "black_mix" else None, component.get("component_name") or ref, component.get("quantity"), component.get("unit", "kg"), Json(component.get("metadata", {})))
+                            (
+                                mix_id,
+                                resolved["id"] if resolved["type"] == "matiere" else None,
+                                resolved["id"] if resolved["type"] == "black_mix" else None,
+                                component.get("component_name") or ref,
+                                component.get("quantity"),
+                                component.get("unit", "kg"),
+                                Json(component.get("metadata", {}))
+                            )
                         )
 
+                # ── 6. Étapes + step_materials (seulement si fournis) ────────
                 if has_process_steps:
                     cur.execute("SELECT id FROM public.black_mix_process_steps WHERE black_mix_id = %s", (mix_id,))
                     old_step_ids = [r["id"] for r in cur.fetchall()]
@@ -1704,6 +2103,7 @@ def update_black_mix(mix_id):
                             else:
                                 cur.execute("INSERT INTO public.black_mix_step_materials (process_step_id, sub_black_mix_id, created_at) VALUES (%s, %s, NOW())", (process_step_id, resolved["id"]))
 
+                # ── 7. Plan de contrôle (seulement si fourni) ────────────────
                 if has_control_plan:
                     cur.execute("DELETE FROM public.black_mix_control_plan WHERE black_mix_id = %s", (mix_id,))
                     for param in control_plan:
@@ -1716,6 +2116,7 @@ def update_black_mix(mix_id):
                             (mix_id, param["parameter_name"], param["target_value"], param["min_value"], param["max_value"], param["unit"], Json(param["sheet_data"]))
                         )
 
+                # ── 8. Reconstruire et versionner l'ADN ──────────────────────
                 new_snapshot = build_black_mix_adn_snapshot(cur, mix_id, product_reference, mix_name)
 
                 cur.execute(
@@ -1779,6 +2180,7 @@ def get_black_mix_adn(mix_id):
             if not bm:
                 return jsonify({"success": False, "error": "Black Mix not found"}), 404
 
+            # ── BASIC: return stored ADN snapshot ──
             if level == "basic":
                 cur.execute("SELECT id, black_mix_id, adn_text, version, created_at FROM public.black_mix_adn WHERE black_mix_id = %s ORDER BY version DESC LIMIT 1", (mix_id,))
                 row = cur.fetchone()
@@ -1786,6 +2188,7 @@ def get_black_mix_adn(mix_id):
                     return jsonify({"success": False, "error": "ADN not found for this Black Mix"}), 404
                 return jsonify({"success": True, "adn": {"id": row["id"], "black_mix_id": row["black_mix_id"], "version": row["version"], "created_at": row["created_at"].isoformat() if row["created_at"] else None, "snapshot": row["adn_text"]}}), 200
 
+            # ── ENRICHED: build live snapshot + AI analysis ──
             if level == "enriched":
                 snapshot = build_black_mix_adn_snapshot(cur, bm["id"], bm["reference"], bm["name"])
                 data_for_ai = {"black_mix_identity": {"reference": bm["reference"], "name": bm["name"], "status": bm["status"], "revision_history": bm["document_revision_history"]}, "components": snapshot["composition"], "process_steps": snapshot["process_steps"], "control_plan": snapshot["control_plan"]}
@@ -1802,6 +2205,7 @@ RÈGLES: Aucune hallucination. Langue: Français. Style professionnel.
                 ai_response = call_groq_with_retry(messages=[{"role": "system", "content": "Tu es un expert en formulation industrielle."}, {"role": "user", "content": prompt}], model="llama-3.3-70b-versatile", temperature=0.2, max_tokens=6000)
                 return jsonify({"success": True, "black_mix": dict(bm), "source_data": serialize_to_json_compatible(data_for_ai), "ai_analysis": ai_response.choices[0].message.content if ai_response.choices else ""}), 200
 
+            # ── COMBINED: stored ADN + material specs for each component ──
             cur.execute("SELECT adn_text, version, created_at FROM public.black_mix_adn WHERE black_mix_id = %s ORDER BY version DESC LIMIT 1", (mix_id,))
             adn_row = cur.fetchone()
             if not adn_row:
@@ -1901,7 +2305,7 @@ def resolve_nuance_ref_lookup(cur, components):
 
 
 # =============================================================================
-# CUISSON PROGRAMS — HELPERS
+# CUISSON PROGRAMS — HELPERS (UPDATED)
 # =============================================================================
 
 def parse_warne_nachbehandlung(raw_value: str):
@@ -1916,6 +2320,7 @@ def parse_warne_nachbehandlung(raw_value: str):
     try:
         raw_num = parts[0]
         h2_percent = int(parts[1]) if len(parts) >= 2 else None
+        # Format number: numeric → zero-padded 3 digits, K-type → as-is
         if raw_num.upper().startswith('K'):
             program_number = raw_num.upper()
         else:
@@ -1946,6 +2351,7 @@ def get_cuisson_program_by_number(cur, program_number: str):
     row = cur.fetchone()
     if not row:
         return None
+    # Build ovens dict (only non-null)
     ovens = {}
     for i in range(13):
         val = row[6 + i]
@@ -1974,10 +2380,12 @@ def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _v
         return {"nuance_id": nuance_id, "product_reference": product_reference, "nuance_name": nuance_name, "error": "Circular reference detected — snapshot truncated here"}
     _visited.add(nuance_id)
 
+    # ── Revision history ─────────────────────────────────────────────────────
     cur.execute("SELECT document_revision_history FROM public.nuances WHERE id = %s", (nuance_id,))
     row = cur.fetchone()
     revision_history = row["document_revision_history"] if row and row["document_revision_history"] else None
 
+    # ── Cuisson program (Wärme-Nachbehandlung) — UPDATED with kontrolle ──────
     cur.execute(
         """
         SELECT n.cuisson_raw, n.cuisson_program_number, n.cuisson_h2_percent,
@@ -2008,6 +2416,7 @@ def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _v
             } if cuisson_row["type"] else None,
         }
 
+    # ── Components ───────────────────────────────────────────────────────────
     cur.execute(
         """
         SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit, c.metadata,
@@ -2055,6 +2464,7 @@ def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _v
             entry["sub_nuance_adn"] = build_nuance_adn_snapshot(cur, sub_nuance_id, sub_nuance_ref, sub_nuance_name, _visited=set(_visited))
         components.append(entry)
 
+    # ── Process steps (mishkarte) ─────────────────────────────────────────────
     cur.execute("SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters FROM public.nuance_process_steps s WHERE s.nuance_id = %s ORDER BY s.step_order", (nuance_id,))
     steps_raw = cur.fetchall()
     process_steps = []
@@ -2080,9 +2490,11 @@ def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _v
                 step_mat_refs.append(ref)
         process_steps.append({"step_order": step_order, "step_name": step_name, "machine": machine, "parameters": parameters, "materials": step_mat_refs})
 
+    # ── Control plan ─────────────────────────────────────────────────────────
     cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit, sheet_data FROM public.nuance_control_plan WHERE nuance_id = %s ORDER BY parameter_name", (nuance_id,))
     control_plan = [{"parameter_name": r["parameter_name"], "target_value": float(r["target_value"]) if r["target_value"] is not None else None, "min_value": float(r["min_value"]) if r["min_value"] is not None else None, "max_value": float(r["max_value"]) if r["max_value"] is not None else None, "unit": r["unit"], "sheet_data": r["sheet_data"]} for r in cur.fetchall()]
 
+    # ── Images + expert notes ─────────────────────────────────────────────────
     cur.execute("""
         SELECT ni.id, ni.image_path, ne.note_json, ne.created_at AS note_created_at
         FROM public.nuance_images ni
@@ -2154,6 +2566,8 @@ def submit_nuance():
         return jsonify({"success": False, "error": "Request body must be JSON"}), 400
 
     data = request.get_json()
+
+    import logging
     logging.info(f"📥 Payload reçu:\n{json.dumps(data, indent=2)}")
 
     product_reference  = data.get("product_reference")
@@ -2163,6 +2577,7 @@ def submit_nuance():
     step_materials_map = data.get("step_materials", {})
     control_plan_raw   = data.get("control_plan", [])
     control_plan       = normalize_control_plan(control_plan_raw)
+
     document_revision_history = data.get("document_revision_history")
 
     warne_raw = data.get("warne_nachbehandlung")
@@ -2171,32 +2586,61 @@ def submit_nuance():
         if warne_raw == "":
             warne_raw = None
 
+    # 🔴 VALIDATION
     if not product_reference or not nuance_name:
-        return jsonify({"success": False, "error": "product_reference and nuance_name are required"}), 400
+        return jsonify({
+            "success": False,
+            "error": "product_reference and nuance_name are required"
+        }), 400
 
     if not process_steps:
-        return jsonify({"success": False, "error": "At least one process_step is required"}), 400
+        return jsonify({
+            "success": False,
+            "error": "At least one process_step is required"
+        }), 400
 
     conn = psycopg2.connect(DB_DSN)
+
     try:
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                ref_lookup, validation_errors = resolve_nuance_ref_lookup(cur, components)
-                if validation_errors:
-                    return jsonify({"success": False, "validation_errors": validation_errors}), 400
 
-                all_step_refs = {ref for refs in step_materials_map.values() for ref in refs if ref}
+                # ───────── VALIDATION DES REFERENCES ─────────
+                ref_lookup, validation_errors = resolve_nuance_ref_lookup(cur, components)
+
+                if validation_errors:
+                    return jsonify({
+                        "success": False,
+                        "validation_errors": validation_errors
+                    }), 400
+
+                # 🔴 Validation step_materials
+                all_step_refs = {
+                    ref for refs in step_materials_map.values()
+                    for ref in refs if ref
+                }
+
                 extra_refs = all_step_refs - set(ref_lookup.keys())
+
                 if extra_refs:
-                    extra_lookup, extra_errors = resolve_nuance_ref_lookup(cur, [{"reference": r} for r in extra_refs])
+                    extra_lookup, extra_errors = resolve_nuance_ref_lookup(
+                        cur, [{"reference": r} for r in extra_refs]
+                    )
+
                     if extra_errors:
-                        return jsonify({"success": False, "validation_errors": extra_errors}), 400
+                        return jsonify({
+                            "success": False,
+                            "validation_errors": extra_errors
+                        }), 400
+
                     ref_lookup.update(extra_lookup)
 
                 logging.info(f"✅ Ref lookup: {ref_lookup}")
 
+                # ───────── CUISSON ─────────
                 cuisson_program_number, cuisson_h2_percent, cuisson_program_id = _resolve_cuisson_program(cur, warne_raw)
 
+                # ───────── INSERT NUANCE ─────────
                 cur.execute("""
                     INSERT INTO public.nuances
                         (reference, name, status, created_at,
@@ -2206,15 +2650,22 @@ def submit_nuance():
                     VALUES (%s, %s, 'draft', NOW(), %s, %s, %s, %s, %s)
                     RETURNING id
                 """, (
-                    product_reference, nuance_name,
+                    product_reference,
+                    nuance_name,
                     Json(document_revision_history) if document_revision_history else None,
-                    warne_raw, cuisson_program_number, cuisson_h2_percent, cuisson_program_id
+                    warne_raw,
+                    cuisson_program_number,
+                    cuisson_h2_percent,
+                    cuisson_program_id
                 ))
+
                 nuance_id = cur.fetchone()["id"]
 
+                # ───────── COMPONENTS ─────────
                 for component in components:
                     ref = component.get("reference")
                     resolved = ref_lookup[ref]
+
                     cur.execute("""
                         INSERT INTO public.nuance_components
                             (nuance_id, matiere_id, sub_black_mix_id, sub_nuance_id,
@@ -2231,21 +2682,33 @@ def submit_nuance():
                         Json(component.get("metadata") or {})
                     ))
 
+                # ───────── PROCESS STEPS ─────────
                 for step in process_steps:
                     step_order = step.get("step_order")
+
                     cur.execute("""
                         INSERT INTO public.nuance_process_steps
                             (nuance_id, step_order, step_name, machine_name, parameters)
                         VALUES (%s, %s, %s, %s, %s)
                         RETURNING id
-                    """, (nuance_id, step_order, step.get("step_name"), step.get("machine"), Json(step.get("parameters") or {})))
+                    """, (
+                        nuance_id,
+                        step_order,
+                        step.get("step_name"),
+                        step.get("machine"),
+                        Json(step.get("parameters") or {})
+                    ))
+
                     process_step_id = cur.fetchone()["id"]
 
                     refs_for_step = step_materials_map.get(str(step_order), [])
+
                     for ref in refs_for_step:
                         resolved = ref_lookup.get(ref)
+
                         if not resolved:
                             raise ValueError(f"Reference '{ref}' in step_materials not found")
+
                         cur.execute("""
                             INSERT INTO public.nuance_step_materials
                                 (process_step_id, matiere_id, sub_black_mix_id, sub_nuance_id, created_at)
@@ -2257,14 +2720,26 @@ def submit_nuance():
                             resolved["id"] if resolved["type"] == "nuance"    else None,
                         ))
 
+                # ───────── CONTROL PLAN ─────────
                 for param in control_plan:
                     cur.execute("""
                         INSERT INTO public.nuance_control_plan
                             (nuance_id, parameter_name, target_value, min_value, max_value, unit, sheet_data)
                         VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """, (nuance_id, param["parameter_name"], param["target_value"], param["min_value"], param["max_value"], param["unit"], Json(param["sheet_data"])))
+                    """, (
+                        nuance_id,
+                        param["parameter_name"],
+                        param["target_value"],
+                        param["min_value"],
+                        param["max_value"],
+                        param["unit"],
+                        Json(param["sheet_data"])
+                    ))
 
-                adn_snapshot = build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name)
+                # ───────── ADN ─────────
+                adn_snapshot = build_nuance_adn_snapshot(
+                    cur, nuance_id, product_reference, nuance_name
+                )
                 adn_snapshot = serialize_to_json_compatible(adn_snapshot)
                 adn_json_str = json.dumps(adn_snapshot, default=str)
 
@@ -2273,16 +2748,31 @@ def submit_nuance():
                         (nuance_id, adn_text, version, created_at)
                     VALUES (%s, %s::jsonb, 1, NOW()) RETURNING id
                 """, (nuance_id, adn_json_str))
+
                 adn_id = cur.fetchone()["id"]
 
-                return jsonify({"success": True, "nuance_id": nuance_id, "adn": {"id": adn_id, "version": 1}}), 200
+                return jsonify({
+                    "success": True,
+                    "nuance_id": nuance_id,
+                    "adn": {
+                        "id": adn_id,
+                        "version": 1
+                    }
+                }), 200
 
     except Exception as e:
         conn.rollback()
         import traceback
         tb = traceback.format_exc()
         logging.error("🔥 ERROR submit_nuance", exc_info=True)
-        return jsonify({"success": False, "error": str(e), "type": type(e).__name__, "traceback": tb}), 500
+
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "type": type(e).__name__,
+            "traceback": tb
+        }), 500
+
     finally:
         conn.close()
 
@@ -2346,6 +2836,7 @@ def get_nuance_adn(nuance_id):
             if not nuance:
                 return jsonify({"success": False, "error": "Nuance not found"}), 404
 
+            # ── BASIC: return stored ADN snapshot ──
             if level == "basic":
                 cur.execute("SELECT id, nuance_id, adn_text, version, created_at FROM public.nuance_adn WHERE nuance_id = %s ORDER BY version DESC LIMIT 1", (nuance_id,))
                 row = cur.fetchone()
@@ -2353,8 +2844,10 @@ def get_nuance_adn(nuance_id):
                     return jsonify({"success": False, "error": "ADN not found for this Nuance"}), 404
                 return jsonify({"success": True, "adn": {"id": row["id"], "nuance_id": row["nuance_id"], "version": row["version"], "created_at": row["created_at"].isoformat() if row["created_at"] else None, "snapshot": row["adn_text"]}}), 200
 
+            # ── Build live snapshot (shared by enriched + combined) ──
             snapshot = build_nuance_adn_snapshot(cur, nuance_id, nuance["reference"], nuance["name"])
 
+            # ── ENRICHED: live snapshot + AI analysis ──
             if level == "enriched":
                 data_for_ai = {"nuance_identity": {"reference": nuance["reference"], "name": nuance["name"], "status": nuance["status"], "revision_history": nuance["document_revision_history"], "cuisson": snapshot.get("cuisson")}, "components": snapshot["composition"], "process_steps": snapshot["process_steps"], "control_plan": snapshot["control_plan"]}
                 prompt = f"""Tu es un expert en formulation industrielle de matériaux carbone et graphite.
@@ -2378,6 +2871,7 @@ RÈGLES: Aucune hallucination. Langue: Français. Style professionnel.
                 ai_response = call_groq_with_retry(messages=[{"role": "system", "content": "Tu es un expert en formulation industrielle."}, {"role": "user", "content": prompt}], model="llama-3.3-70b-versatile", temperature=0.2, max_tokens=6000)
                 return jsonify({"success": True, "nuance": dict(nuance), "source_data": serialize_to_json_compatible(data_for_ai), "ai_analysis": ai_response.choices[0].message.content if ai_response.choices else ""}), 200
 
+            # ── COMBINED: live snapshot with images ──
             for img in snapshot.get("images", []):
                 if img.get("image_path"):
                     img["image_url"] = build_image_url(img["image_path"])
@@ -2390,7 +2884,7 @@ RÈGLES: Aucune hallucination. Langue: Français. Style professionnel.
 
 
 # =============================================================================
-# NUANCE IMAGES — UPLOAD + SIMILARITY SEARCH
+# NUANCE IMAGES — UPLOAD + SEARCH PAR SIMILARITÉ
 # =============================================================================
 
 def search_similar_nuances_in_db(query_embedding: np.ndarray, top_k: int = 5):
@@ -2487,7 +2981,7 @@ def search_similar_nuances():
 
 
 # =============================================================================
-# CUISSON PROGRAMS — ENDPOINTS
+# CUISSON PROGRAMS — ENDPOINTS (UPDATED with kontrolle + VARCHAR)
 # =============================================================================
 
 @app.route("/cuisson-programs", methods=["GET"])
@@ -2519,6 +3013,7 @@ def get_cuisson_program_detail(program_number):
     """
     conn = psycopg2.connect(DB_DSN)
     try:
+        # Normalize: numeric → zero-padded, K-type → uppercase as-is
         if program_number.upper().startswith('K'):
             formatted = program_number.upper()
         else:
@@ -2631,7 +3126,6 @@ def set_nuance_cuisson(nuance_id):
     finally:
         conn.close()
 
-
 @app.route("/nuance/<int:nuance_id>/update", methods=["PUT"])
 def update_nuance(nuance_id):
     if not request.is_json:
@@ -2642,11 +3136,14 @@ def update_nuance(nuance_id):
     try:
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
+
+                # ── 0. Vérifier existence ─────────────────────────────────────
                 cur.execute("SELECT id, reference FROM public.nuances WHERE id = %s", (nuance_id,))
                 existing = cur.fetchone()
                 if not existing:
                     return jsonify({"success": False, "error": "Nuance not found"}), 404
 
+                # ── 1. Champs identité ────────────────────────────────────────
                 product_reference         = data.get("product_reference")
                 nuance_name               = data.get("nuance_name")
                 document_revision_history = data.get("document_revision_history")
@@ -2655,6 +3152,7 @@ def update_nuance(nuance_id):
                 if not product_reference or not nuance_name:
                     return jsonify({"success": False, "error": "product_reference and nuance_name are required"}), 400
 
+                # ── 2. Détecter les sections fournies ─────────────────────────
                 has_components    = "components" in data
                 has_process_steps = "process_steps" in data
                 has_control_plan  = "control_plan" in data
@@ -2665,6 +3163,7 @@ def update_nuance(nuance_id):
                 control_plan_raw   = data.get("control_plan", [])
                 control_plan       = normalize_control_plan(control_plan_raw)
 
+                # ── 3. Valider AVANT toute mutation ───────────────────────────
                 if has_process_steps and not process_steps:
                     return jsonify({"success": False, "error": "At least one process_step is required when providing process_steps"}), 400
 
@@ -2678,13 +3177,17 @@ def update_nuance(nuance_id):
                     all_step_refs = {ref for refs in step_materials_map.values() for ref in refs if ref}
                     extra_refs    = all_step_refs - set(ref_lookup.keys())
                     if extra_refs:
-                        extra_lookup, extra_errors = resolve_nuance_ref_lookup(cur, [{"reference": r} for r in extra_refs])
+                        extra_lookup, extra_errors = resolve_nuance_ref_lookup(
+                            cur, [{"reference": r} for r in extra_refs]
+                        )
                         if extra_errors:
                             return jsonify({"success": False, "validation_errors": extra_errors}), 400
                         ref_lookup.update(extra_lookup)
 
+                # ── 4. Parser le programme de cuisson ────────────────────────
                 cuisson_program_number, cuisson_h2_percent, cuisson_program_id = _resolve_cuisson_program(cur, warne_raw)
 
+                # ── 5. Mettre à jour la table nuances ────────────────────────
                 cur.execute(
                     """
                     UPDATE public.nuances
@@ -2698,9 +3201,19 @@ def update_nuance(nuance_id):
                         updated_at                 = NOW()
                     WHERE id = %s
                     """,
-                    (product_reference, nuance_name, Json(document_revision_history) if document_revision_history else None, warne_raw or None, cuisson_program_number, cuisson_h2_percent, cuisson_program_id, nuance_id)
+                    (
+                        product_reference,
+                        nuance_name,
+                        Json(document_revision_history) if document_revision_history else None,
+                        warne_raw or None,
+                        cuisson_program_number,
+                        cuisson_h2_percent,
+                        cuisson_program_id,
+                        nuance_id
+                    )
                 )
 
+                # ── 6. Composants (seulement si fournis) ─────────────────────
                 if has_components:
                     cur.execute("DELETE FROM public.nuance_components WHERE nuance_id = %s", (nuance_id,))
                     for component in components:
@@ -2713,14 +3226,30 @@ def update_nuance(nuance_id):
                                  component_name, quantity_value, quantity_unit, metadata)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                             """,
-                            (nuance_id, resolved["id"] if resolved["type"] == "matiere" else None, resolved["id"] if resolved["type"] == "black_mix" else None, resolved["id"] if resolved["type"] == "nuance" else None, component.get("component_name") or ref, component.get("quantity"), component.get("unit", "kg"), Json(component.get("metadata", {})))
+                            (
+                                nuance_id,
+                                resolved["id"] if resolved["type"] == "matiere"    else None,
+                                resolved["id"] if resolved["type"] == "black_mix"  else None,
+                                resolved["id"] if resolved["type"] == "nuance"     else None,
+                                component.get("component_name") or ref,
+                                component.get("quantity"),
+                                component.get("unit", "kg"),
+                                Json(component.get("metadata", {}))
+                            )
                         )
 
+                # ── 7. Étapes + step_materials (seulement si fournis) ────────
                 if has_process_steps:
-                    cur.execute("SELECT id FROM public.nuance_process_steps WHERE nuance_id = %s", (nuance_id,))
+                    cur.execute(
+                        "SELECT id FROM public.nuance_process_steps WHERE nuance_id = %s",
+                        (nuance_id,)
+                    )
                     old_step_ids = [r["id"] for r in cur.fetchall()]
                     if old_step_ids:
-                        cur.execute("DELETE FROM public.nuance_step_materials WHERE process_step_id = ANY(%s)", (old_step_ids,))
+                        cur.execute(
+                            "DELETE FROM public.nuance_step_materials WHERE process_step_id = ANY(%s)",
+                            (old_step_ids,)
+                        )
                     cur.execute("DELETE FROM public.nuance_process_steps WHERE nuance_id = %s", (nuance_id,))
 
                     for step in process_steps:
@@ -2731,7 +3260,13 @@ def update_nuance(nuance_id):
                                 (nuance_id, step_order, step_name, machine_name, parameters)
                             VALUES (%s, %s, %s, %s, %s) RETURNING id
                             """,
-                            (nuance_id, step_order, step.get("step_name"), step.get("machine"), Json(step.get("parameters", {})))
+                            (
+                                nuance_id,
+                                step_order,
+                                step.get("step_name"),
+                                step.get("machine"),
+                                Json(step.get("parameters", {}))
+                            )
                         )
                         process_step_id = cur.fetchone()["id"]
 
@@ -2753,9 +3288,15 @@ def update_nuance(nuance_id):
                                     (process_step_id, matiere_id, sub_black_mix_id, sub_nuance_id, created_at)
                                 VALUES (%s, %s, %s, %s, NOW())
                                 """,
-                                (process_step_id, resolved["id"] if resolved["type"] == "matiere" else None, resolved["id"] if resolved["type"] == "black_mix" else None, resolved["id"] if resolved["type"] == "nuance" else None)
+                                (
+                                    process_step_id,
+                                    resolved["id"] if resolved["type"] == "matiere"   else None,
+                                    resolved["id"] if resolved["type"] == "black_mix" else None,
+                                    resolved["id"] if resolved["type"] == "nuance"    else None,
+                                )
                             )
 
+                # ── 8. Plan de contrôle (seulement si fourni) ────────────────
                 if has_control_plan:
                     cur.execute("DELETE FROM public.nuance_control_plan WHERE nuance_id = %s", (nuance_id,))
                     for param in control_plan:
@@ -2765,12 +3306,26 @@ def update_nuance(nuance_id):
                                 (nuance_id, parameter_name, target_value, min_value, max_value, unit, sheet_data)
                             VALUES (%s, %s, %s, %s, %s, %s, %s)
                             """,
-                            (nuance_id, param["parameter_name"], param["target_value"], param["min_value"], param["max_value"], param["unit"], Json(param["sheet_data"]))
+                            (
+                                nuance_id,
+                                param["parameter_name"],
+                                param["target_value"],
+                                param["min_value"],
+                                param["max_value"],
+                                param["unit"],
+                                Json(param["sheet_data"])
+                            )
                         )
 
-                new_snapshot = build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name)
+                # ── 9. Reconstruire et versionner l'ADN ──────────────────────
+                new_snapshot = build_nuance_adn_snapshot(
+                    cur, nuance_id, product_reference, nuance_name
+                )
 
-                cur.execute("SELECT version FROM public.nuance_adn WHERE nuance_id = %s ORDER BY version DESC LIMIT 1", (nuance_id,))
+                cur.execute(
+                    "SELECT version FROM public.nuance_adn WHERE nuance_id = %s ORDER BY version DESC LIMIT 1",
+                    (nuance_id,)
+                )
                 last_version_row = cur.fetchone()
                 next_version     = (last_version_row["version"] + 1) if last_version_row else 1
 
@@ -2793,12 +3348,15 @@ def update_nuance(nuance_id):
                     "product_reference": product_reference,
                     "updated_sections":  updated_sections,
                     "component_types":   {ref: info["type"] for ref, info in ref_lookup.items()},
-                    "adn":               {"id": new_adn_id, "version": next_version},
+                    "adn": {
+                        "id":      new_adn_id,
+                        "version": next_version
+                    },
                     "cuisson": {
-                        "raw":            warne_raw or None,
+                        "raw":           warne_raw or None,
                         "program_number": cuisson_program_number,
-                        "h2_percent":     cuisson_h2_percent,
-                        "program_found":  cuisson_program_id is not None
+                        "h2_percent":    cuisson_h2_percent,
+                        "program_found": cuisson_program_id is not None
                     }
                 }), 200
 
@@ -2812,9 +3370,8 @@ def update_nuance(nuance_id):
     finally:
         conn.close()
 
-
 # =============================================================================
-# XLS → JSON CONVERSION + SHEET EXTRACTION
+# XLS → XLSX CONVERSION + SHEET EXTRACTION TO JSON
 # =============================================================================
 
 def _xlrd_cell_to_str(cell, book):
@@ -2860,13 +3417,20 @@ def _extract_sheet_raw(xls_sheet, book):
 def _parse_sollwerte(xls_sheet, book):
     """Parse the Sollwerte sheet into structured specification data."""
     import xlrd
-    result = {"vormischung": "", "reference": "", "revisions": []}
+    result = {
+        "vormischung": "",
+        "reference": "",
+        "revisions": []
+    }
+    # Row 0: Vormischung / reference
     if xls_sheet.nrows > 0:
         if xls_sheet.ncols > 0:
             result["vormischung"] = _xlrd_cell_to_str(xls_sheet.cell(0, 0), book)
         if xls_sheet.ncols > 1:
             result["reference"] = _xlrd_cell_to_str(xls_sheet.cell(0, 1), book)
 
+    # Parse revision blocks. A new block starts at "geändert am/von", "erstellt am",
+    # or "Änderungsgrund". The topmost block in the sheet is the latest revision.
     current_revision = None
     i = 1
     while i < xls_sheet.nrows:
@@ -2877,26 +3441,39 @@ def _parse_sollwerte(xls_sheet, book):
                 result["revisions"].append(current_revision)
             date_val = _xlrd_cell_to_str(xls_sheet.cell(i, 1), book) if xls_sheet.ncols > 1 else ""
             author = _xlrd_cell_to_str(xls_sheet.cell(i, 2), book) if xls_sheet.ncols > 2 else ""
-            current_revision = {"date": date_val, "author": author, "change_reason": "", "specifications": []}
+            current_revision = {
+                "date": date_val,
+                "author": author,
+                "change_reason": "",
+                "specifications": []
+            }
             i += 1
             continue
 
         if "änderungsgrund" in col0:
+            # Each Änderungsgrund starts a new spec block
             if current_revision and current_revision["specifications"]:
                 result["revisions"].append(current_revision)
             reason = _xlrd_cell_to_str(xls_sheet.cell(i, 1), book) if xls_sheet.ncols > 1 else ""
             if not current_revision:
                 current_revision = {"date": "", "author": "", "change_reason": reason, "specifications": []}
             else:
-                current_revision = {"date": current_revision.get("date", ""), "author": current_revision.get("author", ""), "change_reason": reason, "specifications": []}
+                current_revision = {
+                    "date": current_revision.get("date", ""),
+                    "author": current_revision.get("author", ""),
+                    "change_reason": reason,
+                    "specifications": []
+                }
             i += 1
             continue
 
+        # Check for min/max header row
         col1 = _xlrd_cell_to_str(xls_sheet.cell(i, 1), book).lower() if xls_sheet.ncols > 1 else ""
         if col1 == "min":
             i += 1
             continue
 
+        # Spec rows (e.g. "Schüttdichte [g/L]", "> 630 µm [%]", etc.)
         if col0 and ("µm" in col0 or "schüttdichte" in col0 or "dichte" in col0):
             name = _xlrd_cell_to_str(xls_sheet.cell(i, 0), book)
             min_val = _xlrd_cell_to_str(xls_sheet.cell(i, 1), book) if xls_sheet.ncols > 1 else ""
@@ -2912,6 +3489,7 @@ def _parse_sollwerte(xls_sheet, book):
     if current_revision:
         result["revisions"].append(current_revision)
 
+    # Active specs = first revision block that has specs with actual min/max values
     result["active_specifications"] = []
     for rev in result["revisions"]:
         specs = [s for s in rev.get("specifications", []) if s.get("min") or s.get("max")]
@@ -2923,49 +3501,153 @@ def _parse_sollwerte(xls_sheet, book):
 
 
 def _parse_data_sheet(xls_sheet, book):
-    """Parse the reference/data sheet into structured measurement records."""
+    """Parse the reference/data sheet (e.g. '049 91') into structured measurement records."""
     import xlrd
-    result = {"type": "", "reference": "", "method": "", "headers": [], "measurements": []}
+    result = {
+        "type": "",
+        "reference": "",
+        "method": "",
+        "headers": [],
+        "measurements": []
+    }
 
     if xls_sheet.nrows < 7:
         return result
 
+    # Row 0: VM/HM, reference, method
     result["type"] = _xlrd_cell_to_str(xls_sheet.cell(0, 0), book)
     result["reference"] = _xlrd_cell_to_str(xls_sheet.cell(0, 1), book)
     if xls_sheet.ncols > 4:
         result["method"] = _xlrd_cell_to_str(xls_sheet.cell(0, 4), book)
 
+    # Data rows start at row 7 (index 7) based on structure:
+    # Row 3: top headers (Datum, Charge, Prüfer, Schüttdichte, Siebe)
+    # Row 4: sub-headers (FREI, sieve labels)
+    # Row 5: IST/SOLL labels
+    # Row 6: min/max labels
+    # Row 7+: data
     for row_idx in range(7, xls_sheet.nrows):
         row_num = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 0), book)
         if not row_num:
             continue
 
+        datum = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 1), book)
+        charge = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 2), book)
+        pruefer = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 3), book)
+
         record = {
-            "nr":           row_num,
-            "datum":        _xlrd_cell_to_str(xls_sheet.cell(row_idx, 1), book),
-            "charge":       _xlrd_cell_to_str(xls_sheet.cell(row_idx, 2), book),
-            "pruefer":      _xlrd_cell_to_str(xls_sheet.cell(row_idx, 3), book),
+            "nr": row_num,
+            "datum": datum,
+            "charge": charge,
+            "pruefer": pruefer,
             "schuettdichte": _xlrd_cell_to_str(xls_sheet.cell(row_idx, 4), book),
         }
+
+        # Sieve IST values only (SOLL is already in Sollwerte)
         if xls_sheet.ncols > 10:
-            record["sieve_630"]  = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 10), book)
+            record["sieve_630"] = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 10), book)
         if xls_sheet.ncols > 13:
-            record["sieve_355"]  = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 13), book)
+            record["sieve_355"] = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 13), book)
         if xls_sheet.ncols > 16:
-            record["sieve_90"]   = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 16), book)
+            record["sieve_90"] = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 16), book)
         if xls_sheet.ncols > 19:
             record["sieve_lt90"] = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 19), book)
 
-        result["measurements"].append({k: v for k, v in record.items() if v})
+        # Remove empty values to save space
+        record = {k: v for k, v in record.items() if v}
+
+        result["measurements"].append(record)
 
     return result
 
 
+def _parse_measurement_date(raw_value):
+    """Parse a measurement date string into a datetime for sorting/grouping."""
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+
+    for fmt in (
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d/%m/%Y",
+        "%d.%m.%Y",
+        "%d-%m-%Y",
+        "%m/%d/%Y",
+        "%d/%m/%y",
+        "%d.%m.%y",
+        "%d-%m-%y",
+    ):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+
+    match = re.search(r"(19|20)\d{2}", text)
+    if match:
+        try:
+            return datetime(int(match.group(0)), 1, 1)
+        except ValueError:
+            return None
+
+    return None
+
+
+def _sort_measurements_by_date(measurements):
+    """Sort measurements by parsed date, then row number."""
+    def sort_key(measurement):
+        parsed = _parse_measurement_date(measurement.get("datum", ""))
+        nr_text = str(measurement.get("nr", "")).strip()
+        try:
+            nr_value = int(nr_text)
+        except (TypeError, ValueError):
+            nr_value = float("inf")
+        return (
+            parsed is None,
+            parsed or datetime.max,
+            nr_value,
+            nr_text,
+        )
+
+    return sorted(measurements, key=sort_key)
+
+
+def _group_measurements_by_year(measurements):
+    """Group measurements by the year extracted from datum."""
+    grouped = {}
+    for measurement in _sort_measurements_by_date(measurements):
+        parsed = _parse_measurement_date(measurement.get("datum", ""))
+        if parsed:
+            year_key = str(parsed.year)
+        elif measurement.get("datum"):
+            year_key = "unknown"
+        else:
+            continue
+        grouped.setdefault(year_key, []).append(measurement)
+    return grouped
+
+
+def _summarize_measurements_by_year(grouped_measurements):
+    """Return a light summary for each year bucket."""
+    summary = {}
+    for year, rows in grouped_measurements.items():
+        if not rows:
+            continue
+        dates = [row.get("datum", "") for row in rows if row.get("datum")]
+        summary[year] = {
+            "count": len(rows),
+            "first_date": dates[0] if dates else "",
+            "last_date": dates[-1] if dates else "",
+        }
+    return summary
+
+
 def _compute_measurement_stats(measurements, active_specs=None):
-    """Compute summary statistics for measurement data."""
+    """Compute summary statistics for measurement data to avoid sending all rows."""
     if not measurements:
         return {"count": 0}
 
+    # Numeric fields to aggregate
     fields = ["schuettdichte", "sieve_630", "sieve_355", "sieve_90", "sieve_lt90"]
     stats = {"count": len(measurements)}
 
@@ -2982,17 +3664,29 @@ def _compute_measurement_stats(measurements, active_specs=None):
             avg = sum(values) / len(values)
             stats[field] = {
                 "count": len(values),
-                "min":   round(min(values), 2),
-                "max":   round(max(values), 2),
-                "mean":  round(avg, 2),
-                "std":   round((sum((x - avg) ** 2 for x in values) / len(values)) ** 0.5, 2)
+                "min": round(min(values), 2),
+                "max": round(max(values), 2),
+                "mean": round(avg, 2),
+                "std": round((sum((x - avg) ** 2 for x in values) / len(values)) ** 0.5, 2)
             }
+            # Count out-of-spec if specs are available
             if active_specs:
-                spec_map = {"schuettdichte": "schüttdichte", "sieve_630": "630", "sieve_355": "355", "sieve_90": "> 90", "sieve_lt90": "< 90"}
+                spec = None
+                spec_map = {
+                    "schuettdichte": "schüttdichte",
+                    "sieve_630": "630",
+                    "sieve_355": "355",
+                    "sieve_90": "> 90",
+                    "sieve_lt90": "< 90"
+                }
                 search_key = spec_map.get(field, "")
-                spec = next((s for s in active_specs if search_key in s.get("parameter", "").lower()), None)
+                for s in active_specs:
+                    if search_key in s.get("parameter", "").lower():
+                        spec = s
+                        break
                 if spec:
-                    spec_min = spec_max = None
+                    spec_min = None
+                    spec_max = None
                     try:
                         if spec.get("min"):
                             spec_min = float(str(spec["min"]).replace(",", "."))
@@ -3003,27 +3697,43 @@ def _compute_measurement_stats(measurements, active_specs=None):
                             spec_max = float(str(spec["max"]).replace(",", "."))
                     except (ValueError, TypeError):
                         pass
-                    oos = sum(1 for v in values if (spec_min is not None and v < spec_min) or (spec_max is not None and v > spec_max))
+                    oos = 0
+                    for v in values:
+                        if (spec_min is not None and v < spec_min) or (spec_max is not None and v > spec_max):
+                            oos += 1
                     stats[field]["out_of_spec"] = oos
 
-    dates = [m.get("datum", "") for m in measurements if m.get("datum")]
-    if dates:
-        stats["date_range"] = {"first": dates[0], "last": dates[-1]}
+    # Date range
+    dated_measurements = [m for m in _sort_measurements_by_date(measurements) if m.get("datum")]
+    if dated_measurements:
+        stats["date_range"] = {
+            "first": dated_measurements[0]["datum"],
+            "last": dated_measurements[-1]["datum"],
+        }
 
     return stats
 
 
 def _find_non_conformities(measurements, active_specs):
-    """Find measurements whose values exceed min/max from Sollwerte."""
+    """Find charges (lots) whose measurement values exceed min/max from Sollwerte.
+    A charge may appear multiple times if it was re-tested after a non-conformity."""
     if not measurements or not active_specs:
         return []
 
-    spec_map = {"schuettdichte": "schüttdichte", "sieve_630": "630", "sieve_355": "355", "sieve_90": "> 90", "sieve_lt90": "< 90"}
+    # Build spec lookup: field_name -> (min, max)
+    spec_map = {
+        "schuettdichte": "schüttdichte",
+        "sieve_630": "630",
+        "sieve_355": "355",
+        "sieve_90": "> 90",
+        "sieve_lt90": "< 90"
+    }
     spec_limits = {}
     for field, search_key in spec_map.items():
         for s in active_specs:
             if search_key in s.get("parameter", "").lower():
-                spec_min = spec_max = None
+                spec_min = None
+                spec_max = None
                 try:
                     if s.get("min"):
                         spec_min = float(str(s["min"]).replace(",", "."))
@@ -3053,9 +3763,19 @@ def _find_non_conformities(measurements, active_specs):
             except (ValueError, TypeError):
                 continue
             if (s_min is not None and val < s_min) or (s_max is not None and val > s_max):
-                failures.append({"parameter": param_name, "value": val, "min": s_min, "max": s_max})
+                failures.append({
+                    "parameter": param_name,
+                    "value": val,
+                    "min": s_min,
+                    "max": s_max
+                })
         if failures:
-            non_conf.append({"charge": charge, "nr": m.get("nr", ""), "datum": m.get("datum", ""), "failures": failures})
+            non_conf.append({
+                "charge": charge,
+                "nr": m.get("nr", ""),
+                "datum": m.get("datum", ""),
+                "failures": failures
+            })
 
     return non_conf
 
@@ -3065,7 +3785,9 @@ def convert_xls_to_json():
     """
     Accepts an .xls file via JSON (OpenAI GPT integration), parses and extracts content.
 
-    For VM/HM files: parses the 'Sollwerte' sheet and the reference data sheet.
+    For VM/HM files (filename starts with VM or HM): parses the 'Sollwerte' sheet
+    (specifications) and the reference data sheet (next to Sollwerte) into structured JSON.
+
     For other files: extracts all cells as raw data.
 
     JSON body:
@@ -3093,6 +3815,7 @@ def convert_xls_to_json():
     if not original_name.lower().endswith(".xls"):
         return jsonify({"success": False, "error": "Only .xls files are accepted."}), 400
 
+    # Download the file
     xls_bytes = None
     if download_link:
         try:
@@ -3117,13 +3840,16 @@ def convert_xls_to_json():
         xls_book = xlrd.open_workbook(file_contents=xls_bytes, formatting_info=False)
         all_sheets = xls_book.sheet_names()
 
+        # --- Detect VM/HM files ---
         is_vm_hm = original_name.upper().startswith("VM") or original_name.upper().startswith("HM")
         has_sollwerte = "Sollwerte" in all_sheets
 
         if is_vm_hm and has_sollwerte:
+            # Structured parsing for VM/HM files
             sollwerte_sheet = xls_book.sheet_by_name("Sollwerte")
             sollwerte_data = _parse_sollwerte(sollwerte_sheet, xls_book)
 
+            # The data sheet is the one right after Sollwerte
             sollwerte_idx = all_sheets.index("Sollwerte")
             data_sheet_name = all_sheets[sollwerte_idx + 1] if sollwerte_idx + 1 < len(all_sheets) else None
 
@@ -3132,39 +3858,58 @@ def convert_xls_to_json():
                 data_sheet = xls_book.sheet_by_name(data_sheet_name)
                 data_sheet_result = _parse_data_sheet(data_sheet, xls_book)
 
+
+
+            # Build data_sheet response based on mode
             ds_response = None
             non_conformities = []
             if data_sheet_name and data_sheet_result:
-                all_measurements = data_sheet_result["measurements"]
+                all_measurements = _sort_measurements_by_date(data_sheet_result["measurements"])
                 active_specs = sollwerte_data.get("active_specifications", [])
+                measurements_by_year = _group_measurements_by_year(all_measurements)
+                measurements_by_year_summary = _summarize_measurements_by_year(measurements_by_year)
+
+                # Find charges with values outside spec
                 non_conformities = _find_non_conformities(all_measurements, active_specs)
+
                 ds_response = {
-                    "sheet_name":         data_sheet_name,
-                    "type":               data_sheet_result["type"],
-                    "reference":          data_sheet_result["reference"],
-                    "method":             data_sheet_result["method"],
+                    "sheet_name": data_sheet_name,
+                    "type": data_sheet_result["type"],
+                    "reference": data_sheet_result["reference"],
+                    "method": data_sheet_result["method"],
                     "total_measurements": len(all_measurements),
+                    "measurements_by_year_summary": measurements_by_year_summary,
                 }
                 if mode == "full":
                     ds_response["measurements"] = all_measurements
+                    ds_response["measurements_by_year"] = measurements_by_year
                 else:
-                    ds_response["statistics"]        = _compute_measurement_stats(all_measurements, active_specs)
+                    # Summary mode: stats + last N rows
+                    ds_response["statistics"] = _compute_measurement_stats(all_measurements, active_specs)
                     ds_response["last_measurements"] = all_measurements[-max_rows:]
+                    ds_response["measurements_by_year"] = {
+                        year: rows[-max_rows:]
+                        for year, rows in measurements_by_year.items()
+                    }
 
             return jsonify({
-                "success":          True,
-                "file_type":        "VM/HM",
-                "source_file":      original_name,
+                "success": True,
+                "file_type": "VM/HM",
+                "source_file": original_name,
                 "available_sheets": all_sheets,
-                "mode":             mode,
-                "sollwerte":        sollwerte_data,
+                "mode": mode,
+                "sollwerte": sollwerte_data,
                 "non_conformities": non_conformities,
-                "data_sheet":       ds_response
+                "data_sheet": ds_response
             }), 200
 
+        # --- Generic parsing for non-VM/HM files ---
         if sheet_name:
             if sheet_name not in all_sheets:
-                return jsonify({"success": False, "error": f"Sheet '{sheet_name}' not found. Available sheets: {all_sheets}"}), 400
+                return jsonify({
+                    "success": False,
+                    "error": f"Sheet '{sheet_name}' not found. Available sheets: {all_sheets}"
+                }), 400
             xls_sheet = xls_book.sheet_by_name(sheet_name)
         else:
             xls_sheet = xls_book.sheet_by_index(0)
@@ -3173,12 +3918,12 @@ def convert_xls_to_json():
         cells, all_text_parts, rows_compact = _extract_sheet_raw(xls_sheet, xls_book)
 
         return jsonify({
-            "success":          True,
-            "file_type":        "generic",
-            "source_file":      original_name,
-            "sheet":            sheet_name,
+            "success": True,
+            "file_type": "generic",
+            "source_file": original_name,
+            "sheet": sheet_name,
             "available_sheets": all_sheets,
-            "rows":             rows_compact
+            "rows": rows_compact
         }), 200
 
     except xlrd.biffh.XLRDError as e:
