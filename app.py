@@ -177,6 +177,55 @@ def infer_filename_from_url(raw_url: str) -> str:
         return "image_from_url"
 
 
+def _normalize_openai_file_ref(file_ref: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(file_ref, dict):
+        return file_ref
+    if isinstance(file_ref, str):
+        file_id = file_ref.strip()
+        if not file_id:
+            return None
+        return {
+            "id": file_id,
+            "name": "uploaded_file",
+            "download_link": None,
+            "mime_type": None,
+        }
+    return None
+
+
+def _build_upload_debug_payload(data: Dict[str, Any], refs: List[Any]) -> Dict[str, Any]:
+    sample_items = []
+    for item in refs[:2]:
+        if isinstance(item, dict):
+            sample_items.append(
+                {
+                    "type": "dict",
+                    "has_id": bool(item.get("id")),
+                    "has_name": bool(item.get("name")),
+                    "has_mime_type": bool(item.get("mime_type")),
+                    "has_download_link": bool(item.get("download_link")),
+                }
+            )
+        else:
+            sample_items.append(
+                {
+                    "type": type(item).__name__,
+                    "preview": str(item)[:80] if item is not None else None,
+                }
+            )
+    return {
+        "received_keys": sorted(list(data.keys())),
+        "openaiFileIdRefs_present": "openaiFileIdRefs" in data,
+        "openaiFileIdRefs_count": len(refs),
+        "openaiFileIdRefs_item_types": [type(item).__name__ for item in refs[:5]],
+        "has_file_id": bool(str(data.get("file_id") or data.get("openai_file_id") or "").strip()),
+        "has_download_link": bool(str(data.get("download_link") or "").strip()),
+        "has_url": bool(str(data.get("url") or "").strip()),
+        "has_image_url": bool(str(data.get("image_url") or "").strip()),
+        "sample_items": sample_items,
+    }
+
+
 def cleanup_old_files(interval: int = 1800, max_age_seconds: int = 2 * 3600):
     while True:
         now = time.time()
@@ -598,13 +647,28 @@ def upload_and_search():
     data = request.get_json(silent=True) or {}
     refs = list(data.get("openaiFileIdRefs") or [])
     top_k = int(data.get("top_k", 5))
+    debug_payload = _build_upload_debug_payload(data, refs)
     logging.info(
         "upload_and_search request keys=%s refs_count=%s top_k=%s",
         sorted(list(data.keys())),
         len(refs),
         top_k,
     )
-    # Documented fallback: direct image URL when no attachment refs (OpenAPI note).
+    # Fallbacks when openaiFileIdRefs is absent or empty.
+    # 1) direct file_id / openai_file_id field (mirrors OCR API ergonomics)
+    if not refs:
+        fid_top = data.get("file_id") or data.get("openai_file_id")
+        if fid_top:
+            refs = [{"id": str(fid_top).strip(), "name": data.get("filename") or "uploaded_file"}]
+    # 2) direct download_link
+    if not refs and data.get("download_link"):
+        refs = [{
+            "id": None,
+            "name": data.get("filename") or infer_filename_from_url(str(data.get("download_link"))),
+            "download_link": str(data.get("download_link")),
+            "mime_type": data.get("mime_type"),
+        }]
+    # 3) direct image URL when no attachment refs (OpenAPI note).
     if not refs:
         root_url = data.get("url") or data.get("image_url")
         if isinstance(root_url, str) and root_url.strip():
@@ -620,7 +684,8 @@ def upload_and_search():
         return jsonify(
             {
                 "success": False,
-                "error": "missing_openaiFileIdRefs — pass attachment refs, or a top-level url / image_url (HTTPS or HTTP).",
+                "error": "missing_openaiFileIdRefs - pass attachment refs, or file_id/openai_file_id, or a top-level url / image_url (HTTPS or HTTP).",
+                "debug": debug_payload,
             }
         ), 400
     if top_k < 1 or top_k > 50:
@@ -629,11 +694,12 @@ def upload_and_search():
     errors = []
     unexpected_error = False
     base = _request_external_base_url()
-    for file_ref in refs:
+    for raw_file_ref in refs:
         original_name = "uploaded_file"
         try:
-            if not isinstance(file_ref, dict):
-                errors.append("Each item must be an object.")
+            file_ref = _normalize_openai_file_ref(raw_file_ref)
+            if file_ref is None:
+                errors.append(f"Unsupported openaiFileIdRefs item type: {type(raw_file_ref).__name__}.")
                 continue
             _fid = file_ref.get("id")
             file_id = str(_fid).strip() if _fid is not None and str(_fid).strip() else None
@@ -744,7 +810,14 @@ def upload_and_search():
             errors.append(f"{original_name}: {str(e)}")
     if not final_results and errors:
         status_code = 500 if unexpected_error else 400
-        return jsonify({"success": False, "message": "All operations failed", "errors": errors}), status_code
+        return jsonify(
+            {
+                "success": False,
+                "message": "All operations failed",
+                "errors": errors,
+                "debug": debug_payload,
+            }
+        ), status_code
     return jsonify(
         {
             "success": True,
