@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from threading import Thread
 from typing import Optional, List, Dict, Any
+from urllib.parse import urlparse, unquote
 import re
 import logging
 from dotenv import load_dotenv
@@ -139,7 +140,7 @@ def compute_embedding_from_pil(image: Image.Image) -> np.ndarray:
     return embedding.astype("float32")
 
 
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp"}
 
 
 def allowed_file(filename: str) -> bool:
@@ -152,6 +153,8 @@ def guess_extension_from_mime(mime_type: Optional[str]) -> Optional[str]:
     mt = mime_type.lower()
     if "png" in mt:
         return ".png"
+    if "webp" in mt:
+        return ".webp"
     if "jpeg" in mt or "jpg" in mt:
         return ".jpg"
     return None
@@ -160,9 +163,18 @@ def guess_extension_from_mime(mime_type: Optional[str]) -> Optional[str]:
 def is_supported_image_ref(filename: Optional[str], mime_type: Optional[str]) -> bool:
     mt = (mime_type or "").strip().lower()
     if mt:
-        return mt in {"image/png", "image/jpeg", "image/jpg"}
+        return mt in {"image/png", "image/jpeg", "image/jpg", "image/webp"}
     suffix = Path(filename or "").suffix.lower()
-    return suffix in {".png", ".jpg", ".jpeg"}
+    return suffix in {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def infer_filename_from_url(raw_url: str) -> str:
+    try:
+        parsed = urlparse(raw_url)
+        candidate = Path(unquote(parsed.path)).name
+        return candidate or "image_from_url"
+    except Exception:
+        return "image_from_url"
 
 
 def cleanup_old_files(interval: int = 1800, max_age_seconds: int = 2 * 3600):
@@ -581,6 +593,12 @@ def upload_and_search():
     data = request.get_json(silent=True) or {}
     refs = list(data.get("openaiFileIdRefs") or [])
     top_k = int(data.get("top_k", 5))
+    logging.info(
+        "upload_and_search request keys=%s refs_count=%s top_k=%s",
+        sorted(list(data.keys())),
+        len(refs),
+        top_k,
+    )
     # Documented fallback: direct image URL when no attachment refs (OpenAPI note).
     if not refs:
         root_url = data.get("url") or data.get("image_url")
@@ -588,7 +606,7 @@ def upload_and_search():
             refs = [
                 {
                     "id": None,
-                    "name": "image_from_url",
+                    "name": infer_filename_from_url(root_url.strip()),
                     "download_link": root_url.strip(),
                     "mime_type": None,
                 }
@@ -629,9 +647,9 @@ def upload_and_search():
             if mime_type and "application/pdf" in mime_type.lower():
                 errors.append(f"{original_name}: PDF files are not supported for this endpoint. Please upload an image.")
                 continue
-            if not is_supported_image_ref(original_name, mime_type):
+            if not is_supported_image_ref(original_name, mime_type) and not download_link:
                 errors.append(
-                    f"{original_name}: uploadAndSearch only accepts PNG/JPG images. "
+                    f"{original_name}: uploadAndSearch only accepts PNG/JPG/WEBP images. "
                     "Do not send KB, markdown, PDF, or text files in openaiFileIdRefs."
                 )
                 continue
