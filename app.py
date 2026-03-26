@@ -647,143 +647,88 @@ def upload_and_search():
     data = request.get_json(silent=True) or {}
     refs = list(data.get("openaiFileIdRefs") or [])
     top_k = int(data.get("top_k", 5))
-    debug_payload = _build_upload_debug_payload(data, refs)
-    logging.info(
-        "upload_and_search request keys=%s refs_count=%s top_k=%s",
-        sorted(list(data.keys())),
-        len(refs),
-        top_k,
-    )
-    # Fallbacks when openaiFileIdRefs is absent or empty.
-    # 1) direct file_id / openai_file_id field (mirrors OCR API ergonomics)
+
+    # 🔁 Fallbacks compatibles GPT
     if not refs:
         fid_top = data.get("file_id") or data.get("openai_file_id")
         if fid_top:
-            refs = [{"id": str(fid_top).strip(), "name": data.get("filename") or "uploaded_file"}]
-    # 2) direct download_link
+            refs = [{"id": str(fid_top).strip()}]
+
     if not refs and data.get("download_link"):
         refs = [{
             "id": None,
-            "name": data.get("filename") or infer_filename_from_url(str(data.get("download_link"))),
-            "download_link": str(data.get("download_link")),
-            "mime_type": data.get("mime_type"),
+            "download_link": str(data.get("download_link"))
         }]
-    # 3) direct image URL when no attachment refs (OpenAPI note).
+
     if not refs:
         root_url = data.get("url") or data.get("image_url")
         if isinstance(root_url, str) and root_url.strip():
-            refs = [
-                {
-                    "id": None,
-                    "name": infer_filename_from_url(root_url.strip()),
-                    "download_link": root_url.strip(),
-                    "mime_type": None,
-                }
-            ]
+            refs = [{
+                "id": None,
+                "download_link": root_url.strip()
+            }]
+
     if not refs:
-        return jsonify(
-            {
-                "success": False,
-                "error": "missing_openaiFileIdRefs - pass attachment refs, or file_id/openai_file_id, or a top-level url / image_url (HTTPS or HTTP).",
-                "debug": debug_payload,
-            }
-        ), 400
+        return jsonify({
+            "success": False,
+            "error": "No image provided"
+        }), 400
+
     if top_k < 1 or top_k > 50:
         return jsonify({"success": False, "error": "invalid_top_k"}), 400
+
     final_results = []
     errors = []
-    unexpected_error = False
-    base = _request_external_base_url()
+
     for raw_file_ref in refs:
-        original_name = "uploaded_file"
         try:
             file_ref = _normalize_openai_file_ref(raw_file_ref)
-            if file_ref is None:
-                errors.append(f"Unsupported openaiFileIdRefs item type: {type(raw_file_ref).__name__}.")
-                continue
-            _fid = file_ref.get("id")
-            file_id = str(_fid).strip() if _fid is not None and str(_fid).strip() else None
-            download_link = file_ref.get("download_link")
-            original_name = file_ref.get("name") or "uploaded_file"
-            mime_type = file_ref.get("mime_type")
-            logging.info(
-                "upload_and_search ref name=%s mime_type=%s has_id=%s has_download_link=%s",
-                original_name,
-                mime_type,
-                bool(file_id),
-                bool(download_link),
-            )
-            
-            # Validation du type MIME pour s'assurer que c'est une image
-            if mime_type and "application/pdf" in mime_type.lower():
-                errors.append(f"{original_name}: PDF files are not supported for this endpoint. Please upload an image.")
-                continue
-            if not is_supported_image_ref(original_name, mime_type) and not download_link:
-                errors.append(
-                    f"{original_name}: uploadAndSearch only accepts PNG/JPG/WEBP images. "
-                    "Do not send KB, markdown, PDF, or text files in openaiFileIdRefs."
-                )
+            if not file_ref:
+                errors.append("Invalid file reference")
                 continue
 
-            dl = (download_link or "").strip()
-            if not file_id and not dl:
-                errors.append(
-                    f"{original_name}: provide download_link and/or id (OpenAI file id) to fetch the image."
-                )
-                continue
+            file_id = file_ref.get("id")
+            download_link = file_ref.get("download_link")
+
             file_bytes = None
-            download_error = None
-            if dl and dl.lower().startswith(("http://", "https://")):
+
+            # 🔽 1. Download via URL
+            if download_link and download_link.startswith(("http://", "https://")):
                 try:
-                    r = requests.get(dl, timeout=30, allow_redirects=True)
+                    r = requests.get(download_link, timeout=20)
                     r.raise_for_status()
-                    ct = (r.headers.get("Content-Type") or "").lower()
-                    if "image/" not in ct and ct and "octet-stream" not in ct:
-                        errors.append(
-                            f"{original_name}: download_link returned Content-Type '{ct}', not an image."
-                        )
-                        continue
                     file_bytes = r.content
                 except Exception as e:
-                    download_error = str(e)
-                    logging.warning("upload_and_search download_link failed for %s: %s", original_name, download_error)
+                    errors.append(f"Download failed: {e}")
+                    continue
+
+            # 🔽 2. Download via OpenAI file ID
             if file_bytes is None and file_id:
                 if not client:
-                    errors.append(f"{original_name}: OpenAI API key not configured (needed for id={file_id!r}).")
+                    errors.append("OpenAI client not configured")
                     continue
                 try:
                     file_bytes = client.files.content(file_id).read()
                 except Exception as e:
-                    errors.append(f"{original_name}: OpenAI file download failed: {e}")
+                    errors.append(f"OpenAI download failed: {e}")
                     continue
+
             if file_bytes is None:
-                if download_error:
-                    errors.append(f"{original_name}: download_link failed: {download_error}")
-                else:
-                    errors.append(
-                        f"{original_name}: Could not retrieve image bytes (check download_link or OpenAI file id)."
-                    )
+                errors.append("Could not retrieve file")
                 continue
+
+            # 🧠 Validation réelle via PIL (plus robuste que MIME)
             try:
                 img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
             except Exception as e:
-                errors.append(f"{original_name}: not a valid image file ({e}).")
+                errors.append(f"Invalid image: {e}")
                 continue
-            filename_safe = secure_filename(original_name or "uploaded_file") or "uploaded_file"
-            if "." not in filename_safe:
-                ext = guess_extension_from_mime(mime_type) or ".png"
-                filename_safe += ext
-            if not allowed_file(filename_safe):
-                ext2 = Path(filename_safe).suffix.lower().lstrip(".")
-                if ext2 not in ALLOWED_EXTENSIONS:
-                    filename_safe = f"{Path(filename_safe).stem}.png"
-            unique_filename = f"{uuid.uuid4().hex}_{int(time.time())}_{filename_safe}"
-            file_path = TEMP_UPLOAD_DIR / unique_filename
-            with open(file_path, "wb") as f:
-                f.write(file_bytes)
-            file_url = f"{base}/temp_files/{unique_filename}"
+
+            # ⚡ Embedding direct (no disk write)
             query_embedding = compute_embedding_from_pil(img)
+
             rows = search_similar_in_db(query_embedding, top_k=top_k)
+
             search_results = [
                 {
                     "id": r["id"],
@@ -791,42 +736,29 @@ def upload_and_search():
                     "matiere_id": r["matiere_id"],
                     "material_name": r["nom_matiere"],
                     "reference": r["reference"],
-                    "similarity": float(r["similarity"]) if r["similarity"] is not None else None,
+                    "similarity": float(r["similarity"]) if r["similarity"] else None,
                 }
                 for r in rows
             ]
-            final_results.append(
-                {
-                    "original_name": original_name,
-                    "filename": unique_filename,
-                    "url": file_url,
-                    "expires_in": "2 hours",
-                    "search_results": search_results,
-                }
-            )
-        except Exception as e:
-            logging.exception("upload_and_search failed for %s", original_name)
-            unexpected_error = True
-            errors.append(f"{original_name}: {str(e)}")
-    if not final_results and errors:
-        status_code = 500 if unexpected_error else 400
-        return jsonify(
-            {
-                "success": False,
-                "message": "All operations failed",
-                "errors": errors,
-                "debug": debug_payload,
-            }
-        ), status_code
-    return jsonify(
-        {
-            "success": True,
-            "message": f"Processed {len(final_results)} files.",
-            "results": final_results,
-            "errors": errors,
-        }
-    ), 200
 
+            final_results.append({
+                "search_results": search_results
+            })
+
+        except Exception as e:
+            errors.append(str(e))
+
+    if not final_results:
+        return jsonify({
+            "success": False,
+            "errors": errors
+        }), 400
+
+    return jsonify({
+        "success": True,
+        "results": final_results,
+        "errors": errors
+    }), 200
 
 # =============================================================================
 # MATERIAL DETAILS
