@@ -758,10 +758,6 @@ def upload_and_search():
         return jsonify({"success": False, "error": "JSON required"}), 400
 
     data = request.get_json(silent=True) or {}
-    if "openaiFileIdRefs" not in data:
-        return jsonify({"success": False, "error": "Missing openaiFileIdRefs"}), 400
-    if not isinstance(data.get("openaiFileIdRefs"), list) or len(data.get("openaiFileIdRefs")) != 1:
-        return jsonify({"success": False, "error": "Invalid openaiFileIdRefs"}), 400
     source, err = _resolve_image_source_from_payload(data)
     if err:
         return jsonify(err[0]), err[1]
