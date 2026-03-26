@@ -224,14 +224,19 @@ def get_db_conn():
     return conn
 
 
+def _embedding_to_pgvector_text(query_embedding: np.ndarray) -> str:
+    values = np.asarray(query_embedding, dtype=np.float32).ravel()
+    return "[" + ",".join(f"{float(value):.8f}" for value in values) + "]"
+
+
 def search_similar_in_db(query_embedding: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
-    query_vec = query_embedding.tolist()
+    query_vec = _embedding_to_pgvector_text(query_embedding)
     sql = """
         SELECT mi.id, mi.image_path, mi.matiere_id, m.nom_matiere, m.reference,
-               (1 - (mi.embedding <=> %s)) AS similarity
+               (1 - (mi.embedding <=> %s::vector)) AS similarity
         FROM public.matiere_images mi
         JOIN public.matieres m ON m.matiere_id = mi.matiere_id
-        ORDER BY mi.embedding <=> %s
+        ORDER BY mi.embedding <=> %s::vector
         LIMIT %s;
     """
     conn = get_db_conn()
@@ -2562,13 +2567,13 @@ RÈGLES: Aucune hallucination. Langue: Français. Style professionnel.
 # =============================================================================
 
 def search_similar_nuances_in_db(query_embedding: np.ndarray, top_k: int = 5):
-    query_vec = query_embedding.tolist()
+    query_vec = _embedding_to_pgvector_text(query_embedding)
     sql = """
         SELECT ni.id, ni.image_path, ni.nuance_id, n.name AS nuance_name, n.reference,
-               (1 - (ni.embedding <=> %s)) AS similarity
+               (1 - (ni.embedding <=> %s::vector)) AS similarity
         FROM public.nuance_images ni
         JOIN public.nuances n ON n.id = ni.nuance_id
-        ORDER BY ni.embedding <=> %s LIMIT %s;
+        ORDER BY ni.embedding <=> %s::vector LIMIT %s;
     """
     conn = get_db_conn()
     try:
