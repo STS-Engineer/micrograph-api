@@ -925,8 +925,7 @@ def generate_fiche_adn_docx():
         title = doc.add_heading(f"MATERIAL DNA SHEET - {material_name}", level=1)
         title.alignment = WD_ALIGN_PARAGRAPH.CENTER
         info_paragraph = doc.add_paragraph()
-        info_run = info_paragraph.add_run(f"Reference: {reference}\n")
-        info_run.bold = True
+        info_run = info_paragraph.add_run(f"Reference: {reference}\n").bold = True
         info_paragraph.add_run(f"Type: {type_matiere}\n")
         info_paragraph.add_run(f"Generated on: {result_dict.get('date_creation', 'N/A')}")
         doc.add_paragraph()
@@ -1525,7 +1524,7 @@ def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name,
     revision_history = bm_row["document_revision_history"] if bm_row and bm_row["document_revision_history"] else None
     cur.execute("""
         SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit, c.metadata,
-               c.matiere_id, c.sub_black_mix_id,
+               c.matiere_id, c.sub_black_mix_id, c.sub_nuance_id,
                m.reference AS matiere_reference, m.nom_matiere AS matiere_name,
                bm.reference AS sub_bm_reference, bm.name AS sub_bm_name
         FROM public.black_mix_components c
@@ -1546,10 +1545,12 @@ def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name,
     process_steps = []
     for s in steps_raw:
         cur.execute("""
-            SELECT sm.matiere_id, sm.sub_black_mix_id, m.reference AS matiere_ref, bm.reference AS sub_bm_ref
+            SELECT sm.matiere_id, sm.sub_black_mix_id, sm.sub_nuance_id,
+                   m.reference AS matiere_ref, bm.reference AS sub_bm_ref, sn.reference AS sub_nuance_ref
             FROM public.black_mix_step_materials sm
-            LEFT JOIN public.matieres m ON m.matiere_id = sm.matiere_id
-            LEFT JOIN public.black_mixes bm ON bm.id = sm.sub_black_mix_id
+            LEFT JOIN public.matieres    m  ON m.matiere_id = sm.matiere_id
+            LEFT JOIN public.black_mixes bm ON bm.id        = sm.sub_black_mix_id
+            LEFT JOIN public.nuances     sn ON sn.id        = sm.sub_nuance_id
             WHERE sm.process_step_id = %s
         """, (s["id"],))
         step_mat_refs = [sm["sub_bm_ref"] if sm["sub_black_mix_id"] is not None else sm["matiere_ref"] for sm in cur.fetchall() if (sm["sub_bm_ref"] if sm["sub_black_mix_id"] is not None else sm["matiere_ref"])]
@@ -1693,9 +1694,10 @@ def get_black_mix_details(mix_id):
                 return jsonify({"success": False, "error": "Black Mix not found"}), 404
             result = {"id": row[0], "product_reference": row[1], "mix_name": row[2], "status": row[3], "created_at": row[4].isoformat() if row[4] else None, "document_revision_history": row[5]}
             cur.execute("""
-                SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit, c.matiere_id, c.sub_black_mix_id, c.metadata,
-                       m.reference AS matiere_ref, m.nom_matiere AS matiere_name,
-                       bm.reference AS sub_bm_ref, bm.name AS sub_bm_name
+                SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit, c.metadata,
+                       c.matiere_id, c.sub_black_mix_id, c.sub_nuance_id,
+                       m.reference AS matiere_reference, m.nom_matiere AS matiere_name,
+                       bm.reference AS sub_bm_reference, bm.name AS sub_bm_name
                 FROM public.black_mix_components c
                 LEFT JOIN public.matieres m ON m.matiere_id = c.matiere_id
                 LEFT JOIN public.black_mixes bm ON bm.id = c.sub_black_mix_id
@@ -1846,7 +1848,7 @@ def update_black_mix(mix_id):
                                 continue
                             resolved = ref_lookup.get(ref)
                             if not resolved:
-                                raise ValueError(f"Reference '{ref}' in step_materials not resolved")
+                                raise ValueError(f"Reference '{ref}' in step_materials not found")
                             dedup_key = (resolved["type"], resolved["id"])
                             if dedup_key in seen_ids:
                                 continue
@@ -2460,7 +2462,7 @@ def submit_nuance():
                         resolved = ref_lookup.get(ref)
 
                         if not resolved:
-                            raise ValueError(f"Reference '{ref}' not resolved")
+                            raise ValueError(f"Reference '{ref}' in step_materials not found")
 
                         cur.execute("""
                             INSERT INTO public.nuance_step_materials
@@ -2468,9 +2470,9 @@ def submit_nuance():
                             VALUES (%s, %s, %s, %s, NOW())
                         """, (
                             process_step_id,
-                            resolved["id"] if resolved["type"] == "matiere" else None,
+                            resolved["id"] if resolved["type"] == "matiere"   else None,
                             resolved["id"] if resolved["type"] == "black_mix" else None,
-                            resolved["id"] if resolved["type"] == "nuance" else None
+                            resolved["id"] if resolved["type"] == "nuance"    else None,
                         ))
 
                 # ───────── CONTROL PLAN ─────────
@@ -2499,8 +2501,7 @@ def submit_nuance():
                 cur.execute("""
                     INSERT INTO public.nuance_adn
                         (nuance_id, adn_text, version, created_at)
-                    VALUES (%s, %s::jsonb, 1, NOW())
-                    RETURNING id
+                    VALUES (%s, %s::jsonb, 1, NOW()) RETURNING id
                 """, (nuance_id, adn_json_str))
 
                 adn_id = cur.fetchone()["id"]
@@ -2529,6 +2530,8 @@ def submit_nuance():
 
     finally:
         conn.close()
+
+
 @app.route("/nuance/list", methods=["GET"])
 def list_nuances():
     conn = psycopg2.connect(DB_DSN)
@@ -3029,7 +3032,7 @@ def update_nuance(nuance_id):
                                 continue
                             resolved = ref_lookup.get(ref)
                             if not resolved:
-                                raise ValueError(f"Reference '{ref}' in step_materials not resolved")
+                                raise ValueError(f"Reference '{ref}' in step_materials not found")
                             dedup_key = (resolved["type"], resolved["id"])
                             if dedup_key in seen_ids:
                                 continue
