@@ -41,7 +41,34 @@ DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.datab
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
+# region agent log (debug mode)
+_AGENT_DEBUG_LOG_PATH = None  # set after BASE_DIR
+_AGENT_DEBUG_SESSION_ID = "b359b7"
+_AGENT_DEBUG_TOKEN = os.getenv("AGENT_DEBUG_TOKEN", "").strip() or None
+
+
+def _agent_log(*, hypothesis_id: str, location: str, message: str, data: Dict[str, Any] | None = None, run_id: str = "pre-fix"):
+    try:
+        if not _AGENT_DEBUG_LOG_PATH:
+            return
+        payload = {
+            "sessionId": _AGENT_DEBUG_SESSION_ID,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+# endregion agent log (debug mode)
+
 BASE_DIR = Path(__file__).resolve().parent
+_AGENT_DEBUG_LOG_PATH = str((BASE_DIR / "debug-b359b7.log").resolve())
+_agent_log(hypothesis_id="Z", location="app.py:startup", message="Agent debug logger initialized", data={"log_path": _AGENT_DEBUG_LOG_PATH})
 OUTPUT_BASE_DIR = BASE_DIR / "embeddings_v7"
 IMAGES_DIR = OUTPUT_BASE_DIR / "images"
 TEMP_UPLOAD_DIR = BASE_DIR / "temp_uploads"
@@ -473,14 +500,38 @@ def build_image_url(image_path: str) -> str:
 
 def _load_image_from_source(download_link=None, temp_filename=None, file_id=None):
     """Load a PIL image from one of three sources. Returns (Image, error_tuple_or_None)."""
+    _agent_log(
+        hypothesis_id="C",
+        location="app.py:_load_image_from_source",
+        message="Load image from source (sanitized)",
+        data={
+            "has_download_link": bool(download_link),
+            "download_host": (urlparse(download_link).netloc if download_link else None),
+            "has_temp_filename": bool(temp_filename),
+            "has_file_id": bool(file_id),
+            "openai_client_configured": client is not None,
+        },
+    )
     if download_link:
         try:
             r = requests.get(download_link, timeout=20)
             r.raise_for_status()
             return Image.open(io.BytesIO(r.content)).convert("RGB"), None
         except UnidentifiedImageError:
+            _agent_log(
+                hypothesis_id="C",
+                location="app.py:_load_image_from_source",
+                message="Downloaded content is not a valid image",
+                data={"download_host": urlparse(download_link).netloc if download_link else None},
+            )
             return None, ({"success": False, "error": "not_an_image", "message": "Downloaded content is not a valid image"}, 400)
         except Exception as e:
+            _agent_log(
+                hypothesis_id="C",
+                location="app.py:_load_image_from_source",
+                message="download_link image load failed",
+                data={"error_type": type(e).__name__, "message": str(e)[:300]},
+            )
             return None, ({"success": False, "error": "download_link_failed", "message": str(e)}, 400)
     elif temp_filename:
         # Only allow basenames inside TEMP_UPLOAD_DIR (no path traversal).
@@ -500,11 +551,31 @@ def _load_image_from_source(download_link=None, temp_filename=None, file_id=None
             return None, ({"success": False, "error": "not_an_image", "message": "Temp file is not a valid image"}, 400)
     elif file_id:
         if not client:
+            _agent_log(
+                hypothesis_id="D",
+                location="app.py:_load_image_from_source",
+                message="OpenAI client not configured; cannot fetch file_id",
+                data={},
+            )
             return None, ({"success": False, "error": "openai_not_configured"}, 400)
         try:
             return Image.open(io.BytesIO(client.files.content(file_id).read())).convert("RGB"), None
         except UnidentifiedImageError:
+            _agent_log(
+                hypothesis_id="D",
+                location="app.py:_load_image_from_source",
+                message="OpenAI file content is not a valid image",
+                data={},
+            )
             return None, ({"success": False, "error": "not_an_image", "message": "OpenAI file content is not a valid image"}, 400)
+        except Exception as e:
+            _agent_log(
+                hypothesis_id="D",
+                location="app.py:_load_image_from_source",
+                message="file_id image load failed",
+                data={"error_type": type(e).__name__, "message": str(e)[:300]},
+            )
+            return None, ({"success": False, "error": "file_id_failed", "message": str(e)}, 400)
     return None, ({"success": False, "error": "No image source provided"}, 400)
 
 
@@ -801,6 +872,42 @@ def serve_temp_file(filename):
         return jsonify({"error": "temp_file_not_found"}), 404
 
 
+# region agent log (debug mode)
+@app.route("/__debug/agent_log/clear", methods=["POST"])
+def __debug_agent_log_clear():
+    token = (request.headers.get("X-Agent-Debug-Token") or request.args.get("token") or "").strip()
+    if _AGENT_DEBUG_TOKEN and token != _AGENT_DEBUG_TOKEN:
+        return jsonify({"success": False, "error": "unauthorized"}), 401
+    try:
+        if _AGENT_DEBUG_LOG_PATH and os.path.exists(_AGENT_DEBUG_LOG_PATH):
+            os.remove(_AGENT_DEBUG_LOG_PATH)
+        _agent_log(hypothesis_id="Z", location="app.py:__debug_agent_log_clear", message="Cleared agent debug log", data={})
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": "clear_failed", "message": str(e)}), 500
+
+
+@app.route("/__debug/agent_log", methods=["GET"])
+def __debug_agent_log_get():
+    token = (request.headers.get("X-Agent-Debug-Token") or request.args.get("token") or "").strip()
+    if _AGENT_DEBUG_TOKEN and token != _AGENT_DEBUG_TOKEN:
+        return jsonify({"success": False, "error": "unauthorized"}), 401
+    try:
+        if not _AGENT_DEBUG_LOG_PATH or not os.path.exists(_AGENT_DEBUG_LOG_PATH):
+            return jsonify({"success": True, "exists": False, "lines": []}), 200
+        max_lines = request.args.get("max_lines", "200").strip()
+        try:
+            max_lines_i = max(1, min(2000, int(max_lines)))
+        except Exception:
+            max_lines_i = 200
+        with open(_AGENT_DEBUG_LOG_PATH, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()[-max_lines_i:]
+        return jsonify({"success": True, "exists": True, "lines": lines, "count": len(lines)}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": "read_failed", "message": str(e)}), 500
+# endregion agent log (debug mode)
+
+
 # =============================================================================
 # UPLOAD AND SEARCH (MATIERES)
 # =============================================================================
@@ -808,13 +915,36 @@ def serve_temp_file(filename):
 @app.route("/upload_and_search", methods=["POST"])
 def upload_and_search():
     if not request.is_json:
+        _agent_log(
+            hypothesis_id="E",
+            location="app.py:upload_and_search",
+            message="Reject non-JSON request",
+            data={"content_type": request.content_type, "mimetype": request.mimetype},
+        )
         return jsonify({"success": False, "error": "JSON required"}), 400
 
     data = request.get_json(silent=True) or {}
+    refs_raw = data.get("openaiFileIdRefs")
+    refs_list = refs_raw if isinstance(refs_raw, list) else []
+    _agent_log(
+        hypothesis_id="A",
+        location="app.py:upload_and_search",
+        message="Received upload_and_search payload (sanitized)",
+        data={
+            "content_type": request.content_type,
+            "payload_debug": _build_upload_debug_payload(data, refs_list),
+        },
+    )
     # Hard requirement: this endpoint must use the user's current attachment.
     # Do not allow alternate sources (url/download_link/file_id), because they can drift
     # from what the user actually uploaded in the current message.
     if "openaiFileIdRefs" not in data:
+        _agent_log(
+            hypothesis_id="A",
+            location="app.py:upload_and_search",
+            message="Missing openaiFileIdRefs key",
+            data={"received_keys": sorted(list(data.keys()))},
+        )
         return jsonify({
             "success": False,
             "error": "missing_openaiFileIdRefs",
@@ -823,7 +953,27 @@ def upload_and_search():
         }), 400
     source, err = _resolve_image_source_from_payload(data)
     if err:
+        _agent_log(
+            hypothesis_id="B",
+            location="app.py:upload_and_search",
+            message="Failed to resolve image source from payload",
+            data={"error": err[0], "status_code": err[1]},
+        )
         return jsonify(err[0]), err[1]
+    _agent_log(
+        hypothesis_id="B",
+        location="app.py:upload_and_search",
+        message="Resolved image source (sanitized)",
+        data={
+            "has_download_link": bool(source.get("download_link")),
+            "download_host": (urlparse(source.get("download_link") or "").netloc or None),
+            "has_temp_filename": bool(source.get("temp_filename")),
+            "has_file_id": bool(source.get("file_id")),
+            "original_name": source.get("original_name"),
+            "mime_type": source.get("mime_type"),
+            "openai_client_configured": client is not None,
+        },
+    )
 
     try:
         top_k = _parse_top_k(data.get("top_k", 5))
