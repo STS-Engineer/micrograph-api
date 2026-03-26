@@ -661,6 +661,7 @@ def upload_and_search():
                 )
                 continue
             file_bytes = None
+            download_error = None
             if dl and dl.lower().startswith(("http://", "https://")):
                 try:
                     r = requests.get(dl, timeout=30, allow_redirects=True)
@@ -673,7 +674,8 @@ def upload_and_search():
                         continue
                     file_bytes = r.content
                 except Exception as e:
-                    print(f"⚠️ download_link failed: {e}")
+                    download_error = str(e)
+                    logging.warning("upload_and_search download_link failed for %s: %s", original_name, download_error)
             if file_bytes is None and file_id:
                 if not client:
                     errors.append(f"{original_name}: OpenAI API key not configured (needed for id={file_id!r}).")
@@ -684,9 +686,12 @@ def upload_and_search():
                     errors.append(f"{original_name}: OpenAI file download failed: {e}")
                     continue
             if file_bytes is None:
-                errors.append(
-                    f"{original_name}: Could not retrieve image bytes (check download_link or OpenAI file id)."
-                )
+                if download_error:
+                    errors.append(f"{original_name}: download_link failed: {download_error}")
+                else:
+                    errors.append(
+                        f"{original_name}: Could not retrieve image bytes (check download_link or OpenAI file id)."
+                    )
                 continue
             try:
                 img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
