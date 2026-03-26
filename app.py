@@ -835,7 +835,19 @@ def get_all_images_for_material(matiere_id: int, limit: int = 2) -> List[Dict[st
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"service": "micrograph-search-api", "status": "ok", "model": DINO_MODEL_NAME, "dino_loaded": DINO_MODEL is not None, "images_dir": str(IMAGES_DIR)}), 200
+    return jsonify({
+        "service": "micrograph-search-api",
+        "status": "ok",
+        "model": DINO_MODEL_NAME,
+        "dino_loaded": DINO_MODEL is not None,
+        "images_dir": str(IMAGES_DIR),
+        "agent_debug_session": _AGENT_DEBUG_SESSION_ID,
+        "agent_debug_endpoints": {
+            "ping": "/__debug/ping",
+            "log_get": "/__debug/agent_log",
+            "log_clear": "/__debug/agent_log/clear",
+        },
+    }), 200
 
 
 @app.route("/health", methods=["GET"])
@@ -905,6 +917,17 @@ def __debug_agent_log_get():
         return jsonify({"success": True, "exists": True, "lines": lines, "count": len(lines)}), 200
     except Exception as e:
         return jsonify({"success": False, "error": "read_failed", "message": str(e)}), 500
+# endregion agent log (debug mode)
+
+
+# region agent log (debug mode)
+@app.route("/__debug/ping", methods=["GET"])
+def __debug_ping():
+    token = (request.headers.get("X-Agent-Debug-Token") or request.args.get("token") or "").strip()
+    if _AGENT_DEBUG_TOKEN and token != _AGENT_DEBUG_TOKEN:
+        return jsonify({"success": False, "error": "unauthorized"}), 401
+    _agent_log(hypothesis_id="Z", location="app.py:__debug_ping", message="Ping", data={})
+    return jsonify({"success": True, "sessionId": _AGENT_DEBUG_SESSION_ID}), 200
 # endregion agent log (debug mode)
 
 
