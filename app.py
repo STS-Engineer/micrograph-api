@@ -33,6 +33,7 @@ from psycopg2.extras import RealDictCursor, Json
 from pgvector.psycopg2 import register_vector
 from flask import url_for
 
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Micrographie_IA"
@@ -178,8 +179,25 @@ def infer_filename_from_url(raw_url: str) -> str:
 
 
 def _normalize_openai_file_ref(file_ref: Any) -> Optional[Dict[str, Any]]:
+    """
+    Normalize OpenAI file references to a dict with at least:
+      - id (required)
+      - name (optional)
+      - download_link (optional)
+      - mime_type (optional)
+    """
     if isinstance(file_ref, dict):
-        return file_ref
+        file_id = str(file_ref.get("id") or "").strip()
+        if not file_id:
+            return None
+        download_link = str(file_ref.get("download_link") or "").strip() or None
+        return {
+            "id": file_id,
+            "name": file_ref.get("name") or "uploaded_file",
+            "download_link": download_link,
+            "mime_type": file_ref.get("mime_type"),
+        }
+
     if isinstance(file_ref, str):
         file_id = file_ref.strip()
         if not file_id:
@@ -190,6 +208,7 @@ def _normalize_openai_file_ref(file_ref: Any) -> Optional[Dict[str, Any]]:
             "download_link": None,
             "mime_type": None,
         }
+
     return None
 
 
@@ -224,6 +243,97 @@ def _build_upload_debug_payload(data: Dict[str, Any], refs: List[Any]) -> Dict[s
         "has_image_url": bool(str(data.get("image_url") or "").strip()),
         "sample_items": sample_items,
     }
+
+
+def _parse_top_k(raw_value: Any, default: int = 5) -> int:
+    try:
+        top_k = int(raw_value if raw_value is not None else default)
+    except (TypeError, ValueError):
+        raise ValueError("invalid_top_k")
+    if top_k < 1 or top_k > 50:
+        raise ValueError("invalid_top_k")
+    return top_k
+
+
+def _resolve_image_source_from_payload(data: Dict[str, Any], allow_temp_filename: bool = False):
+    refs = data.get("openaiFileIdRefs")
+    if refs is not None:
+        if not isinstance(refs, list):
+            return None, ({"success": False, "error": "Invalid openaiFileIdRefs"}, 400)
+        if len(refs) != 1:
+            return None, ({"success": False, "error": "Invalid openaiFileIdRefs length"}, 400)
+        file_ref = _normalize_openai_file_ref(refs[0])
+        if not file_ref:
+            return None, ({"success": False, "error": "Invalid openaiFileIdRefs entry"}, 400)
+        return {
+            "download_link": str(file_ref.get("download_link") or "").strip() or None,
+            "temp_filename": None,
+            "file_id": str(file_ref.get("id") or "").strip() or None,
+            "original_name": file_ref.get("name") or "uploaded_image.jpg",
+            "mime_type": file_ref.get("mime_type"),
+        }, None
+
+    download_link = str(
+        data.get("download_link")
+        or data.get("url")
+        or data.get("image_url")
+        or ""
+    ).strip() or None
+    file_id = str(data.get("file_id") or data.get("openai_file_id") or "").strip() or None
+    temp_filename = str(data.get("temp_filename") or "").strip() or None
+
+    provided_sources = [bool(download_link), bool(file_id)]
+    if allow_temp_filename:
+        provided_sources.append(bool(temp_filename))
+
+    if sum(provided_sources) != 1:
+        allowed = "download_link, url, image_url, file_id, openai_file_id"
+        if allow_temp_filename:
+            allowed += ", temp_filename"
+        return None, ({"success": False, "error": f"Provide exactly ONE of: openaiFileIdRefs, {allowed}"}, 400)
+
+    if download_link:
+        original_name = infer_filename_from_url(download_link)
+    elif temp_filename:
+        original_name = temp_filename
+    else:
+        original_name = "uploaded_image.jpg"
+
+    return {
+        "download_link": download_link,
+        "temp_filename": temp_filename if allow_temp_filename else None,
+        "file_id": file_id,
+        "original_name": original_name,
+        "mime_type": data.get("mime_type"),
+    }, None
+
+
+def _load_image_with_fallback(*, download_link=None, temp_filename=None, file_id=None):
+    if download_link:
+        img, err = _load_image_from_source(download_link=download_link)
+        if not err:
+            return img, None
+        if not file_id:
+            return None, err
+    if temp_filename:
+        return _load_image_from_source(temp_filename=temp_filename)
+    if file_id:
+        return _load_image_from_source(file_id=file_id)
+    return None, ({"success": False, "error": "No image source provided"}, 400)
+
+
+def _format_material_search_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "id": r["id"],
+            "image_url": build_image_url(r["image_path"]),
+            "matiere_id": r["matiere_id"],
+            "material_name": r["nom_matiere"],
+            "reference": r["reference"],
+            "similarity": float(r["similarity"]) if r["similarity"] is not None else None,
+        }
+        for r in rows
+    ]
 
 
 def cleanup_old_files(interval: int = 1800, max_age_seconds: int = 2 * 3600):
@@ -648,92 +758,50 @@ def upload_and_search():
         return jsonify({"success": False, "error": "JSON required"}), 400
 
     data = request.get_json(silent=True) or {}
-    refs = data.get("openaiFileIdRefs")
-
-    if not refs or not isinstance(refs, list):
+    if "openaiFileIdRefs" not in data:
         return jsonify({"success": False, "error": "Missing openaiFileIdRefs"}), 400
-
-    file_ref = refs[0] if isinstance(refs[0], dict) else {"id": str(refs[0])}
-
-    download_link = file_ref.get("download_link")
-    openai_file_id = file_ref.get("id")
-    original_name = file_ref.get("name") or "uploaded_image.jpg"
-    mime_type = file_ref.get("mime_type")
-
-    if not download_link and not openai_file_id:
-        return jsonify({
-            "success": False,
-            "error": "Missing file reference (id or download_link required)"
-        }), 400
+    if not isinstance(data.get("openaiFileIdRefs"), list) or len(data.get("openaiFileIdRefs")) != 1:
+        return jsonify({"success": False, "error": "Invalid openaiFileIdRefs"}), 400
+    source, err = _resolve_image_source_from_payload(data)
+    if err:
+        return jsonify(err[0]), err[1]
 
     try:
-        image_bytes = None
+        top_k = _parse_top_k(data.get("top_k", 5))
+        mime_type = source.get("mime_type")
+        original_name = source.get("original_name") or "uploaded_image.jpg"
 
-        # 🔹 PRIORITY 1: download_link
-        if download_link:
-            try:
-                r = requests.get(download_link, timeout=20)
-                if r.status_code != 200:
-                    logging.warning(f"Download failed: {r.status_code}")
-                else:
-                    image_bytes = r.content
-            except Exception as e:
-                logging.warning(f"Download link error: {e}")
+        if mime_type and not str(mime_type).lower().startswith("image/"):
+            return jsonify({"success": False, "error": "File is not an image"}), 400
 
-        # 🔹 PRIORITY 2: fallback to OpenAI file
-        if image_bytes is None and openai_file_id:
-            meta = client.files.retrieve(openai_file_id)
-            if getattr(meta, "filename", None):
-                original_name = meta.filename
-            image_bytes = client.files.content(openai_file_id).read()
+        img, err = _load_image_with_fallback(
+            download_link=source.get("download_link"),
+            temp_filename=source.get("temp_filename"),
+            file_id=source.get("file_id"),
+        )
+        if err:
+            return jsonify(err[0]), err[1]
 
-        if image_bytes is None:
-            return jsonify({"success": False, "error": "Failed to retrieve file"}), 400
-
-        # 🔹 MIME validation
-        if mime_type and not mime_type.startswith("image/"):
-            return jsonify({
-                "success": False,
-                "error": "File is not an image"
-            }), 400
-
-        # 🔹 Decode image
-        image_array = np.frombuffer(image_bytes, dtype=np.uint8)
-        decoded_image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-
-        if decoded_image is None:
-            return jsonify({
-                "success": False,
-                "error": "Invalid image format"
-            }), 400
-
-        # 🔹 Save image
         safe_name = secure_filename(original_name) or "uploaded_image"
-        image_stem = Path(safe_name).stem
+        image_stem = Path(safe_name).stem or "uploaded_image"
+        image_filename = f"{image_stem}_{int(time.time())}_{uuid.uuid4().hex}.jpg"
+        image_path = IMAGES_DIR / image_filename
+        img.save(image_path, format="JPEG", quality=95)
 
-        timestamp = int(time.time())
-        image_filename = f"{image_stem}_{timestamp}_{uuid.uuid4().hex}.jpg"
-        image_path = OUTPUT_FOLDER / image_filename
-
-        if not cv2.imwrite(str(image_path), decoded_image):
-            return jsonify({"success": False, "error": "Failed to save image"}), 500
-
-        # 🔹 Run pipeline
-        result = process_image_and_search(str(image_path))
-
-        if not result.get("success"):
-            return jsonify({
-                "success": False,
-                "error": result.get("error", "Processing failed")
-            }), 500
+        query_embedding = compute_embedding_from_pil(img)
+        rows = search_similar_in_db(query_embedding, top_k=top_k)
 
         return jsonify({
             "success": True,
             "image_filename": image_filename,
-            "results": result.get("results", []),
-            "image_url": f"{request.host_url.rstrip('/')}/images/{image_filename}"
+            "results": _format_material_search_results(rows),
+            "image_url": build_image_url(str(image_path))
         }), 200
 
+    except ValueError as e:
+        if str(e) == "invalid_top_k":
+            return jsonify({"success": False, "error": "invalid_top_k"}), 400
+        return jsonify({"success": False, "error": str(e)}), 400
     except Exception as e:
         logging.error(f"Upload and search failed: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
