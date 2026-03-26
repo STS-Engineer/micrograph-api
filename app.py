@@ -20,7 +20,7 @@ import requests
 import torch
 from flask import Flask, jsonify, request, send_from_directory, send_file, url_for
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from transformers import AutoModel, AutoImageProcessor
 from werkzeug.utils import secure_filename
 from groq import Groq
@@ -433,6 +433,8 @@ def _load_image_from_source(download_link=None, temp_filename=None, file_id=None
             r = requests.get(download_link, timeout=20)
             r.raise_for_status()
             return Image.open(io.BytesIO(r.content)).convert("RGB"), None
+        except UnidentifiedImageError:
+            return None, ({"success": False, "error": "not_an_image", "message": "Downloaded content is not a valid image"}, 400)
         except Exception as e:
             return None, ({"success": False, "error": "download_link_failed", "message": str(e)}, 400)
     elif temp_filename:
@@ -447,11 +449,17 @@ def _load_image_from_source(download_link=None, temp_filename=None, file_id=None
             return None, ({"success": False, "error": "temp_file_not_found"}, 404)
         if not file_path.is_file():
             return None, ({"success": False, "error": "temp_file_not_found"}, 404)
-        return Image.open(file_path).convert("RGB"), None
+        try:
+            return Image.open(file_path).convert("RGB"), None
+        except UnidentifiedImageError:
+            return None, ({"success": False, "error": "not_an_image", "message": "Temp file is not a valid image"}, 400)
     elif file_id:
         if not client:
             return None, ({"success": False, "error": "openai_not_configured"}, 400)
-        return Image.open(io.BytesIO(client.files.content(file_id).read())).convert("RGB"), None
+        try:
+            return Image.open(io.BytesIO(client.files.content(file_id).read())).convert("RGB"), None
+        except UnidentifiedImageError:
+            return None, ({"success": False, "error": "not_an_image", "message": "OpenAI file content is not a valid image"}, 400)
     return None, ({"success": False, "error": "No image source provided"}, 400)
 
 
@@ -758,6 +766,16 @@ def upload_and_search():
         return jsonify({"success": False, "error": "JSON required"}), 400
 
     data = request.get_json(silent=True) or {}
+    # Hard requirement: this endpoint must use the user's current attachment.
+    # Do not allow alternate sources (url/download_link/file_id), because they can drift
+    # from what the user actually uploaded in the current message.
+    if "openaiFileIdRefs" not in data:
+        return jsonify({
+            "success": False,
+            "error": "missing_openaiFileIdRefs",
+            "message": "uploadAndSearch requires the user's uploaded IMAGE from the current message (openaiFileIdRefs).",
+            "action": "Please attach exactly ONE micrograph image (PNG/JPG/JPEG/WEBP) and retry."
+        }), 400
     source, err = _resolve_image_source_from_payload(data)
     if err:
         return jsonify(err[0]), err[1]
@@ -767,8 +785,27 @@ def upload_and_search():
         mime_type = source.get("mime_type")
         original_name = source.get("original_name") or "uploaded_image.jpg"
 
-        if mime_type and not str(mime_type).lower().startswith("image/"):
-            return jsonify({"success": False, "error": "File is not an image"}), 400
+        # Strict guardrail: reject obvious non-image attachments early (e.g. KB .md).
+        ext = (Path(str(original_name)).suffix or "").lower()
+        if mime_type:
+            if not str(mime_type).lower().startswith("image/"):
+                return jsonify({
+                    "success": False,
+                    "error": "invalid_file_type",
+                    "message": "uploadAndSearch expects exactly one IMAGE attachment (PNG/JPG/JPEG/WEBP).",
+                    "received": {"name": original_name, "mime_type": mime_type},
+                    "action": "Please re-upload ONLY the micrograph image (no .md/.pdf/.xls attachments) and retry."
+                }), 400
+        else:
+            # Some runtimes may omit mime_type; still block clearly non-image filenames.
+            if ext in {".md", ".markdown", ".pdf", ".xls", ".xlsx", ".doc", ".docx", ".txt"}:
+                return jsonify({
+                    "success": False,
+                    "error": "invalid_file_type",
+                    "message": "uploadAndSearch expects exactly one IMAGE attachment (PNG/JPG/JPEG/WEBP).",
+                    "received": {"name": original_name, "mime_type": None},
+                    "action": "Please re-upload ONLY the micrograph image and retry."
+                }), 400
 
         img, err = _load_image_with_fallback(
             download_link=source.get("download_link"),
