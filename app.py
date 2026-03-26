@@ -336,6 +336,51 @@ def _format_material_search_results(rows: List[Dict[str, Any]]) -> List[Dict[str
     ]
 
 
+def _format_nuance_search_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "id": r["id"],
+            "image_url": build_image_url(r["image_path"]),
+            "nuance_id": r["nuance_id"],
+            "nuance_name": r["nuance_name"],
+            "reference": r["reference"],
+            "similarity": float(r["similarity"]) if r["similarity"] is not None else None,
+        }
+        for r in rows
+    ]
+
+
+def _fuse_image_search_results(*, matieres: List[Dict[str, Any]], nuances: List[Dict[str, Any]], top_k: int):
+    fused: List[Dict[str, Any]] = []
+
+    for r in matieres:
+        fused.append({
+            "type": "matiere",
+            "id": r.get("id"),
+            "image_url": r.get("image_url"),
+            "reference": r.get("reference"),
+            "label": r.get("material_name"),
+            "matiere_id": r.get("matiere_id"),
+            "nuance_id": None,
+            "similarity": r.get("similarity"),
+        })
+
+    for r in nuances:
+        fused.append({
+            "type": "nuance",
+            "id": r.get("id"),
+            "image_url": r.get("image_url"),
+            "reference": r.get("reference"),
+            "label": r.get("nuance_name"),
+            "matiere_id": None,
+            "nuance_id": r.get("nuance_id"),
+            "similarity": r.get("similarity"),
+        })
+
+    fused.sort(key=lambda x: (x.get("similarity") is not None, x.get("similarity") or -1.0), reverse=True)
+    return fused[:top_k]
+
+
 def cleanup_old_files(interval: int = 1800, max_age_seconds: int = 2 * 3600):
     while True:
         now = time.time()
@@ -782,6 +827,9 @@ def upload_and_search():
 
     try:
         top_k = _parse_top_k(data.get("top_k", 5))
+        scope = str(data.get("scope") or "auto").strip().lower()
+        if scope not in {"auto", "matieres", "nuances"}:
+            return jsonify({"success": False, "error": "invalid_scope", "allowed": ["auto", "matieres", "nuances"]}), 400
         mime_type = source.get("mime_type")
         original_name = source.get("original_name") or "uploaded_image.jpg"
 
@@ -822,12 +870,26 @@ def upload_and_search():
         img.save(image_path, format="JPEG", quality=95)
 
         query_embedding = compute_embedding_from_pil(img)
-        rows = search_similar_in_db(query_embedding, top_k=top_k)
+        if scope == "auto":
+            # Fetch more from each table, then fuse into a single global top_k.
+            k_each = min(50, max(top_k * 2, top_k))
+            mat_rows = search_similar_in_db(query_embedding, top_k=k_each)
+            nu_rows = search_similar_nuances_in_db(query_embedding, top_k=k_each)
+            mat_results = _format_material_search_results(mat_rows)
+            nu_results = _format_nuance_search_results(nu_rows)
+            results = _fuse_image_search_results(matieres=mat_results, nuances=nu_results, top_k=top_k)
+        elif scope == "nuances":
+            rows = search_similar_nuances_in_db(query_embedding, top_k=top_k)
+            results = _format_nuance_search_results(rows)
+        else:
+            rows = search_similar_in_db(query_embedding, top_k=top_k)
+            results = _format_material_search_results(rows)
 
         return jsonify({
             "success": True,
+            "scope": scope,
             "image_filename": image_filename,
-            "results": _format_material_search_results(rows),
+            "results": results,
             "image_url": build_image_url(str(image_path))
         }), 200
 
