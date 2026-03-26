@@ -645,120 +645,98 @@ def serve_temp_file(filename):
 @app.route("/upload_and_search", methods=["POST"])
 def upload_and_search():
     data = request.get_json(silent=True) or {}
-    refs = list(data.get("openaiFileIdRefs") or [])
+
+    # 1. Récupération avec priorité openaiFileIdRefs
+    refs = data.get("openaiFileIdRefs")
+    file_id = data.get("openai_file_id")
+    download_link = data.get("download_link")
+
+    # Priorité: openaiFileIdRefs > openai_file_id > download_link
+    if refs and isinstance(refs, list) and len(refs) > 0:
+        # Prendre le premier élément
+        file_ref = refs[0]
+        if isinstance(file_ref, dict):
+            file_id = file_ref.get("id")
+            download_link = file_ref.get("download_link")
+            name = file_ref.get("name")
+        elif isinstance(file_ref, str):
+            file_id = file_ref
+            name = None
+        else:
+            return jsonify({"success": False, "error": "Invalid item in openaiFileIdRefs"}), 400
+    elif not file_id and not download_link:
+        return jsonify({"success": False, "error": "No image source provided (openaiFileIdRefs, openai_file_id, download_link)"}), 400
+
     top_k = int(data.get("top_k", 5))
-
-    # 🔁 Fallbacks compatibles GPT
-    if not refs:
-        fid_top = data.get("file_id") or data.get("openai_file_id")
-        if fid_top:
-            refs = [{"id": str(fid_top).strip()}]
-
-    if not refs and data.get("download_link"):
-        refs = [{
-            "id": None,
-            "download_link": str(data.get("download_link"))
-        }]
-
-    if not refs:
-        root_url = data.get("url") or data.get("image_url")
-        if isinstance(root_url, str) and root_url.strip():
-            refs = [{
-                "id": None,
-                "download_link": root_url.strip()
-            }]
-
-    if not refs:
-        return jsonify({
-            "success": False,
-            "error": "No image provided"
-        }), 400
-
     if top_k < 1 or top_k > 50:
         return jsonify({"success": False, "error": "invalid_top_k"}), 400
 
-    final_results = []
-    errors = []
-
-    for raw_file_ref in refs:
+    # 2. Vérification de l'extension si possible
+    allowed_extensions = {"png", "jpg", "jpeg", "webp"}
+    if name:
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        if ext not in allowed_extensions:
+            return jsonify({"success": False, "error": f"File extension '{ext}' not allowed. Allowed: {', '.join(allowed_extensions)}"}), 400
+    elif download_link:
+        # Essayer d'extraire le nom depuis l'URL
         try:
-            file_ref = _normalize_openai_file_ref(raw_file_ref)
-            if not file_ref:
-                errors.append("Invalid file reference")
-                continue
+            parsed = urlparse(download_link)
+            candidate = Path(unquote(parsed.path)).name
+            if candidate:
+                ext = candidate.rsplit(".", 1)[-1].lower() if "." in candidate else ""
+                if ext not in allowed_extensions:
+                    return jsonify({"success": False, "error": f"File extension '{ext}' from URL not allowed. Allowed: {', '.join(allowed_extensions)}"}), 400
+        except Exception:
+            pass  # Si on ne peut pas extraire, on continue sans bloquer
 
-            file_id = file_ref.get("id")
-            download_link = file_ref.get("download_link")
-
-            file_bytes = None
-
-            # 🔽 1. Download via URL
-            if download_link and download_link.startswith(("http://", "https://")):
-                try:
-                    r = requests.get(download_link, timeout=20)
-                    r.raise_for_status()
-                    file_bytes = r.content
-                except Exception as e:
-                    errors.append(f"Download failed: {e}")
-                    continue
-
-            # 🔽 2. Download via OpenAI file ID
-            if file_bytes is None and file_id:
-                if not client:
-                    errors.append("OpenAI client not configured")
-                    continue
-                try:
-                    file_bytes = client.files.content(file_id).read()
-                except Exception as e:
-                    errors.append(f"OpenAI download failed: {e}")
-                    continue
-
-            if file_bytes is None:
-                errors.append("Could not retrieve file")
-                continue
-
-            # 🧠 Validation réelle via PIL (plus robuste que MIME)
-            try:
-                img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-            except Exception as e:
-                errors.append(f"Invalid image: {e}")
-                continue
-
-            # ⚡ Embedding direct (no disk write)
-            query_embedding = compute_embedding_from_pil(img)
-
-            rows = search_similar_in_db(query_embedding, top_k=top_k)
-
-            search_results = [
-                {
-                    "id": r["id"],
-                    "image_url": build_image_url(r["image_path"]),
-                    "matiere_id": r["matiere_id"],
-                    "material_name": r["nom_matiere"],
-                    "reference": r["reference"],
-                    "similarity": float(r["similarity"]) if r["similarity"] else None,
-                }
-                for r in rows
-            ]
-
-            final_results.append({
-                "search_results": search_results
-            })
-
+    # 3. Télécharger le fichier
+    file_bytes = None
+    if download_link and download_link.startswith(("http://", "https://")):
+        try:
+            r = requests.get(download_link, timeout=20)
+            r.raise_for_status()
+            file_bytes = r.content
         except Exception as e:
-            errors.append(str(e))
+            return jsonify({"success": False, "error": f"Download from URL failed: {e}"}), 400
 
-    if not final_results:
-        return jsonify({
-            "success": False,
-            "errors": errors
-        }), 400
+    if file_bytes is None and file_id:
+        if not client:
+            return jsonify({"success": False, "error": "OpenAI client not configured"}), 400
+        try:
+            file_bytes = client.files.content(file_id).read()
+        except Exception as e:
+            return jsonify({"success": False, "error": f"OpenAI download failed: {e}"}), 400
 
-    return jsonify({
-        "success": True,
-        "results": final_results,
-        "errors": errors
-    }), 200
+    if file_bytes is None:
+        return jsonify({"success": False, "error": "Could not retrieve image"}), 400
+
+    # 4. Valider que c'est une image via PIL
+    try:
+        img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Invalid image: {e}"}), 400
+
+    # 5. Calculer l'embedding
+    try:
+        query_embedding = compute_embedding_from_pil(img)
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Embedding computation failed: {e}"}), 500
+
+    # 6. Recherche en base
+    rows = search_similar_in_db(query_embedding, top_k=top_k)
+    search_results = [
+        {
+            "id": r["id"],
+            "image_url": build_image_url(r["image_path"]),
+            "matiere_id": r["matiere_id"],
+            "material_name": r["nom_matiere"],
+            "reference": r["reference"],
+            "similarity": float(r["similarity"]) if r["similarity"] else None,
+        }
+        for r in rows
+    ]
+
+    return jsonify({"success": True, "results": search_results}), 200
 
 # =============================================================================
 # MATERIAL DETAILS
