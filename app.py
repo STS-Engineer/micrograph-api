@@ -157,6 +157,14 @@ def guess_extension_from_mime(mime_type: Optional[str]) -> Optional[str]:
     return None
 
 
+def is_supported_image_ref(filename: Optional[str], mime_type: Optional[str]) -> bool:
+    mt = (mime_type or "").strip().lower()
+    if mt:
+        return mt in {"image/png", "image/jpeg", "image/jpg"}
+    suffix = Path(filename or "").suffix.lower()
+    return suffix in {".png", ".jpg", ".jpeg"}
+
+
 def cleanup_old_files(interval: int = 1800, max_age_seconds: int = 2 * 3600):
     while True:
         now = time.time()
@@ -596,6 +604,7 @@ def upload_and_search():
         return jsonify({"success": False, "error": "invalid_top_k"}), 400
     final_results = []
     errors = []
+    unexpected_error = False
     base = _request_external_base_url()
     for file_ref in refs:
         original_name = "uploaded_file"
@@ -608,10 +617,23 @@ def upload_and_search():
             download_link = file_ref.get("download_link")
             original_name = file_ref.get("name") or "uploaded_file"
             mime_type = file_ref.get("mime_type")
+            logging.info(
+                "upload_and_search ref name=%s mime_type=%s has_id=%s has_download_link=%s",
+                original_name,
+                mime_type,
+                bool(file_id),
+                bool(download_link),
+            )
             
             # Validation du type MIME pour s'assurer que c'est une image
             if mime_type and "application/pdf" in mime_type.lower():
                 errors.append(f"{original_name}: PDF files are not supported for this endpoint. Please upload an image.")
+                continue
+            if not is_supported_image_ref(original_name, mime_type):
+                errors.append(
+                    f"{original_name}: uploadAndSearch only accepts PNG/JPG images. "
+                    "Do not send KB, markdown, PDF, or text files in openaiFileIdRefs."
+                )
                 continue
 
             dl = (download_link or "").strip()
@@ -627,9 +649,10 @@ def upload_and_search():
                     r.raise_for_status()
                     ct = (r.headers.get("Content-Type") or "").lower()
                     if "image/" not in ct and ct and "octet-stream" not in ct:
-                        logging.warning(
-                            "upload_and_search: unexpected Content-Type %s for %s", ct, dl[:80]
+                        errors.append(
+                            f"{original_name}: download_link returned Content-Type '{ct}', not an image."
                         )
+                        continue
                     file_bytes = r.content
                 except Exception as e:
                     print(f"⚠️ download_link failed: {e}")
@@ -689,9 +712,11 @@ def upload_and_search():
             )
         except Exception as e:
             logging.exception("upload_and_search failed for %s", original_name)
+            unexpected_error = True
             errors.append(f"{original_name}: {str(e)}")
     if not final_results and errors:
-        return jsonify({"success": False, "message": "All operations failed", "errors": errors}), 500
+        status_code = 500 if unexpected_error else 400
+        return jsonify({"success": False, "message": "All operations failed", "errors": errors}), status_code
     return jsonify(
         {
             "success": True,
