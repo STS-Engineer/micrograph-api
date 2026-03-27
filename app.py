@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 import numpy as np
 import requests
 import torch
-from flask import Flask, jsonify, request, send_from_directory, send_file, url_for
+from flask import Flask, jsonify, request, send_from_directory, send_file, url_for, render_template, render_template_string
 from openai import OpenAI
 from PIL import Image, UnidentifiedImageError
 from transformers import AutoModel, AutoImageProcessor
@@ -357,10 +357,31 @@ def _format_material_search_results(rows: List[Dict[str, Any]]) -> List[Dict[str
             "matiere_id": r["matiere_id"],
             "material_name": r["nom_matiere"],
             "reference": r["reference"],
+            "type_matiere": r.get("type_matiere"),
             "similarity": float(r["similarity"]) if r["similarity"] is not None else None,
         }
         for r in rows
     ]
+
+
+def _format_material_browser_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    formatted = []
+    for idx, row in enumerate(rows, start=1):
+        similarity = float(row["similarity"]) if row["similarity"] is not None else None
+        similarity_pct = round(max(0.0, min(1.0, similarity)) * 100, 2) if similarity is not None else None
+        formatted.append({
+            "rank": idx,
+            "id": row["id"],
+            "matiere_id": row["matiere_id"],
+            "material_name": row["nom_matiere"],
+            "reference": row["reference"],
+            "type_matiere": row.get("type_matiere"),
+            "similarity": similarity,
+            "similarity_pct": similarity_pct,
+            "image_url": build_image_url(row["image_path"]),
+            "detail_url": url_for("get_material_details", matiere_id=row["matiere_id"]),
+        })
+    return formatted
 
 
 def _format_nuance_search_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -463,7 +484,7 @@ def _embedding_to_pgvector_text(query_embedding: np.ndarray) -> str:
 def search_similar_in_db(query_embedding: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
     query_vec = _embedding_to_pgvector_text(query_embedding)
     sql = """
-        SELECT mi.id, mi.image_path, mi.matiere_id, m.nom_matiere, m.reference,
+        SELECT mi.id, mi.image_path, mi.matiere_id, m.nom_matiere, m.reference, m.type_matiere,
                (1 - (mi.embedding <=> %s::vector)) AS similarity
         FROM public.matiere_images mi
         JOIN public.matieres m ON m.matiere_id = mi.matiere_id
@@ -848,6 +869,257 @@ def root():
             "log_clear": "/__debug/agent_log/clear",
         },
     }), 200
+
+
+@app.route("/materials-search-ui", methods=["GET"])
+def materials_search_ui():
+    return render_template_string("""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Material Proposer</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background: #f8f9fb; color: #1f2937; }
+    .card { max-width: 860px; margin: 0 auto; background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 18px; }
+    h1 { margin: 0 0 12px; font-size: 22px; }
+    .row { margin: 10px 0; }
+    label { display: block; margin-bottom: 6px; font-weight: 600; }
+    input, button { padding: 10px; border-radius: 8px; border: 1px solid #d1d5db; }
+    input[type="number"] { width: 120px; }
+    button { cursor: pointer; background: #111827; color: #fff; border: 0; }
+    button:disabled { opacity: 0.6; cursor: wait; }
+    table { width: 100%; border-collapse: collapse; margin-top: 14px; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e5e7eb; font-size: 14px; }
+    .preview { max-width: 220px; max-height: 220px; margin-top: 8px; border-radius: 8px; border: 1px solid #e5e7eb; display: none; }
+    .muted { color: #6b7280; font-size: 13px; }
+    .error { color: #b91c1c; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Material Proposer (Without OpenAI)</h1>
+    <p class="muted">Upload one micrograph image and get the closest materials from the database.</p>
+
+    <form id="searchForm">
+      <div class="row">
+        <label for="image">Image</label>
+        <input id="image" name="image" type="file" accept=".png,.jpg,.jpeg,.webp" required />
+        <img id="preview" class="preview" alt="preview" />
+      </div>
+      <div class="row">
+        <label for="top_k">Top K results</label>
+        <input id="top_k" name="top_k" type="number" min="1" max="50" value="5" />
+      </div>
+      <div class="row">
+        <button id="submitBtn" type="submit">Search materials</button>
+      </div>
+    </form>
+
+    <div id="status" class="muted"></div>
+    <div id="error" class="error"></div>
+    <div id="results"></div>
+  </div>
+
+  <script>
+    const form = document.getElementById("searchForm");
+    const imageInput = document.getElementById("image");
+    const preview = document.getElementById("preview");
+    const statusEl = document.getElementById("status");
+    const errorEl = document.getElementById("error");
+    const resultsEl = document.getElementById("results");
+    const submitBtn = document.getElementById("submitBtn");
+
+    imageInput.addEventListener("change", () => {
+      const file = imageInput.files && imageInput.files[0];
+      if (!file) {
+        preview.style.display = "none";
+        preview.src = "";
+        return;
+      }
+      preview.src = URL.createObjectURL(file);
+      preview.style.display = "block";
+    });
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      errorEl.textContent = "";
+      resultsEl.innerHTML = "";
+      statusEl.textContent = "Searching...";
+      submitBtn.disabled = true;
+
+      try {
+        const fd = new FormData(form);
+        const response = await fetch("/materials/propose", { method: "POST", body: fd });
+        const data = await response.json();
+
+        if (!response.ok || !data.success) {
+          throw new Error(data.error || data.message || "Search failed");
+        }
+
+        statusEl.textContent = `Found ${data.results.length} result(s).`;
+        const rows = data.results.map((r, i) => `
+          <tr>
+            <td>${i + 1}</td>
+            <td>${r.material_name || ""}</td>
+            <td>${r.reference || ""}</td>
+            <td>${r.similarity != null ? Number(r.similarity).toFixed(4) : ""}</td>
+            <td>${r.image_url ? `<a href="${r.image_url}" target="_blank">image</a>` : ""}</td>
+          </tr>
+        `).join("");
+
+        resultsEl.innerHTML = `
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Material</th>
+                <th>Reference</th>
+                <th>Similarity</th>
+                <th>Image</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        `;
+      } catch (err) {
+        errorEl.textContent = err.message || String(err);
+        statusEl.textContent = "";
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
+    """)
+
+
+@app.route("/materials/intelligence-ui", methods=["GET"])
+def materials_intelligence_ui():
+    return render_template("materials_intelligence_ui.html")
+
+
+@app.route("/materials/propose", methods=["POST"])
+def propose_materials_from_uploaded_image():
+    """Propose closest materials from DB using uploaded image only (no OpenAI refs)."""
+    try:
+        top_k = _parse_top_k(request.form.get("top_k", 5))
+    except ValueError:
+        return jsonify({"success": False, "error": "invalid_top_k"}), 400
+
+    if "image" not in request.files:
+        return jsonify({"success": False, "error": "missing_image_file"}), 400
+
+    file = request.files["image"]
+    if not file or not file.filename:
+        return jsonify({"success": False, "error": "missing_image_file"}), 400
+
+    if not allowed_file(file.filename):
+        return jsonify({"success": False, "error": "invalid_file_type", "allowed": sorted(list(ALLOWED_EXTENSIONS))}), 400
+
+    try:
+        file_bytes = file.read()
+        image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    except UnidentifiedImageError:
+        return jsonify({"success": False, "error": "not_an_image"}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": "image_read_failed", "message": str(e)}), 400
+
+    safe_name = secure_filename(file.filename) or "uploaded_image"
+    image_filename = f"manual_{Path(safe_name).stem}_{int(time.time())}_{uuid.uuid4().hex}.jpg"
+    image_path = IMAGES_DIR / image_filename
+    try:
+        image.save(image_path, format="JPEG", quality=95)
+    except Exception:
+        # Non-blocking: even if saving fails, similarity search can still continue.
+        image_path = None
+
+    try:
+        query_embedding = compute_embedding_from_pil(image)
+        rows = search_similar_in_db(query_embedding, top_k=top_k)
+        results = _format_material_search_results(rows)
+        return jsonify({
+            "success": True,
+            "top_k": top_k,
+            "results": results,
+            "uploaded_image_url": build_image_url(str(image_path)) if image_path else None,
+            "source": "multipart_upload_no_openai",
+        }), 200
+    except Exception as e:
+        logging.error(f"propose_materials_from_uploaded_image failed: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "search_failed", "message": str(e)}), 500
+
+
+@app.route("/api/materials/browser-search", methods=["POST"])
+def browser_search_materials():
+    """Browser-native material search using multipart upload instead of OpenAI refs."""
+    try:
+        top_k = _parse_top_k(request.form.get("top_k", 8))
+    except ValueError:
+        return jsonify({"success": False, "error": "invalid_top_k"}), 400
+
+    if "image" not in request.files:
+        return jsonify({"success": False, "error": "missing_image_file"}), 400
+
+    file = request.files["image"]
+    if not file or not file.filename:
+        return jsonify({"success": False, "error": "missing_image_file"}), 400
+
+    if not allowed_file(file.filename):
+        return jsonify({
+            "success": False,
+            "error": "invalid_file_type",
+            "allowed": sorted(list(ALLOWED_EXTENSIONS)),
+        }), 400
+
+    try:
+        file_bytes = file.read()
+        image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    except UnidentifiedImageError:
+        return jsonify({"success": False, "error": "not_an_image"}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": "image_read_failed", "message": str(e)}), 400
+
+    safe_name = secure_filename(file.filename) or "uploaded_image"
+    image_filename = f"browser_{Path(safe_name).stem}_{int(time.time())}_{uuid.uuid4().hex}.jpg"
+    image_path = IMAGES_DIR / image_filename
+    try:
+        image.save(image_path, format="JPEG", quality=95)
+    except Exception:
+        image_path = None
+
+    try:
+        query_embedding = compute_embedding_from_pil(image)
+        rows = search_similar_in_db(query_embedding, top_k=top_k)
+        results = _format_material_browser_results(rows)
+        similarities = [item["similarity"] for item in results if item.get("similarity") is not None]
+        best_match = results[0] if results else None
+        runner_up = results[1] if len(results) > 1 else None
+
+        return jsonify({
+            "success": True,
+            "endpoint": "browser_material_search",
+            "query": {
+                "filename": safe_name,
+                "top_k": top_k,
+                "uploaded_image_url": build_image_url(str(image_path)) if image_path else None,
+            },
+            "summary": {
+                "result_count": len(results),
+                "best_match": best_match,
+                "average_similarity": round(sum(similarities) / len(similarities), 4) if similarities else None,
+                "average_similarity_pct": round((sum(similarities) / len(similarities)) * 100, 2) if similarities else None,
+                "confidence_gap": round(best_match["similarity"] - runner_up["similarity"], 4)
+                if best_match and runner_up and best_match.get("similarity") is not None and runner_up.get("similarity") is not None
+                else None,
+            },
+            "results": results,
+        }), 200
+    except Exception as e:
+        logging.error(f"browser_search_materials failed: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "search_failed", "message": str(e)}), 500
 
 
 @app.route("/health", methods=["GET"])
