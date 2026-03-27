@@ -27,6 +27,8 @@ from groq import Groq
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from azure.storage.blob import BlobServiceClient
+from azure.core.exceptions import ResourceExistsError
 
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
@@ -37,6 +39,11 @@ from flask import url_for
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Micrographie_IA"
+AZURE_CONNECTION_STRING = os.getenv("AZURE_CONNECTION_STRING", "").strip()
+AZURE_CONTAINER_NAME = os.getenv("AZURE_CONTAINER_NAME", "").strip()
+AZURE_BLOB_PREFIX = os.getenv("AZURE_BLOB_PREFIX", "micrograph-images").strip("/ ")
+EXPECTED_AZURE_CONTAINER_NAME = os.getenv("EXPECTED_AZURE_CONTAINER_NAME", "micrographie-images").strip()
+_BLOB_SERVICE_CLIENT: Optional[BlobServiceClient] = None
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
@@ -515,6 +522,114 @@ def build_image_url(image_path: str) -> str:
     return f"{base}/images/{secure_filename(filename)}"
 
 
+def is_azure_blob_enabled() -> bool:
+    return bool(AZURE_CONNECTION_STRING and AZURE_CONTAINER_NAME)
+
+
+def validate_azure_blob_config() -> None:
+    if not is_azure_blob_enabled():
+        return
+    if EXPECTED_AZURE_CONTAINER_NAME and AZURE_CONTAINER_NAME != EXPECTED_AZURE_CONTAINER_NAME:
+        raise RuntimeError(
+            f"Refusing to use Azure container '{AZURE_CONTAINER_NAME}'. "
+            f"Expected '{EXPECTED_AZURE_CONTAINER_NAME}'."
+        )
+
+
+def get_blob_service_client() -> Optional[BlobServiceClient]:
+    global _BLOB_SERVICE_CLIENT
+    if not is_azure_blob_enabled():
+        return None
+    validate_azure_blob_config()
+    if _BLOB_SERVICE_CLIENT is None:
+        _BLOB_SERVICE_CLIENT = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
+        container_client = _BLOB_SERVICE_CLIENT.get_container_client(AZURE_CONTAINER_NAME)
+        try:
+            container_client.create_container()
+        except ResourceExistsError:
+            pass
+    return _BLOB_SERVICE_CLIENT
+
+
+def _build_blob_name(filename: str) -> str:
+    safe_filename = secure_filename(filename) or f"image_{uuid.uuid4().hex}.jpg"
+    if AZURE_BLOB_PREFIX:
+        return f"{AZURE_BLOB_PREFIX}/{safe_filename}"
+    return safe_filename
+
+
+def _blob_path_from_name(blob_name: str) -> str:
+    return f"azure-blob://{AZURE_CONTAINER_NAME}/{blob_name}"
+
+
+def _blob_name_from_storage_path(storage_path: str) -> Optional[str]:
+    prefix = f"azure-blob://{AZURE_CONTAINER_NAME}/"
+    if storage_path.startswith(prefix):
+        return storage_path[len(prefix):]
+    return None
+
+
+def upload_bytes_to_blob(content: bytes, filename: str, content_type: str = "image/jpeg") -> str:
+    blob_service = get_blob_service_client()
+    if not blob_service:
+        raise RuntimeError("Azure Blob Storage is not configured")
+    blob_name = _build_blob_name(filename)
+    blob_client = blob_service.get_blob_client(container=AZURE_CONTAINER_NAME, blob=blob_name)
+    blob_client.upload_blob(content, overwrite=True, content_type=content_type)
+    return _blob_path_from_name(blob_name)
+
+
+def _store_image_bytes(content: bytes, filename: str, content_type: str = "image/jpeg") -> str:
+    safe_filename = secure_filename(filename) or f"image_{uuid.uuid4().hex}.jpg"
+    if is_azure_blob_enabled():
+        return upload_bytes_to_blob(content, safe_filename, content_type=content_type)
+    file_path = IMAGES_DIR / safe_filename
+    with open(file_path, "wb") as f:
+        f.write(content)
+    return str(file_path)
+
+
+def _store_pil_image(image: Image.Image, filename: str, *, format: str = "JPEG", quality: int = 95, content_type: str = "image/jpeg") -> str:
+    buffer = io.BytesIO()
+    image.save(buffer, format=format, quality=quality)
+    return _store_image_bytes(buffer.getvalue(), filename, content_type=content_type)
+
+
+def _read_image_bytes_from_storage_path(storage_path: str) -> Optional[bytes]:
+    blob_name = _blob_name_from_storage_path(storage_path)
+    if blob_name:
+        blob_service = get_blob_service_client()
+        if not blob_service:
+            return None
+        blob_client = blob_service.get_blob_client(container=AZURE_CONTAINER_NAME, blob=blob_name)
+        return blob_client.download_blob().readall()
+    normalized_path = storage_path.replace("\\", "/")
+    filename = Path(normalized_path).name
+    for file_path in [
+        Path(normalized_path),
+        BASE_DIR / normalized_path,
+        IMAGES_DIR / filename,
+        BASE_DIR / "output_v3" / "images" / filename,
+        BASE_DIR / "output_v4" / "images" / filename,
+    ]:
+        try:
+            if file_path.exists():
+                return file_path.read_bytes()
+        except Exception:
+            pass
+    return None
+
+
+def _load_pil_image_from_storage_path(storage_path: str) -> Optional[Image.Image]:
+    image_bytes = _read_image_bytes_from_storage_path(storage_path)
+    if not image_bytes:
+        return None
+    try:
+        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        return None
+
+
 # =============================================================================
 # SHARED HELPERS — DRY
 # =============================================================================
@@ -794,15 +909,7 @@ def get_first_image_for_material(matiere_id: int) -> Optional[Image.Image]:
             cur.execute("SELECT image_path FROM public.matiere_images WHERE matiere_id = %s LIMIT 1", (matiere_id,))
             result = cur.fetchone()
             if result and result.get("image_path"):
-                image_path = result["image_path"]
-                normalized_path = image_path.replace("\\", "/")
-                filename = Path(normalized_path).name
-                for file_path in [Path(normalized_path), BASE_DIR / normalized_path, IMAGES_DIR / filename, BASE_DIR / "output_v3" / "images" / filename]:
-                    if file_path.exists():
-                        try:
-                            return Image.open(file_path).convert("RGB")
-                        except Exception:
-                            pass
+                return _load_pil_image_from_storage_path(result["image_path"])
         return None
     except Exception as e:
         print(f"⚠️ Error retrieving image: {e}")
@@ -831,15 +938,7 @@ def get_all_images_for_material(matiere_id: int, limit: int = 2) -> List[Dict[st
                 magnification = note_json.get("magnification", "N/A") if isinstance(note_json, dict) else "N/A"
                 image_obj = None
                 if image_path:
-                    normalized_path = image_path.replace("\\", "/")
-                    filename = Path(normalized_path).name
-                    for file_path in [Path(normalized_path), BASE_DIR / normalized_path, IMAGES_DIR / filename, BASE_DIR / "output_v3" / "images" / filename]:
-                        try:
-                            if file_path.exists():
-                                image_obj = Image.open(file_path).convert("RGB")
-                                break
-                        except Exception:
-                            pass
+                    image_obj = _load_pil_image_from_storage_path(image_path)
                 images_data.append({"image_path": image_path, "magnification": magnification, "image_obj": image_obj})
             return images_data
     except Exception as e:
@@ -1029,9 +1128,9 @@ def propose_materials_from_uploaded_image():
 
     safe_name = secure_filename(file.filename) or "uploaded_image"
     image_filename = f"manual_{Path(safe_name).stem}_{int(time.time())}_{uuid.uuid4().hex}.jpg"
-    image_path = IMAGES_DIR / image_filename
+    image_path = None
     try:
-        image.save(image_path, format="JPEG", quality=95)
+        image_path = _store_pil_image(image, image_filename, format="JPEG", quality=95, content_type="image/jpeg")
     except Exception:
         # Non-blocking: even if saving fails, similarity search can still continue.
         image_path = None
@@ -1084,9 +1183,9 @@ def browser_search_materials():
 
     safe_name = secure_filename(file.filename) or "uploaded_image"
     image_filename = f"browser_{Path(safe_name).stem}_{int(time.time())}_{uuid.uuid4().hex}.jpg"
-    image_path = IMAGES_DIR / image_filename
+    image_path = None
     try:
-        image.save(image_path, format="JPEG", quality=95)
+        image_path = _store_pil_image(image, image_filename, format="JPEG", quality=95, content_type="image/jpeg")
     except Exception:
         image_path = None
 
@@ -1143,9 +1242,19 @@ def health():
 @app.route("/images/<path:filename>", methods=["GET"])
 def serve_image(filename):
     try:
-        return send_from_directory(str(IMAGES_DIR), filename)
+        local_path = IMAGES_DIR / filename
+        if local_path.exists():
+            return send_from_directory(str(IMAGES_DIR), filename)
+        if is_azure_blob_enabled():
+            blob_name = _build_blob_name(filename)
+            blob_service = get_blob_service_client()
+            blob_client = blob_service.get_blob_client(container=AZURE_CONTAINER_NAME, blob=blob_name)
+            if blob_client.exists():
+                image_bytes = blob_client.download_blob().readall()
+                return send_file(io.BytesIO(image_bytes), download_name=filename)
     except Exception:
-        return jsonify({"error": "not_found"}), 404
+        pass
+    return jsonify({"error": "not_found"}), 404
 
 
 @app.route("/temp_files/<path:filename>", methods=["GET"])
@@ -1311,8 +1420,7 @@ def upload_and_search():
         safe_name = secure_filename(original_name) or "uploaded_image"
         image_stem = Path(safe_name).stem or "uploaded_image"
         image_filename = f"{image_stem}_{int(time.time())}_{uuid.uuid4().hex}.jpg"
-        image_path = IMAGES_DIR / image_filename
-        img.save(image_path, format="JPEG", quality=95)
+        image_path = _store_pil_image(img, image_filename, format="JPEG", quality=95, content_type="image/jpeg")
 
         query_embedding = compute_embedding_from_pil(img)
         if scope == "auto":
@@ -1626,15 +1734,7 @@ RÈGLES GÉNÉRALES: Aucune hallucination — utiliser UNIQUEMENT les données J
                 if not image_path:
                     continue
                 normalized = image_path.replace("\\\\", "/")
-                fname = Path(normalized).name
-                img_obj = None
-                for fpath in [Path(normalized), BASE_DIR / normalized, IMAGES_DIR / fname, BASE_DIR / "output_v3" / "images" / fname, BASE_DIR / "output_v4" / "images" / fname]:
-                    try:
-                        if fpath.exists():
-                            img_obj = Image.open(fpath).convert("RGB")
-                            break
-                    except Exception:
-                        pass
+                img_obj = _load_pil_image_from_storage_path(normalized)
                 if img_obj:
                     img_stream = io.BytesIO()
                     img_obj.save(img_stream, format="PNG")
@@ -3201,10 +3301,8 @@ def upload_nuance_image():
     try:
         filename_safe = secure_filename(file.filename)
         unique_filename = f"nuance_{nuance_id}_{uuid.uuid4().hex}_{filename_safe}"
-        file_path = IMAGES_DIR / unique_filename
         file_bytes = file.read()
-        with open(file_path, "wb") as f:
-            f.write(file_bytes)
+        file_path = _store_image_bytes(file_bytes, unique_filename, content_type=file.mimetype or "application/octet-stream")
         img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
         embedding = compute_embedding_from_pil(img)
         conn = get_db_conn()

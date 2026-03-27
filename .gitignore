@@ -1,35 +1,4 @@
-# Virtual Environment
-.venv/
-venv/
-env/
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-
-# Environment
 .env
-.env.local
-
-# Temporary files
-temp_uploads/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Database
-*.db
-*.sqlite
-
-# Logs
-*.log
+embeddings_v7/images/
+output_v3/images/
+output_v4/images/

@@ -21,4 +21,5 @@ groq
 python-docx
 xlrd
 openpyxl
+azure-storage-blob
 
