@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Materials Discovery Workbench</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='materials_intelligence_ui.css') }}" />
+</head>
+<body data-search-endpoint="{{ url_for('browser_search_materials') }}">
+  <div class="page-shell">
+    <header class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Micrograph Search</p>
+        <h1>Find the closest materials from a browser upload.</h1>
+        <p class="hero-text">
+          Upload a micrograph image directly from the browser. The interface runs similarity search against the material image base
+          without relying on <code>openaiFileIdRefs</code>, then lets you inspect the strongest candidates in detail.
+        </p>
+      </div>
+      <div class="hero-badge">
+        <span>Browser-native</span>
+        <span>Top matches</span>
+        <span>Detail-on-click</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="panel control-panel">
+        <div class="panel-header">
+          <p class="panel-kicker">Input</p>
+          <h2>Query Image</h2>
+        </div>
+
+        <form id="searchForm" class="search-form" novalidate>
+          <input id="imageInput" name="image" type="file" accept=".png,.jpg,.jpeg,.webp" hidden />
+
+          <button id="dropzone" class="dropzone" type="button">
+            <span class="dropzone-title">Drop a micrograph here</span>
+            <span class="dropzone-subtitle">or click to browse PNG, JPG, JPEG, WEBP</span>
+          </button>
+
+          <div class="preview-card">
+            <img id="previewImage" alt="Selected micrograph preview" />
+            <div class="preview-meta">
+              <p id="previewName">No file selected</p>
+              <p id="previewHint">The uploaded image stays in-browser until you run the search.</p>
+            </div>
+          </div>
+
+          <label class="field">
+            <span class="field-label">Result window</span>
+            <div class="range-wrap">
+              <input id="topK" name="top_k" type="range" min="3" max="15" value="8" />
+              <span id="topKValue" class="range-value">8</span>
+            </div>
+            <span class="field-help">More results widen the candidate set, but reduce focus.</span>
+          </label>
+
+          <button id="submitBtn" class="primary-btn" type="submit">Search Material Base</button>
+        </form>
+
+        <div class="tips-card">
+          <p class="tips-title">Search advice</p>
+          <ul class="tips-list">
+            <li>Use a clean micrograph crop with the target structure centered.</li>
+            <li>If the top scores are close, compare the first three materials before deciding.</li>
+            <li>Open the detail panel to inspect fiches, specifications, and expert-note volume.</li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="panel results-panel">
+        <div class="panel-header">
+          <p class="panel-kicker">Output</p>
+          <h2>Proposed Materials</h2>
+        </div>
+
+        <div id="statusBar" class="status-bar">Waiting for an image.</div>
+
+        <div id="summaryGrid" class="summary-grid">
+          <article class="metric-card">
+            <span class="metric-label">Matches</span>
+            <strong id="metricCount">0</strong>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Best score</span>
+            <strong id="metricBest">-</strong>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Average</span>
+            <strong id="metricAverage">-</strong>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Signal</span>
+            <strong id="metricSignal">-</strong>
+          </article>
+        </div>
+
+        <div id="searchNarrative" class="narrative-card">
+          Upload an image to generate ranked candidates and an interpretation of the score spread.
+        </div>
+
+        <div id="querySnapshot" class="query-snapshot query-snapshot-empty">
+          <div class="query-copy">
+            <p class="query-label">Query snapshot</p>
+            <p class="query-title">No search executed yet.</p>
+            <p class="query-text">The uploaded image and best-match summary will appear here after search.</p>
+          </div>
+        </div>
+
+        <div id="resultsList" class="results-list"></div>
+      </section>
+
+      <aside class="panel details-panel">
+        <div class="panel-header">
+          <p class="panel-kicker">Inspection</p>
+          <h2>Material Detail</h2>
+        </div>
+        <div id="detailsContent" class="details-content empty-state">
+          Select a proposed material to inspect its database record, fiches, specifications, and expert notes.
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <script src="{{ url_for('static', filename='materials_intelligence_ui.js') }}" defer></script>
+</body>
+</html>
