@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from threading import Thread
 from typing import Optional, List, Dict, Any
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 import re
 import logging
 from dotenv import load_dotenv
@@ -173,6 +173,41 @@ def compute_embedding_from_pil(image: Image.Image) -> np.ndarray:
         outputs = DINO_MODEL(**inputs)
         embedding = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
     return embedding.astype("float32")
+
+
+def _normalize_embedding(embedding: np.ndarray) -> np.ndarray:
+    embedding = np.asarray(embedding, dtype=np.float32).ravel()
+    norm = float(np.linalg.norm(embedding))
+    if norm <= 0:
+        return embedding
+    return (embedding / norm).astype("float32")
+
+
+def _generate_query_views(image: Image.Image) -> List[Image.Image]:
+    image = image.convert("RGB")
+    width, height = image.size
+    views: List[Image.Image] = [image]
+
+    crop_ratios = [0.92, 0.8, 0.66]
+    seen = {(width, height, 0, 0)}
+    for ratio in crop_ratios:
+        crop_w = max(32, int(width * ratio))
+        crop_h = max(32, int(height * ratio))
+        left = max(0, (width - crop_w) // 2)
+        top = max(0, (height - crop_h) // 2)
+        key = (crop_w, crop_h, left, top)
+        if key in seen:
+            continue
+        seen.add(key)
+        views.append(image.crop((left, top, left + crop_w, top + crop_h)))
+
+    return views
+
+
+def compute_query_embedding_from_pil(image: Image.Image) -> np.ndarray:
+    view_embeddings = [_normalize_embedding(compute_embedding_from_pil(view)) for view in _generate_query_views(image)]
+    averaged = np.mean(np.stack(view_embeddings, axis=0), axis=0)
+    return _normalize_embedding(averaged)
 
 
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp"}
@@ -391,6 +426,84 @@ def _format_material_browser_results(rows: List[Dict[str, Any]]) -> List[Dict[st
     return formatted
 
 
+def _format_combined_browser_results(material_rows: List[Dict[str, Any]], nuance_rows: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+    combined = []
+
+    for row in material_rows:
+        similarity = float(row["similarity"]) if row["similarity"] is not None else None
+        similarity_pct = round(max(0.0, min(1.0, similarity)) * 100, 2) if similarity is not None else None
+        combined.append({
+            "domain": "matiere",
+            "id": row["id"],
+            "matiere_id": row["matiere_id"],
+            "nuance_id": None,
+            "material_name": row["nom_matiere"],
+            "display_name": row["nom_matiere"],
+            "reference": row["reference"],
+            "type_matiere": row.get("type_matiere"),
+            "similarity": similarity,
+            "similarity_pct": similarity_pct,
+            "image_url": build_image_url(row["image_path"]),
+            "detail_url": url_for("get_material_details", matiere_id=row["matiere_id"]),
+            "adn_url": url_for("get_fiche_adn", matiere_id=row["matiere_id"]),
+        })
+
+    for row in nuance_rows:
+        similarity = float(row["similarity"]) if row["similarity"] is not None else None
+        similarity_pct = round(max(0.0, min(1.0, similarity)) * 100, 2) if similarity is not None else None
+        combined.append({
+            "domain": "nuance",
+            "id": row["id"],
+            "matiere_id": None,
+            "nuance_id": row["nuance_id"],
+            "material_name": row["nuance_name"],
+            "display_name": row["nuance_name"],
+            "reference": row["reference"],
+            "type_matiere": "Nuance",
+            "similarity": similarity,
+            "similarity_pct": similarity_pct,
+            "image_url": build_image_url(row["image_path"]),
+            "detail_url": url_for("get_nuance_details", nuance_id=row["nuance_id"]),
+            "adn_url": url_for("get_nuance_adn", nuance_id=row["nuance_id"], level="combined"),
+        })
+
+    combined.sort(key=lambda item: item["similarity"] if item["similarity"] is not None else float("-inf"), reverse=True)
+    return [
+        {
+            **item,
+            "rank": idx,
+        }
+        for idx, item in enumerate(combined[:top_k], start=1)
+    ]
+
+
+def _format_global_browser_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    formatted = []
+    for idx, row in enumerate(rows, start=1):
+        similarity = float(row["similarity"]) if row["similarity"] is not None else None
+        similarity_pct = round(max(0.0, min(1.0, similarity)) * 100, 2) if similarity is not None else None
+        domain = row.get("domain")
+        matiere_id = row.get("matiere_id")
+        nuance_id = row.get("nuance_id")
+        formatted.append({
+            "rank": idx,
+            "domain": domain,
+            "id": row["id"],
+            "matiere_id": matiere_id,
+            "nuance_id": nuance_id,
+            "material_name": row["display_name"],
+            "display_name": row["display_name"],
+            "reference": row["reference"],
+            "type_matiere": row.get("type_matiere"),
+            "similarity": similarity,
+            "similarity_pct": similarity_pct,
+            "image_url": build_image_url(row["image_path"]),
+            "detail_url": url_for("get_nuance_details", nuance_id=nuance_id) if domain == "nuance" else url_for("get_material_details", matiere_id=matiere_id),
+            "adn_url": url_for("get_nuance_adn", nuance_id=nuance_id, level="combined") if domain == "nuance" else url_for("get_fiche_adn", matiere_id=matiere_id),
+        })
+    return formatted
+
+
 def _format_nuance_search_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [
         {
@@ -507,6 +620,53 @@ def search_similar_in_db(query_embedding: np.ndarray, top_k: int = 5) -> List[Di
         conn.close()
 
 
+def search_similar_globally_in_db(query_embedding: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
+    query_vec = _embedding_to_pgvector_text(query_embedding)
+    sql = """
+        SELECT *
+        FROM (
+            SELECT
+                'matiere'::text AS domain,
+                mi.id,
+                mi.image_path,
+                mi.matiere_id,
+                NULL::integer AS nuance_id,
+                m.nom_matiere AS display_name,
+                m.reference,
+                m.type_matiere,
+                (1 - (mi.embedding <=> %(query_vec)s::vector)) AS similarity,
+                (mi.embedding <=> %(query_vec)s::vector) AS distance
+            FROM public.matiere_images mi
+            JOIN public.matieres m ON m.matiere_id = mi.matiere_id
+
+            UNION ALL
+
+            SELECT
+                'nuance'::text AS domain,
+                ni.id,
+                ni.image_path,
+                NULL::integer AS matiere_id,
+                ni.nuance_id,
+                n.name AS display_name,
+                n.reference,
+                'Nuance'::text AS type_matiere,
+                (1 - (ni.embedding <=> %(query_vec)s::vector)) AS similarity,
+                (ni.embedding <=> %(query_vec)s::vector) AS distance
+            FROM public.nuance_images ni
+            JOIN public.nuances n ON n.id = ni.nuance_id
+        ) combined
+        ORDER BY distance ASC
+        LIMIT %(top_k)s;
+    """
+    conn = get_db_conn()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, {"query_vec": query_vec, "top_k": top_k})
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def _request_external_base_url() -> str:
     """Return the external base URL, honoring Azure reverse-proxy headers."""
     host = request.headers.get("X-Forwarded-Host") or request.host or os.getenv("API_HOST", "localhost:5000")
@@ -517,9 +677,12 @@ def _request_external_base_url() -> str:
 
 
 def build_image_url(image_path: str) -> str:
-    filename = Path(image_path).name
     base = _request_external_base_url()
-    return f"{base}/images/{secure_filename(filename)}"
+    blob_name = _blob_name_from_storage_path(str(image_path))
+    if blob_name:
+        return f"{base}/images/{quote(blob_name, safe='/')}"
+    normalized_path = str(image_path).replace("\\", "/")
+    return f"{base}/images/{quote(normalized_path, safe='/')}"
 
 
 def is_azure_blob_enabled() -> bool:
@@ -1136,15 +1299,15 @@ def propose_materials_from_uploaded_image():
         image_path = None
 
     try:
-        query_embedding = compute_embedding_from_pil(image)
-        rows = search_similar_in_db(query_embedding, top_k=top_k)
-        results = _format_material_search_results(rows)
+        query_embedding = compute_query_embedding_from_pil(image)
+        rows = search_similar_globally_in_db(query_embedding, top_k=top_k)
+        results = _format_global_browser_results(rows)
         return jsonify({
             "success": True,
             "top_k": top_k,
             "results": results,
             "uploaded_image_url": build_image_url(str(image_path)) if image_path else None,
-            "source": "multipart_upload_no_openai",
+            "source": "multipart_upload_combined_search",
         }), 200
     except Exception as e:
         logging.error(f"propose_materials_from_uploaded_image failed: {e}", exc_info=True)
@@ -1153,9 +1316,11 @@ def propose_materials_from_uploaded_image():
 
 @app.route("/api/materials/browser-search", methods=["POST"])
 def browser_search_materials():
-    """Browser-native material search using multipart upload instead of OpenAI refs."""
+    """Browser-native combined search across material and nuance image bases."""
     try:
-        top_k = _parse_top_k(request.form.get("top_k", 8))
+        top_k = 1
+        if request.form.get("top_k"):
+            top_k = _parse_top_k(request.form.get("top_k", 1))
     except ValueError:
         return jsonify({"success": False, "error": "invalid_top_k"}), 400
 
@@ -1190,16 +1355,16 @@ def browser_search_materials():
         image_path = None
 
     try:
-        query_embedding = compute_embedding_from_pil(image)
-        rows = search_similar_in_db(query_embedding, top_k=top_k)
-        results = _format_material_browser_results(rows)
+        query_embedding = compute_query_embedding_from_pil(image)
+        rows = search_similar_globally_in_db(query_embedding, top_k=top_k)
+        results = _format_global_browser_results(rows)
         similarities = [item["similarity"] for item in results if item.get("similarity") is not None]
         best_match = results[0] if results else None
         runner_up = results[1] if len(results) > 1 else None
 
         return jsonify({
             "success": True,
-            "endpoint": "browser_material_search",
+            "endpoint": "browser_combined_search",
             "query": {
                 "filename": safe_name,
                 "top_k": top_k,
@@ -1242,16 +1407,31 @@ def health():
 @app.route("/images/<path:filename>", methods=["GET"])
 def serve_image(filename):
     try:
-        local_path = IMAGES_DIR / filename
+        requested_path = unquote(filename).replace("\\", "/")
+        local_path = Path(IMAGES_DIR / requested_path)
         if local_path.exists():
-            return send_from_directory(str(IMAGES_DIR), filename)
+            return send_from_directory(str(IMAGES_DIR), requested_path)
         if is_azure_blob_enabled():
-            blob_name = _build_blob_name(filename)
             blob_service = get_blob_service_client()
-            blob_client = blob_service.get_blob_client(container=AZURE_CONTAINER_NAME, blob=blob_name)
-            if blob_client.exists():
-                image_bytes = blob_client.download_blob().readall()
-                return send_file(io.BytesIO(image_bytes), download_name=filename)
+            candidate_blob_names = []
+
+            if requested_path.startswith("azure-blob://"):
+                storage_blob_name = _blob_name_from_storage_path(requested_path)
+                if storage_blob_name:
+                    candidate_blob_names.append(storage_blob_name)
+            else:
+                candidate_blob_names.append(requested_path)
+                candidate_blob_names.append(_build_blob_name(Path(requested_path).name))
+
+            seen = set()
+            for blob_name in candidate_blob_names:
+                if not blob_name or blob_name in seen:
+                    continue
+                seen.add(blob_name)
+                blob_client = blob_service.get_blob_client(container=AZURE_CONTAINER_NAME, blob=blob_name)
+                if blob_client.exists():
+                    image_bytes = blob_client.download_blob().readall()
+                    return send_file(io.BytesIO(image_bytes), download_name=Path(blob_name).name)
     except Exception:
         pass
     return jsonify({"error": "not_found"}), 404
@@ -4593,6 +4773,7 @@ def search_image_unified():
 #
 # This ensures temp images (uploaded by GPT) are deleted after 15 minutes
 # while docx files in DOCX_TEMP_DIR retain their existing 1-hour TTL.
+
 # =============================================================================
 # =============================================================================
 # MAIN
