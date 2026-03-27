@@ -18,9 +18,13 @@
     resultReference: document.getElementById("resultReference"),
     resultName:    document.getElementById("resultName"),
     adnButton:     document.getElementById("adnButton"),
+    cancelAdnButton: document.getElementById("cancelAdnButton"),
+    downloadPanel: document.getElementById("downloadPanel"),
+    downloadLink:  document.getElementById("downloadLink"),
   };
 
   let previewUrl = null;
+  let adnAbortController = null;
 
   // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -49,6 +53,9 @@
     elements.emptyState.hidden = false;
     elements.emptyState.textContent = "Upload an image to see the closest reference and name.";
     elements.adnButton.setAttribute("href", "#");
+    elements.downloadPanel.hidden = true;
+    elements.downloadLink.setAttribute("href", "#");
+    elements.cancelAdnButton.hidden = true;
   }
 
   function renderPreview(file) {
@@ -74,6 +81,8 @@
     elements.adnButton.href = match.adn_url || "#";
     elements.resultCard.hidden  = false;
     elements.emptyState.hidden  = true;
+    elements.downloadPanel.hidden = true;
+    elements.downloadLink.setAttribute("href", "#");
   }
 
   async function handleAdnClick(event) {
@@ -82,26 +91,44 @@
     if (!targetUrl || targetUrl === "#") return;
 
     const previousLabel = elements.adnButton.textContent;
+    adnAbortController = new AbortController();
     elements.adnButton.textContent = "Generating ADN...";
     elements.adnButton.style.pointerEvents = "none";
+    elements.cancelAdnButton.hidden = false;
+    elements.downloadPanel.hidden = true;
     setStatus("Generating ADN docx with GPT-4o...", null);
 
     try {
       const response = await fetch(targetUrl, {
         method: "GET",
         headers: { Accept: "application/json" },
+        signal: adnAbortController.signal,
       });
       const payload = await response.json();
       if (!response.ok || !payload.success || !payload.absolute_url) {
         throw new Error(payload.error || payload.message || "ADN generation failed");
       }
+      elements.downloadLink.href = payload.absolute_url;
+      elements.downloadPanel.hidden = false;
       window.open(payload.absolute_url, "_blank", "noopener,noreferrer");
       setStatus("ADN docx generated.", "success");
     } catch (error) {
-      setStatus(error.message || String(error), "error");
+      if (error.name === "AbortError") {
+        setStatus("ADN generation cancelled.", "warning");
+      } else {
+        setStatus(error.message || String(error), "error");
+      }
     } finally {
+      adnAbortController = null;
       elements.adnButton.textContent = previousLabel;
       elements.adnButton.style.pointerEvents = "";
+      elements.cancelAdnButton.hidden = true;
+    }
+  }
+
+  function handleCancelAdn() {
+    if (adnAbortController) {
+      adnAbortController.abort();
     }
   }
 
@@ -215,6 +242,7 @@
 
   elements.form.addEventListener("submit", submitSearch);
   elements.adnButton.addEventListener("click", handleAdnClick);
+  elements.cancelAdnButton.addEventListener("click", handleCancelAdn);
   attachDropzoneHandlers();
   resetResult();
 })();

@@ -91,8 +91,8 @@ openai_api_key = HARDCODED_OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 
 GROQ_API_KEYS = [
-    "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",
-    "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",
+    "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",
+    "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",
 ]
 
 current_groq_key_index = 0
