@@ -2041,7 +2041,7 @@ def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name,
     revision_history = bm_row["document_revision_history"] if bm_row and bm_row["document_revision_history"] else None
     cur.execute("""
         SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit, c.metadata,
-               c.matiere_id, c.sub_black_mix_id, c.sub_nuance_id,
+               c.matiere_id, c.sub_black_mix_id,
                m.reference AS matiere_reference, m.nom_matiere AS matiere_name,
                bm.reference AS sub_bm_reference, bm.name AS sub_bm_name
         FROM public.black_mix_components c
@@ -2062,15 +2062,18 @@ def build_black_mix_adn_snapshot(cur, black_mix_id, product_reference, mix_name,
     process_steps = []
     for s in steps_raw:
         cur.execute("""
-            SELECT sm.matiere_id, sm.sub_black_mix_id, sm.sub_nuance_id,
-                   m.reference AS matiere_ref, bm.reference AS sub_bm_ref, sn.reference AS sub_nuance_ref
+            SELECT sm.matiere_id, sm.sub_black_mix_id,
+                   m.reference AS matiere_ref, bm.reference AS sub_bm_ref
             FROM public.black_mix_step_materials sm
             LEFT JOIN public.matieres    m  ON m.matiere_id = sm.matiere_id
             LEFT JOIN public.black_mixes bm ON bm.id        = sm.sub_black_mix_id
-            LEFT JOIN public.nuances     sn ON sn.id        = sm.sub_nuance_id
             WHERE sm.process_step_id = %s
         """, (s["id"],))
-        step_mat_refs = [sm["sub_bm_ref"] if sm["sub_black_mix_id"] is not None else sm["matiere_ref"] for sm in cur.fetchall() if (sm["sub_bm_ref"] if sm["sub_black_mix_id"] is not None else sm["matiere_ref"])]
+        step_mat_refs = [
+            sm["sub_bm_ref"] if sm["sub_black_mix_id"] is not None else sm["matiere_ref"]
+            for sm in cur.fetchall()
+            if (sm["sub_bm_ref"] if sm["sub_black_mix_id"] is not None else sm["matiere_ref"])
+        ]
         process_steps.append({"step_order": s["step_order"], "step_name": s["step_name"], "machine": s["machine_name"], "parameters": s["parameters"], "materials": step_mat_refs})
     cur.execute("SELECT parameter_name, target_value, min_value, max_value, unit, sheet_data FROM public.black_mix_control_plan WHERE black_mix_id = %s ORDER BY parameter_name", (black_mix_id,))
     control_plan = [{"parameter_name": r["parameter_name"], "target_value": float(r["target_value"]) if r["target_value"] is not None else None, "min_value": float(r["min_value"]) if r["min_value"] is not None else None, "max_value": float(r["max_value"]) if r["max_value"] is not None else None, "unit": r["unit"], "sheet_data": r["sheet_data"]} for r in cur.fetchall()]
@@ -2212,7 +2215,7 @@ def get_black_mix_details(mix_id):
             result = {"id": row[0], "product_reference": row[1], "mix_name": row[2], "status": row[3], "created_at": row[4].isoformat() if row[4] else None, "document_revision_history": row[5]}
             cur.execute("""
                 SELECT c.id, c.component_name, c.quantity_value, c.quantity_unit, c.metadata,
-                       c.matiere_id, c.sub_black_mix_id, c.sub_nuance_id,
+                       c.matiere_id, c.sub_black_mix_id,
                        m.reference AS matiere_reference, m.nom_matiere AS matiere_name,
                        bm.reference AS sub_bm_reference, bm.name AS sub_bm_name
                 FROM public.black_mix_components c
@@ -2222,8 +2225,8 @@ def get_black_mix_details(mix_id):
             """, (mix_id,))
             result["components"] = []
             for r in cur.fetchall():
-                is_sub = r[5] is not None
-                result["components"].append({"id": r[0], "component_name": r[1], "quantity": float(r[2]) if r[2] is not None else None, "unit": r[3], "is_sub_black_mix": is_sub, "reference": r[9] if is_sub else r[7], "material_name": r[10] if is_sub else r[8], "matiere_id": r[4], "sub_black_mix_id": r[5], "metadata": r[6]})
+                is_sub = r[6] is not None
+                result["components"].append({"id": r[0], "component_name": r[1], "quantity": float(r[2]) if r[2] is not None else None, "unit": r[3], "is_sub_black_mix": is_sub, "reference": r[9] if is_sub else r[7], "material_name": r[10] if is_sub else r[8], "matiere_id": r[5], "sub_black_mix_id": r[6], "metadata": r[4]})
             cur.execute("""
                 SELECT s.id, s.step_order, s.step_name, s.machine_name, s.parameters,
                        ARRAY_AGG(COALESCE(bm.reference, m.reference) ORDER BY COALESCE(bm.reference, m.reference)) AS materials
