@@ -499,7 +499,7 @@ def _format_global_browser_results(rows: List[Dict[str, Any]]) -> List[Dict[str,
             "similarity_pct": similarity_pct,
             "image_url": build_image_url(row["image_path"]),
             "detail_url": url_for("get_nuance_details", nuance_id=nuance_id) if domain == "nuance" else url_for("get_material_details", matiere_id=matiere_id),
-            "adn_url": url_for("get_nuance_adn", nuance_id=nuance_id, level="combined") if domain == "nuance" else url_for("get_fiche_adn", matiere_id=matiere_id),
+            "adn_url": url_for("generate_match_adn_docx", domain=domain, match_id=nuance_id if domain == "nuance" else matiere_id, reference=row["reference"]),
         })
     return formatted
 
@@ -985,6 +985,111 @@ OUTPUT FORMAT: Use Markdown with tables, bullet lists, **bold** for keywords. AL
     except Exception as e:
         print(f"❌ Groq generation failed: {e}")
         raise e
+
+
+def generate_fiche_adn_content_with_openai(fiche_data, material_name, reference, type_matiere, specifications):
+    if not client:
+        raise Exception("OpenAI client not initialized - set OPENAI_API_KEY")
+    if isinstance(specifications, str):
+        try:
+            specifications = json.loads(specifications)
+        except Exception:
+            specifications = {}
+    if not isinstance(specifications, dict):
+        specifications = {}
+    prompt_data = {
+        "material": {
+            "nom_matiere": material_name,
+            "reference": reference,
+            "type_matiere": type_matiere,
+        },
+        "fiche_adn": fiche_data,
+        "source_data": specifications,
+    }
+    prompt = f"""You are a senior industrial materials engineer.
+Generate a structured MATERIAL ADN report in professional English using ONLY the JSON source data below.
+Do not invent missing values. If data is missing, explicitly write "Not available".
+
+Return Markdown only, with this exact structure:
+# MATERIAL ADN REPORT
+## 1. Material Identity
+## 2. Executive Summary
+## 3. General Characteristics
+## 4. Chemical and Composition Profile
+## 5. Physical and Process-Relevant Properties
+## 6. Quality Control and Specifications
+## 7. Expert Notes and Observations
+## 8. Operational Guidance
+## 9. Risks, Stability, and Handling
+## 10. Final Technical Assessment
+
+Use Markdown tables when they improve readability.
+
+SOURCE JSON:
+{json.dumps(prompt_data, ensure_ascii=False, default=str, indent=2)}"""
+    response = call_openai(
+        messages=[
+            {"role": "system", "content": "You generate rigorous technical ADN documents from structured source data."},
+            {"role": "user", "content": prompt},
+        ],
+        model="gpt-4o",
+        temperature=0.2,
+        max_tokens=6000,
+    )
+    content = response.choices[0].message.content if response.choices else ""
+    if not content or len(content.strip()) < 100:
+        raise Exception("OpenAI returned insufficient content for material ADN generation")
+    return content
+
+
+def generate_nuance_adn_content_with_openai(nuance, snapshot):
+    if not client:
+        raise Exception("OpenAI client not initialized - set OPENAI_API_KEY")
+    prompt_data = {
+        "nuance_identity": {
+            "id": nuance.get("id"),
+            "reference": nuance.get("reference"),
+            "name": nuance.get("name"),
+            "status": nuance.get("status"),
+            "created_at": nuance.get("created_at"),
+            "document_revision_history": nuance.get("document_revision_history"),
+        },
+        "snapshot": serialize_to_json_compatible(snapshot),
+    }
+    prompt = f"""You are a senior industrial carbon and graphite manufacturing engineer.
+Generate a structured NUANCE ADN report in professional English using ONLY the JSON source data below.
+Do not invent missing values. If data is missing, explicitly write "Not available".
+
+Return Markdown only, with this exact structure:
+# NUANCE ADN REPORT
+## 1. Nuance Identity
+## 2. Executive Summary
+## 3. Thermal Program and Processing Context
+## 4. Composition and Component ADN
+## 5. Manufacturing Process Flow
+## 6. Control Plan and Measured Results
+## 7. Revision and Traceability Notes
+## 8. Structural Interpretation
+## 9. Technical Risks and Attention Points
+## 10. Final Technical Assessment
+
+Use Markdown tables when they improve readability.
+
+SOURCE JSON:
+{json.dumps(prompt_data, ensure_ascii=False, default=str, indent=2)}"""
+    response = call_openai(
+        messages=[
+            {"role": "system", "content": "You generate rigorous technical ADN documents from structured source data."},
+            {"role": "user", "content": prompt},
+        ],
+        model="gpt-4o",
+        temperature=0.2,
+        max_tokens=7000,
+    )
+    content = response.choices[0].message.content if response.choices else ""
+    if not content or len(content.strip()) < 100:
+        raise Exception("OpenAI returned insufficient content for nuance ADN generation")
+    return content
 
 
 def add_formatted_markdown_to_docx(doc: Document, markdown_text):
@@ -1725,7 +1830,7 @@ def generate_fiche_adn_docx():
                     specifications = {}
             if not isinstance(specifications, dict):
                 specifications = {}
-        content = generate_fiche_adn_content_with_groq(result_dict, material_name, reference, type_matiere, specifications)
+        content = generate_fiche_adn_content_with_openai(result_dict, material_name, reference, type_matiere, specifications)
         doc = Document()
         title = doc.add_heading(f"MATERIAL DNA SHEET - {material_name}", level=1)
         title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -1789,6 +1894,102 @@ def download_fiche_adn_docx(filename):
 # =============================================================================
 # DOCX GENERATION — BLACK MIX
 # =============================================================================
+
+@app.route("/generate_match_adn_docx", methods=["GET"])
+def generate_match_adn_docx():
+    domain = (request.args.get("domain") or "").strip().lower()
+    match_id = (request.args.get("match_id") or "").strip()
+    reference = (request.args.get("reference") or "").strip()
+    if domain not in {"matiere", "nuance"}:
+        return jsonify({"success": False, "error": "invalid_domain"}), 400
+    if not client:
+        return jsonify({"success": False, "error": "openai_not_configured", "message": "Set OPENAI_API_KEY to generate ADN docx."}), 500
+
+    conn = None
+    try:
+        conn = get_db_conn()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if domain == "matiere":
+                fiche = _get_fiche_adn(cur, reference=reference, matiere_id=int(match_id) if match_id else None)
+                if not fiche:
+                    return jsonify({"success": False, "error": "fiche_adn_not_found"}), 404
+                matiere_id = fiche.get("matiere_id")
+                material_name = fiche.get("nom_matiere") or "Unknown material"
+                reference_value = fiche.get("reference") or reference
+                type_matiere = fiche.get("type_matiere") or "N/A"
+                specifications = fiche.get("specifications") or {}
+                content = generate_fiche_adn_content_with_openai(fiche, material_name, reference_value, type_matiere, specifications)
+
+                doc = Document()
+                title = doc.add_heading(f"MATERIAL ADN REPORT - {material_name}", level=1)
+                title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                info = doc.add_paragraph()
+                info.add_run(f"Reference: {reference_value}\n").bold = True
+                info.add_run(f"Type: {type_matiere}\n")
+                info.add_run(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+                doc.add_paragraph()
+                add_formatted_markdown_to_docx(doc, content)
+
+                images = get_all_images_for_material(matiere_id, limit=6) if matiere_id else []
+                for img_data in images[:3]:
+                    if not img_data.get("image_obj"):
+                        continue
+                    img_stream = io.BytesIO()
+                    img_data["image_obj"].save(img_stream, format="PNG")
+                    img_stream.seek(0)
+                    try:
+                        doc.add_picture(img_stream, width=Inches(5))
+                        doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    except Exception:
+                        pass
+                    doc.add_paragraph()
+
+                filename, download_url, absolute_url = _save_docx_and_build_url(doc, "ADN_Material_OpenAI", reference_value or "material")
+                return jsonify({"success": True, "file_name": filename, "download_url": download_url, "absolute_url": absolute_url, "expires_in": "1 hour"}), 200
+
+            cur.execute("SELECT id, reference, name, status, created_at, document_revision_history FROM public.nuances WHERE id = %s", (int(match_id),))
+            nuance = cur.fetchone()
+            if not nuance:
+                return jsonify({"success": False, "error": "nuance_not_found"}), 404
+            snapshot = build_nuance_adn_snapshot(cur, nuance["id"], nuance["reference"], nuance["name"])
+            snapshot = serialize_to_json_compatible(snapshot)
+            content = generate_nuance_adn_content_with_openai(nuance, snapshot)
+
+            doc = Document()
+            title = doc.add_heading(f"NUANCE ADN REPORT - {nuance['name']}", level=1)
+            title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            info = doc.add_paragraph()
+            info.add_run(f"Reference: {nuance['reference']}\n").bold = True
+            info.add_run(f"Status: {nuance['status']}\n")
+            info.add_run(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+            doc.add_paragraph()
+            add_formatted_markdown_to_docx(doc, content)
+
+            for img_data in snapshot.get("images", [])[:3]:
+                image_path = img_data.get("image_path")
+                if not image_path:
+                    continue
+                img_obj = _load_pil_image_from_storage_path(str(image_path).replace("\\\\", "/"))
+                if not img_obj:
+                    continue
+                img_stream = io.BytesIO()
+                img_obj.save(img_stream, format="PNG")
+                img_stream.seek(0)
+                try:
+                    doc.add_picture(img_stream, width=Inches(5))
+                    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                except Exception:
+                    pass
+                doc.add_paragraph()
+
+            filename, download_url, absolute_url = _save_docx_and_build_url(doc, "ADN_Nuance_OpenAI", nuance["reference"] or "nuance")
+            return jsonify({"success": True, "file_name": filename, "download_url": download_url, "absolute_url": absolute_url, "expires_in": "1 hour"}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": "generation_failed", "message": str(e)}), 500
+    finally:
+        if conn:
+            conn.close()
+
 
 @app.route("/generate_black_mix_adn_docx", methods=["GET"])
 def generate_black_mix_adn_docx():

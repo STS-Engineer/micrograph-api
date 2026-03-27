@@ -76,6 +76,35 @@
     elements.emptyState.hidden  = true;
   }
 
+  async function handleAdnClick(event) {
+    event.preventDefault();
+    const targetUrl = elements.adnButton.getAttribute("href");
+    if (!targetUrl || targetUrl === "#") return;
+
+    const previousLabel = elements.adnButton.textContent;
+    elements.adnButton.textContent = "Generating ADN...";
+    elements.adnButton.style.pointerEvents = "none";
+    setStatus("Generating ADN docx with GPT-4o...", null);
+
+    try {
+      const response = await fetch(targetUrl, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.success || !payload.absolute_url) {
+        throw new Error(payload.error || payload.message || "ADN generation failed");
+      }
+      window.open(payload.absolute_url, "_blank", "noopener,noreferrer");
+      setStatus("ADN docx generated.", "success");
+    } catch (error) {
+      setStatus(error.message || String(error), "error");
+    } finally {
+      elements.adnButton.textContent = previousLabel;
+      elements.adnButton.style.pointerEvents = "";
+    }
+  }
+
   // ── Main search ────────────────────────────────────────────────────────────
 
   async function submitSearch(event) {
@@ -185,6 +214,7 @@
   });
 
   elements.form.addEventListener("submit", submitSearch);
+  elements.adnButton.addEventListener("click", handleAdnClick);
   attachDropzoneHandlers();
   resetResult();
 })();
