@@ -96,7 +96,7 @@
     elements.adnButton.style.pointerEvents = "none";
     elements.cancelAdnButton.hidden = false;
     elements.downloadPanel.hidden = true;
-    setStatus("Generating ADN docx with GPT-4o...", null);
+    setStatus("Generating ADN docx with Groq Llama...", null);
 
     try {
       const response = await fetch(targetUrl, {

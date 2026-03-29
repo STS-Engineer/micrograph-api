@@ -988,8 +988,8 @@ OUTPUT FORMAT: Use Markdown with tables, bullet lists, **bold** for keywords. AL
 
 
 def generate_fiche_adn_content_with_openai(fiche_data, material_name, reference, type_matiere, specifications):
-    if not client:
-        raise Exception("OpenAI client not initialized - set OPENAI_API_KEY")
+    if not groq_client:
+        raise Exception("Groq client not initialized - set GROQ_API_KEY or hardcoded keys")
     if isinstance(specifications, str):
         try:
             specifications = json.loads(specifications)
@@ -1027,24 +1027,24 @@ Use Markdown tables when they improve readability.
 
 SOURCE JSON:
 {json.dumps(prompt_data, ensure_ascii=False, default=str, indent=2)}"""
-    response = call_openai(
+    response = call_groq_with_retry(
         messages=[
             {"role": "system", "content": "You generate rigorous technical ADN documents from structured source data."},
             {"role": "user", "content": prompt},
         ],
-        model="gpt-4o",
+        model="llama-3.1-8b-instant",
         temperature=0.2,
-        max_tokens=6000,
+        max_tokens=5000,
     )
     content = response.choices[0].message.content if response.choices else ""
     if not content or len(content.strip()) < 100:
-        raise Exception("OpenAI returned insufficient content for material ADN generation")
+        raise Exception("Groq returned insufficient content for material ADN generation")
     return content
 
 
 def generate_nuance_adn_content_with_openai(nuance, snapshot):
-    if not client:
-        raise Exception("OpenAI client not initialized - set OPENAI_API_KEY")
+    if not groq_client:
+        raise Exception("Groq client not initialized - set GROQ_API_KEY or hardcoded keys")
     prompt_data = {
         "nuance_identity": {
             "id": nuance.get("id"),
@@ -1077,18 +1077,18 @@ Use Markdown tables when they improve readability.
 
 SOURCE JSON:
 {json.dumps(prompt_data, ensure_ascii=False, default=str, indent=2)}"""
-    response = call_openai(
+    response = call_groq_with_retry(
         messages=[
             {"role": "system", "content": "You generate rigorous technical ADN documents from structured source data."},
             {"role": "user", "content": prompt},
         ],
-        model="gpt-4o",
+        model="llama-3.1-8b-instant",
         temperature=0.2,
-        max_tokens=7000,
+        max_tokens=6000,
     )
     content = response.choices[0].message.content if response.choices else ""
     if not content or len(content.strip()) < 100:
-        raise Exception("OpenAI returned insufficient content for nuance ADN generation")
+        raise Exception("Groq returned insufficient content for nuance ADN generation")
     return content
 
 
@@ -1902,8 +1902,8 @@ def generate_match_adn_docx():
     reference = (request.args.get("reference") or "").strip()
     if domain not in {"matiere", "nuance"}:
         return jsonify({"success": False, "error": "invalid_domain"}), 400
-    if not client:
-        return jsonify({"success": False, "error": "openai_not_configured", "message": "Set OPENAI_API_KEY to generate ADN docx."}), 500
+    if not groq_client:
+        return jsonify({"success": False, "error": "groq_not_configured", "message": "Configure Groq to generate ADN docx."}), 500
 
     conn = None
     try:
@@ -3125,7 +3125,7 @@ def get_cuisson_program_by_number(cur, program_number: str):
     }
 
 
-def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _visited=None):
+def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _visited=None, include_nested_adn=True):
     """
     Recursively builds a fully enriched ADN snapshot for a nuance.
     Includes: cuisson program (with kontrolle), components, mishkarte, control plan, images.
@@ -3212,12 +3212,12 @@ def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _v
         else:
             comp_type, ref, name = "matiere",   matiere_ref,    matiere_name
         entry = {"id": comp_id, "component_name": component_name, "quantity": float(qty) if qty is not None else None, "unit": unit, "metadata": metadata, "component_type": comp_type, "reference": ref, "material_name": name, "matiere_id": matiere_id, "sub_black_mix_id": sub_bm_id, "sub_nuance_id": sub_nuance_id, "matiere_adn": None, "black_mix_adn": None, "sub_nuance_adn": None}
-        if comp_type == "matiere" and matiere_id:
+        if include_nested_adn and comp_type == "matiere" and matiere_id:
             entry["matiere_adn"] = get_matiere_full_adn(cur, matiere_id, ref)
-        elif comp_type == "black_mix" and sub_bm_id:
+        elif include_nested_adn and comp_type == "black_mix" and sub_bm_id:
             entry["black_mix_adn"] = build_black_mix_adn_snapshot(cur, sub_bm_id, sub_bm_ref, sub_bm_name, _visited=set(_visited))
-        elif comp_type == "nuance" and sub_nuance_id:
-            entry["sub_nuance_adn"] = build_nuance_adn_snapshot(cur, sub_nuance_id, sub_nuance_ref, sub_nuance_name, _visited=set(_visited))
+        elif include_nested_adn and comp_type == "nuance" and sub_nuance_id:
+            entry["sub_nuance_adn"] = build_nuance_adn_snapshot(cur, sub_nuance_id, sub_nuance_ref, sub_nuance_name, _visited=set(_visited), include_nested_adn=True)
         components.append(entry)
 
     # ── Process steps (mishkarte) ─────────────────────────────────────────────
@@ -3263,9 +3263,9 @@ def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _v
         flat = []
         for c in comp_list:
             flat.append({**c, "depth": depth, "matiere_adn": None, "black_mix_adn": None, "sub_nuance_adn": None})
-            if c["component_type"] == "nuance" and c["sub_nuance_adn"]:
+            if include_nested_adn and c["component_type"] == "nuance" and c["sub_nuance_adn"]:
                 flat.extend(flatten(c["sub_nuance_adn"].get("composition", []), depth + 1))
-            elif c["component_type"] == "black_mix" and c["black_mix_adn"]:
+            elif include_nested_adn and c["component_type"] == "black_mix" and c["black_mix_adn"]:
                 for bm_comp in c["black_mix_adn"].get("composition", []):
                     flat.append({**bm_comp, "depth": depth + 1})
         return flat
@@ -3284,6 +3284,7 @@ def build_nuance_adn_snapshot(cur, nuance_id, product_reference, nuance_name, _v
         "step_materials":            {str(s["step_order"]): s["materials"] for s in process_steps},
         "control_plan":              control_plan,
         "images":                    images,
+        "snapshot_scope":            "full" if include_nested_adn else "compact",
         "snapshot_timestamp":        datetime.now().isoformat(),
     }
 
@@ -3494,7 +3495,7 @@ def submit_nuance():
 
                 # ───────── ADN ─────────
                 adn_snapshot = build_nuance_adn_snapshot(
-                    cur, nuance_id, product_reference, nuance_name
+                    cur, nuance_id, product_reference, nuance_name, include_nested_adn=False
                 )
                 adn_snapshot = serialize_to_json_compatible(adn_snapshot)
                 adn_json_str = json.dumps(adn_snapshot, default=str)
@@ -4073,7 +4074,7 @@ def update_nuance(nuance_id):
 
                 # ── 9. Reconstruire et versionner l'ADN ──────────────────────
                 new_snapshot = build_nuance_adn_snapshot(
-                    cur, nuance_id, product_reference, nuance_name
+                    cur, nuance_id, product_reference, nuance_name, include_nested_adn=False
                 )
 
                 cur.execute(
