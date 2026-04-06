@@ -5113,10 +5113,9 @@ def convert_xls_to_json():
         all_sheets = xls_book.sheet_names()
 
         # --- Detect VM/HM files ---
-        is_vm_hm = original_name.upper().startswith("VM") or original_name.upper().startswith("HM")
         has_sollwerte = "Sollwerte" in all_sheets
 
-        if is_vm_hm and has_sollwerte:
+        if has_sollwerte:
             # Structured parsing for VM/HM files
             sollwerte_sheet = xls_book.sheet_by_name("Sollwerte")
             sollwerte_data = _parse_sollwerte(sollwerte_sheet, xls_book)
