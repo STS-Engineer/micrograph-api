@@ -5116,68 +5116,16 @@ def convert_xls_to_json():
         has_sollwerte = "Sollwerte" in all_sheets
 
         if has_sollwerte:
-            # Structured parsing for VM/HM files
+            # Structured parsing for VM/HM files — only Sollwerte sheet
             sollwerte_sheet = xls_book.sheet_by_name("Sollwerte")
             sollwerte_data = _parse_sollwerte(sollwerte_sheet, xls_book)
-
-            # The data sheet is the one right after Sollwerte
-            sollwerte_idx = all_sheets.index("Sollwerte")
-            data_sheet_name = all_sheets[sollwerte_idx + 1] if sollwerte_idx + 1 < len(all_sheets) else None
-
-            data_sheet_result = None
-            if data_sheet_name:
-                data_sheet = xls_book.sheet_by_name(data_sheet_name)
-                data_sheet_result = _parse_data_sheet(data_sheet, xls_book)
-
-
-
-            # Build data_sheet response based on mode
-            ds_response = None
-            non_conformities = []
-            if data_sheet_name and data_sheet_result:
-                all_measurements = _sort_measurements_by_date(data_sheet_result["measurements"])
-                active_specs = sollwerte_data.get("active_specifications", [])
-                measurements_by_year = _group_measurements_by_year(all_measurements)
-                measurements_by_year_summary = _summarize_measurements_by_year(measurements_by_year)
-                latest_measurements = _select_latest_measurements(all_measurements)
-
-                # Find charges with values outside spec
-                non_conformities = _find_non_conformities(all_measurements, active_specs, data_sheet_result.get("columns"))
-
-                ds_response = {
-                    "sheet_name": data_sheet_name,
-                    "type": data_sheet_result["type"],
-                    "reference": data_sheet_result["reference"],
-                    "method": data_sheet_result["method"],
-                    "columns": data_sheet_result.get("columns", []),
-                    "total_measurements": len(all_measurements),
-                    "latest_measurement_date": latest_measurements["latest_date"],
-                    "recent_measurements_count": len(latest_measurements["measurements"]),
-                    "recent_measurements": latest_measurements["measurements"],
-                    "measurements_by_year_summary": measurements_by_year_summary,
-                    "non_conformities": non_conformities,
-                }
-                if mode == "full":
-                    ds_response["measurements"] = all_measurements
-                    ds_response["measurements_by_year"] = measurements_by_year
-                else:
-                    # Summary mode: stats + compact recent-date persistence payload
-                    ds_response["statistics"] = _compute_measurement_stats(all_measurements, active_specs, data_sheet_result.get("columns"))
-                    ds_response["last_measurements"] = all_measurements[-max_rows:]
-                    ds_response["measurements_by_year"] = {
-                        year: rows[-max_rows:]
-                        for year, rows in measurements_by_year.items()
-                    }
 
             return jsonify({
                 "success": True,
                 "file_type": "VM/HM",
                 "source_file": original_name,
                 "available_sheets": all_sheets,
-                "mode": mode,
                 "sollwerte": sollwerte_data,
-                "non_conformities": non_conformities,
-                "data_sheet": ds_response
             }), 200
 
         # --- Generic parsing for non-VM/HM files ---

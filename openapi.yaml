@@ -1,0 +1,1188 @@
+openapi: 3.1.0
+info:
+  title: Micrographie IA API
+  version: 1.2.0
+  description: API complète (Matières, Black Mix, Nuances, ADN, OCR, XLS) — 30 opérations
+
+servers:
+  - url: https://micrographie-ia.azurewebsites.net
+
+paths:
+
+  # =========================
+  # OCR / IMAGE
+  # =========================
+  /upload_and_search:
+    post:
+      operationId: uploadAndSearch
+      summary: Upload image micrographique + similarité matières (IMAGE UNIQUEMENT — pas de PDF)
+      description: >
+        Analyse une image PNG/JPG et retourne les matériaux similaires (DINOv2).
+        IMAGE UNIQUEMENT — jamais un PDF (le serveur fait Image.open()).
+        Passer openaiFileIdRefs avec mime_type image/png ou image/jpeg.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImageSearchPayload'
+      responses:
+        "200":
+          description: Résultats
+
+  /search:
+    post:
+      operationId: searchSimilarMaterials
+      summary: Recherche matières par image
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchPayload'
+      responses:
+        "200":
+          description: Résultats
+
+  /image_lookup:
+    get:
+      operationId: lookupImageOwner
+      summary: Résoudre une image stockée vers une matière première ou une nuance
+      description: >
+        Accepte une URL Azure Blob complète, une URL proxy /images/... ou un chemin azure-blob://...
+        et retourne le ou les enregistrements correspondants dans matiere_images ou nuance_images.
+      parameters:
+        - in: query
+          name: image_url
+          required: true
+          schema:
+            type: string
+          description: URL complète de l'image ou chemin stocké en base.
+      responses:
+        "200":
+          description: Correspondance trouvée
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageLookupResponse'
+        "400":
+          description: Paramètre image_url manquant ou invalide
+        "404":
+          description: Image introuvable dans matiere_images et nuance_images
+
+  # =========================
+  # MATIERES
+  # =========================
+  /material_details/{matiere_id}:
+    get:
+      operationId: getMaterialDetails
+      parameters:
+        - in: path
+          name: matiere_id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+
+  /fiche_adn:
+    get:
+      operationId: getFicheAdnByReference
+      parameters:
+        - in: query
+          name: reference
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+
+  /fiche_adn/{matiere_id}:
+    get:
+      operationId: getFicheAdnById
+      parameters:
+        - in: path
+          name: matiere_id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+
+  /generate_fiche_adn_docx:
+    get:
+      operationId: generateFicheAdnDocx
+      summary: Générer un DOCX ADN pour une matière (retourne download_url)
+      parameters:
+        - in: query
+          name: reference
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+
+  /generate_docx_from_content:
+    post:
+      operationId: generateDocxFromContent
+      summary: Convertir du contenu Markdown (rédigé par l'assistant) en fichier DOCX téléchargeable, sans appel IA interne
+      description: >
+        L'assistant envoie un titre, un contenu Markdown, une référence et, si besoin,
+        des images à intégrer. Le serveur convertit ce contenu en DOCX et retourne
+        un lien de téléchargement, sans génération IA côté serveur.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - title
+                - content
+              properties:
+                title:
+                  type: string
+                  description: Titre principal du document DOCX
+                content:
+                  type: string
+                  description: Contenu Markdown complet rédigé par l'assistant
+                reference:
+                  type: string
+                  description: Référence utilisée dans le nom de fichier (défaut "report")
+                images:
+                  type: array
+                  description: Images à intégrer directement dans le DOCX
+                  items:
+                    type: object
+                    properties:
+                      caption:
+                        type: string
+                      magnification:
+                        type: string
+                      protocol:
+                        type: string
+                      storage_path:
+                        type: string
+                        description: Chemin stocké en base, par ex. azure-blob://...
+                      image_url:
+                        type: string
+                        description: URL HTTP(S) de l'image si disponible
+                      path:
+                        type: string
+                        description: Alias de storage_path
+                      url:
+                        type: string
+                        description: Alias de image_url
+      responses:
+        "200":
+          description: DOCX généré avec succès
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  file_name:
+                    type: string
+                  download_url:
+                    type: string
+                  absolute_url:
+                    type: string
+                  images_added:
+                    type: integer
+                  expires_in:
+                    type: string
+        "400":
+          description: Paramètres invalides ou manquants
+        "413":
+          description: Contenu trop volumineux (> 500 000 caractères)
+
+  /populate_fiches_adn_table:
+    post:
+      operationId: populateFichesAdnTable
+      responses:
+        "200":
+          description: OK
+
+  /verify_fiches_adn_table:
+    get:
+      operationId: verifyFichesAdnTable
+      responses:
+        "200":
+          description: OK
+
+  # =========================
+  # ANALYSIS
+  # =========================
+  /generate_application_analysis:
+    post:
+      operationId: generateApplicationAnalysis
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplicationPayload'
+      responses:
+        "200":
+          description: OK
+
+  /application_analysis:
+    get:
+      operationId: getApplicationAnalysis
+      parameters:
+        - in: query
+          name: reference
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+
+  # =========================
+  # BLACK MIX
+  # =========================
+  /black-mix/validate-material/{reference}:
+    get:
+      operationId: validateBlackMixMaterial
+      parameters:
+        - in: path
+          name: reference
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+
+  /black-mix/submit:
+    post:
+      operationId: submitBlackMixData
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BlackMixPayload'
+      responses:
+        "200":
+          description: OK
+
+  /black-mix/list:
+    get:
+      operationId: listBlackMixes
+      responses:
+        "200":
+          description: OK
+
+  /black-mix/{mix_id}:
+    get:
+      operationId: getBlackMixDetails
+      parameters:
+        - in: path
+          name: mix_id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+
+  /black-mix/{mix_id}/update:
+    put:
+      operationId: updateBlackMix
+      summary: "Mise à jour partielle ou complète d'un Black Mix (auto-refresh ADN compact sur une seule ligne). Seules les sections fournies sont remplacées."
+      parameters:
+        - in: path
+          name: mix_id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BlackMixUpdatePayload'
+      responses:
+        "200":
+          description: OK
+
+  /black-mix/{mix_id}/adn:
+    get:
+      operationId: getBlackMixAdn
+      summary: "ADN Black Mix — level: basic (snapshot compact stocké), enriched (+ AI live), combined (+ résumés légers)"
+      parameters:
+        - in: path
+          name: mix_id
+          required: true
+          schema:
+            type: integer
+        - in: query
+          name: level
+          schema:
+            type: string
+            enum: [basic, enriched, combined]
+            default: basic
+      responses:
+        "200":
+          description: OK
+
+  /generate_black_mix_adn_docx:
+    get:
+      operationId: generateBlackMixAdnDocx
+      summary: Générer un DOCX ADN pour un Black Mix (retourne download_url)
+      parameters:
+        - in: query
+          name: mix_id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+
+  # =========================
+  # NUANCES
+  # =========================
+  /nuance/validate-material/{reference}:
+    get:
+      operationId: validateNuanceMaterial
+      parameters:
+        - in: path
+          name: reference
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+
+  /nuance/submit:
+    post:
+      operationId: submitNuance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NuancePayload'
+      responses:
+        "200":
+          description: OK
+
+  /nuance/list:
+    get:
+      operationId: listNuances
+      responses:
+        "200":
+          description: OK
+
+  /nuance/{nuance_id}:
+    get:
+      operationId: getNuanceDetails
+      parameters:
+        - in: path
+          name: nuance_id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+
+  /nuance/{nuance_id}/update:
+    put:
+      operationId: updateNuance
+      summary: "Mise à jour partielle ou complète d'une Nuance (auto-refresh ADN compact sur une seule ligne). Seules les sections fournies sont remplacées."
+      parameters:
+        - in: path
+          name: nuance_id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NuanceUpdatePayload'
+      responses:
+        "200":
+          description: OK
+
+  /nuance/{nuance_id}/adn:
+    get:
+      operationId: getNuanceAdn
+      summary: "ADN Nuance — level: basic (snapshot compact stocké), enriched (+ AI live), combined (+ images/liens légers)"
+      parameters:
+        - in: path
+          name: nuance_id
+          required: true
+          schema:
+            type: integer
+        - in: query
+          name: level
+          schema:
+            type: string
+            enum: [basic, enriched, combined]
+            default: basic
+      responses:
+        "200":
+          description: OK
+
+  /nuance/search-similar:
+    post:
+      operationId: searchSimilarNuances
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchPayload'
+      responses:
+        "200":
+          description: OK
+
+  /generate_nuance_adn_docx:
+    get:
+      operationId: generateNuanceAdnDocx
+      summary: Générer un DOCX ADN pour une Nuance (retourne download_url)
+      parameters:
+        - in: query
+          name: nuance_id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+
+  # =========================
+  # CUISSON
+  # =========================
+  /cuisson-programs/{program_number}:
+    get:
+      operationId: getCuissonProgramDetail
+      summary: "Détail d'un programme de cuisson (ex: 101, K000)"
+      parameters:
+        - in: path
+          name: program_number
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+
+  /cuisson-programs/parse:
+    get:
+      operationId: parseCuissonField
+      summary: "Parser un champ Wärme-Nachbehandlung (ex: ?value=101 25)"
+      parameters:
+        - in: query
+          name: value
+          required: true
+          schema:
+            type: string
+          description: "Valeur brute, ex: '101 25'"
+      responses:
+        "200":
+          description: OK
+
+  # =========================
+  # XLS PARSING
+  # =========================
+  /convert_xls_to_json:
+    post:
+      operationId: convertXlsToJson
+      summary: "Convertir un fichier .xls en JSON structuré (Mischkarte, VM/HM, générique)"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/XlsConvertPayload'
+      responses:
+        "200":
+          description: Contenu JSON extrait du fichier XLS
+        "400":
+          description: Fichier manquant ou format invalide
+
+components:
+  schemas:
+
+    ImageLookupMatch:
+      type: object
+      properties:
+        domain:
+          type: string
+          enum: [matiere, nuance]
+        image_id:
+          type: integer
+        image_path:
+          type: string
+        image_url:
+          type: string
+        matiere_id:
+          type: integer
+          nullable: true
+        nuance_id:
+          type: integer
+          nullable: true
+        reference:
+          type: string
+          nullable: true
+        display_name:
+          type: string
+          nullable: true
+        type_matiere:
+          type: string
+          nullable: true
+        status:
+          type: string
+          nullable: true
+        detail_url:
+          type: string
+        adn_url:
+          type: string
+
+    ImageLookupResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        query:
+          type: object
+          properties:
+            image_url:
+              type: string
+            normalized_storage_path:
+              type: string
+        match_count:
+          type: integer
+        matches:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImageLookupMatch'
+
+    ImageSearchPayload:
+      type: object
+      description: >-
+        ⚠️ CET ENDPOINT ACCEPTE UNIQUEMENT DES IMAGES (PNG / JPG).
+        NE JAMAIS envoyer un PDF ici — le serveur fait Image.open() sur les bytes
+        et retourne une erreur PIL si ce n'est pas une image.
+        RÈGLE ABSOLUE : openaiFileIdRefs doit contenir l'objet de l'IMAGE attachée
+        dans le message. Chaque item DOIT avoir mime_type = "image/png" ou "image/jpeg".
+        Ne jamais passer openaiFileIdRefs vide [].
+        Ne jamais utiliser image_url avec une URL files.openai.com (inaccessible depuis Azure).
+      properties:
+        openaiFileIdRefs:
+          type: array
+          minItems: 1
+          description: >-
+            OBLIGATOIRE si une image a été uploadée dans le message.
+            Passer les objets de référence des pièces jointes IMAGE du message.
+            Chaque item DOIT contenir :
+              - id : OpenAI file id (string)
+              - mime_type : "image/png" ou "image/jpeg" (OBLIGATOIRE pour confirmer que c'est une image)
+              - download_link : URL de téléchargement si disponible (priorité 1 côté serveur)
+            Le serveur tente download_link en premier, puis file_id en fallback.
+            NE JAMAIS passer un item avec mime_type "application/pdf" ici.
+          items:
+            type: object
+            required: [id, mime_type]
+            properties:
+              id:
+                type: string
+                description: "OpenAI file id — OBLIGATOIRE"
+              name:
+                type: string
+                description: "Nom du fichier image (ex: photo.png)"
+              mime_type:
+                type: string
+                enum: ["image/png", "image/jpeg", "image/jpg", "image/webp"]
+                description: "Type MIME — OBLIGATOIRE. Doit être image/* jamais application/pdf"
+              download_link:
+                type: string
+                description: "URL de téléchargement directe (priorité 1). Ne pas utiliser files.openai.com"
+          example:
+            - id: "file-abc123"
+              name: "micrographie.png"
+              mime_type: "image/png"
+              download_link: "https://cdn.example.com/micrographie.png"
+        url:
+          type: string
+          description: >-
+            URL publique HTTPS d'une image externe. Utiliser UNIQUEMENT si
+            openaiFileIdRefs est absent ET que l'URL pointe vers une image PNG/JPG publique.
+            Ne jamais utiliser avec des URLs files.openai.com.
+        top_k:
+          type: integer
+          default: 5
+          description: "Nombre de matériaux similaires à retourner (1-50)"
+
+    SearchPayload:
+      type: object
+      properties:
+        download_link:
+          type: string
+        file_id:
+          type: string
+        top_k:
+          type: integer
+
+    ApplicationPayload:
+      type: object
+      required: [reference]
+      properties:
+        reference:
+          type: string
+        company_context:
+          type: string
+        save_to_db:
+          type: boolean
+
+    ControlPlanSpecification:
+      type: object
+      required: [parameter]
+      description: "Specification individuelle du plan de controle. Les alias backend parameter_name / min_value / max_value / target_value sont aussi acceptes."
+      properties:
+        parameter:
+          type: string
+        parameter_name:
+          type: string
+          nullable: true
+        min:
+          type: number
+          nullable: true
+        min_value:
+          type: number
+          nullable: true
+        max:
+          type: number
+          nullable: true
+        max_value:
+          type: number
+          nullable: true
+        target:
+          type: number
+          nullable: true
+        target_value:
+          type: number
+          nullable: true
+        unit:
+          type: string
+          nullable: true
+
+    ControlPlanColumn:
+      type: object
+      description: "Metadonnee de colonne extraite depuis l'onglet situe juste apres Sollwerte."
+      properties:
+        index:
+          type: integer
+        excel_column:
+          type: string
+        key:
+          type: string
+        label:
+          type: string
+        parameter_label:
+          type: string
+        role:
+          type: string
+          enum: [meta, actual, spec]
+
+    ControlPlanMeasurement:
+      type: object
+      description: "Ligne de mesure issue du sheet situe apres Sollwerte. Le champ values conserve toutes les colonnes utiles de la ligne."
+      properties:
+        nr:
+          type: string
+        datum:
+          type: string
+        charge:
+          type: string
+        pruefer:
+          type: string
+        teil:
+          type: string
+        los:
+          type: string
+        bemerkung:
+          type: string
+        values:
+          type: object
+          additionalProperties:
+            type: string
+
+    ControlPlanFailure:
+      type: object
+      properties:
+        parameter:
+          type: string
+        value:
+          type: number
+        min:
+          type: number
+          nullable: true
+        max:
+          type: number
+          nullable: true
+        unit:
+          type: string
+          nullable: true
+        column_label:
+          type: string
+
+    ControlPlanNonConformity:
+      type: object
+      properties:
+        charge:
+          type: string
+        nr:
+          type: string
+        datum:
+          type: string
+        teil:
+          type: string
+        los:
+          type: string
+        bemerkung:
+          type: string
+        failures:
+          type: array
+          items:
+            $ref: '#/components/schemas/ControlPlanFailure'
+
+    ControlPlanYearSummary:
+      type: object
+      properties:
+        count:
+          type: integer
+        first_date:
+          type: string
+        last_date:
+          type: string
+
+    ControlPlanSollwerteRevision:
+      type: object
+      properties:
+        date:
+          type: string
+        author:
+          type: string
+        change_reason:
+          type: string
+        specifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/ControlPlanSpecification'
+
+    ControlPlanSollwerte:
+      type: object
+      description: "Bloc Sollwerte parse depuis l'onglet Sollwerte."
+      properties:
+        vormischung:
+          type: string
+        reference:
+          type: string
+        revisions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ControlPlanSollwerteRevision'
+        active_specifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/ControlPlanSpecification'
+
+    ControlPlanDataSheet:
+      type: object
+      description: "JSON persiste dans la colonne DB sheet_data pour chaque ligne du control_plan. Contient les donnees du sheet place immediatement apres Sollwerte, compacte sur la date la plus recente pour eviter des payloads trop volumineux."
+      properties:
+        sheet_name:
+          type: string
+        type:
+          type: string
+        reference:
+          type: string
+        method:
+          type: string
+        columns:
+          type: array
+          items:
+            $ref: '#/components/schemas/ControlPlanColumn'
+        total_measurements:
+          type: integer
+        latest_measurement_date:
+          type: string
+          nullable: true
+        recent_measurements_count:
+          type: integer
+        recent_measurements:
+          type: array
+          description: "Lignes de mesure correspondant a la date la plus recente detectee dans le data sheet."
+          items:
+            $ref: '#/components/schemas/ControlPlanMeasurement'
+        measurements_by_year_summary:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ControlPlanYearSummary'
+        non_conformities:
+          type: array
+          items:
+            $ref: '#/components/schemas/ControlPlanNonConformity'
+        measurements:
+          type: array
+          description: "Toutes les lignes de mesure triees par date."
+          items:
+            $ref: '#/components/schemas/ControlPlanMeasurement'
+        statistics:
+          type: object
+          description: "Statistiques calculees par parametre a partir de l'ensemble des mesures disponibles."
+          additionalProperties: true
+        measurements_by_year:
+          type: object
+          description: "Toutes les mesures regroupees par annee."
+          additionalProperties:
+            type: array
+            items:
+              $ref: '#/components/schemas/ControlPlanMeasurement'
+
+    ControlPlanPayload:
+      type: object
+      description: "Plan de controle enrichi. Lors de la persistance, le backend recopie data_sheet dans la colonne DB sheet_data de chaque entree du control_plan."
+      properties:
+        active_specifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/ControlPlanSpecification'
+        data_sheet:
+          $ref: '#/components/schemas/ControlPlanDataSheet'
+        sollwerte:
+          $ref: '#/components/schemas/ControlPlanSollwerte'
+
+    StepMaterialsEntry:
+      type: object
+      required: [step_order, materials]
+      description: "Format alternatif compatible GPT Actions pour remplacer le map step_materials."
+      properties:
+        step_order:
+          type: integer
+        materials:
+          type: array
+          items:
+            type: string
+
+    BlackMixPayload:
+      type: object
+      required:
+        - product_reference
+        - mix_name
+        - process_steps
+      properties:
+        product_reference:
+          type: string
+        mix_name:
+          type: string
+        components:
+          type: array
+          items:
+            type: object
+            properties:
+              component_name:
+                type: string
+              reference:
+                type: string
+              quantity:
+                type: number
+              unit:
+                type: string
+              metadata:
+                type: object
+                nullable: true
+        process_steps:
+          type: array
+          items:
+            type: object
+            properties:
+              step_order:
+                type: integer
+              step_name:
+                type: string
+              machine:
+                type: string
+              parameters:
+                type: object
+                nullable: true
+        step_materials:
+          type: object
+          description: "Format legacy/backend: map dynamique {\"1\": [\"6600035\"], \"2\": [...]}. Peut etre rejete par GPT Actions."
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        step_materials_list:
+          type: array
+          description: "Format recommande pour GPT Actions. Au moins un de step_materials ou step_materials_list doit etre fourni."
+          items:
+            $ref: '#/components/schemas/StepMaterialsEntry'
+        control_plan:
+          $ref: '#/components/schemas/ControlPlanPayload'
+        document_revision_history:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              version:
+                type: string
+              date:
+                type: string
+              description:
+                type: string
+              author:
+                type: string
+
+    BlackMixUpdatePayload:
+      type: object
+      required:
+        - product_reference
+        - mix_name
+      properties:
+        product_reference:
+          type: string
+        mix_name:
+          type: string
+        components:
+          type: array
+          description: "Si fourni, remplace tous les composants existants"
+          items:
+            type: object
+            properties:
+              component_name:
+                type: string
+              reference:
+                type: string
+              quantity:
+                type: number
+              unit:
+                type: string
+              metadata:
+                type: object
+                nullable: true
+        process_steps:
+          type: array
+          description: "Si fourni, remplace toutes les étapes existantes"
+          items:
+            type: object
+            properties:
+              step_order:
+                type: integer
+              step_name:
+                type: string
+              machine:
+                type: string
+              parameters:
+                type: object
+                nullable: true
+        step_materials:
+          type: object
+          description: "Format legacy/backend: map dynamique {\"1\": [\"6600035\"], \"2\": [...]}. Peut etre rejete par GPT Actions."
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        step_materials_list:
+          type: array
+          description: "Format recommande pour GPT Actions. Obligatoire si process_steps est fourni et que step_materials n'est pas envoye."
+          items:
+            $ref: '#/components/schemas/StepMaterialsEntry'
+        control_plan:
+          $ref: '#/components/schemas/ControlPlanPayload'
+        document_revision_history:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              version:
+                type: string
+              date:
+                type: string
+              description:
+                type: string
+              author:
+                type: string
+
+    NuanceUpdatePayload:
+      type: object
+      required:
+        - product_reference
+        - nuance_name
+      properties:
+        product_reference:
+          type: string
+        nuance_name:
+          type: string
+        warne_nachbehandlung:
+          type: string
+          nullable: true
+        components:
+          type: array
+          description: "Si fourni, remplace tous les composants existants"
+          items:
+            type: object
+            required: [reference]
+            properties:
+              component_name:
+                type: string
+              reference:
+                type: string
+              quantity:
+                type: number
+              unit:
+                type: string
+              metadata:
+                type: object
+                nullable: true
+        process_steps:
+          type: array
+          description: "Si fourni, remplace toutes les étapes existantes"
+          items:
+            type: object
+            properties:
+              step_order:
+                type: integer
+              step_name:
+                type: string
+              machine:
+                type: string
+              parameters:
+                type: object
+                nullable: true
+        step_materials:
+          type: object
+          description: "Format legacy/backend: map dynamique {\"1\": [\"6600035\"], \"2\": [...]}. Peut etre rejete par GPT Actions."
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        step_materials_list:
+          type: array
+          description: "Format recommande pour GPT Actions. Obligatoire si process_steps est fourni et que step_materials n'est pas envoye."
+          items:
+            $ref: '#/components/schemas/StepMaterialsEntry'
+        control_plan:
+          $ref: '#/components/schemas/ControlPlanPayload'
+        document_revision_history:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              version:
+                type: string
+              date:
+                type: string
+              description:
+                type: string
+              author:
+                type: string
+
+    XlsConvertPayload:
+      type: object
+      required: [openaiFileIdRefs]
+      properties:
+        openaiFileIdRefs:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              name: { type: string }
+              download_link: { type: string }
+        sheet_name:
+          type: string
+          description: "Nom de l'onglet à extraire (optionnel, défaut = premier onglet)"
+
+    NuancePayload:
+      type: object
+      required:
+        - product_reference
+        - nuance_name
+        - components
+        - process_steps
+      properties:
+        product_reference:
+          type: string
+        nuance_name:
+          type: string
+        warne_nachbehandlung:
+          type: string
+          nullable: true
+        components:
+          type: array
+          items:
+            type: object
+            required: [reference]
+            properties:
+              component_name:
+                type: string
+              reference:
+                type: string
+              quantity:
+                type: number
+              unit:
+                type: string
+              metadata:
+                type: object
+                nullable: true
+        process_steps:
+          type: array
+          items:
+            type: object
+            properties:
+              step_order:
+                type: integer
+              step_name:
+                type: string
+              machine:
+                type: string
+              parameters:
+                type: object
+                nullable: true
+        step_materials:
+          type: object
+          description: "Format legacy/backend: map dynamique {\"1\": [\"6600035\"], \"2\": [...]}. Peut etre rejete par GPT Actions."
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        step_materials_list:
+          type: array
+          description: "Format recommande pour GPT Actions. Au moins un de step_materials ou step_materials_list doit etre fourni."
+          items:
+            $ref: '#/components/schemas/StepMaterialsEntry'
+        control_plan:
+          $ref: '#/components/schemas/ControlPlanPayload'
+        document_revision_history:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              version:
+                type: string
+              date:
+                type: string
+              description:
+                type: string
+              author:
+                type: string
