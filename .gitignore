@@ -1,6 +1,1 @@
 .env
-__pycache__/
-*.py[cod]
-output_v3/
-output_v4/
-embeddings_v7/

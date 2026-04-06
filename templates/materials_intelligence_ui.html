@@ -3,78 +3,404 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Micrograph Match</title>
+  <title>Micrograph Match — Materials Intelligence</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@600;700;800&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;1,9..40,300&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="{{ url_for('static', filename='materials_intelligence_ui.css') }}" />
 </head>
-<body data-search-endpoint="{{ url_for('browser_search_materials') }}">
-  <main class="app-shell">
-    <section class="hero-card">
-      <p class="eyebrow">Micrograph Match</p>
-      <h1>Upload one image. Get one exact match.</h1>
-      <p class="hero-copy">
-        The system searches both <code>matiere_images</code> and <code>nuance_images</code>, then returns the single closest result
-        with its reference, name, and a direct ADN action.
-      </p>
-    </section>
+<body
+  data-search-endpoint="{{ url_for('browser_search_materials') }}"
+  data-compare-endpoint="{{ url_for('compare_micrographs') }}"
+>
 
-    <section class="dashboard-card">
-      <form id="searchForm" class="search-form" novalidate>
-        <input id="imageInput" name="image" type="file" accept=".png,.jpg,.jpeg,.webp" hidden />
+  <div class="bg-grain" aria-hidden="true"></div>
 
-        <button id="dropzone" class="dropzone" type="button">
-          <span class="dropzone-title">Choose micrograph image</span>
-          <span class="dropzone-subtitle">PNG, JPG, JPEG or WEBP</span>
-        </button>
+  <div class="app-root">
 
-        <div class="preview-card">
-          <img id="previewImage" alt="Selected micrograph preview" />
-          <div class="preview-copy">
-            <strong id="previewName">No image selected</strong>
-            <p id="previewHint">Your image will appear here before search.</p>
+    <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="brand-icon" aria-hidden="true">
+          <svg viewBox="0 0 32 32" fill="none">
+            <rect x="4"  y="4"  width="10" height="10" rx="2" fill="currentColor" opacity="0.9"/>
+            <rect x="18" y="4"  width="10" height="10" rx="2" fill="currentColor" opacity="0.5"/>
+            <rect x="4"  y="18" width="10" height="10" rx="2" fill="currentColor" opacity="0.5"/>
+            <rect x="18" y="18" width="10" height="10" rx="2" fill="currentColor" opacity="0.2"/>
+          </svg>
+        </div>
+        <div>
+          <p class="brand-label">Micrograph Match</p>
+          <p class="brand-sub">Materials Intelligence</p>
+        </div>
+      </div>
+
+      <nav class="sidebar-nav" aria-label="Main navigation">
+        <a href="#" class="nav-item is-active" data-view="search">
+          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <circle cx="9" cy="9" r="5.5" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M13.5 13.5L17 17" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          Image Search
+        </a>
+        <a href="#" class="nav-item" data-view="compare">
+          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <rect x="2" y="4" width="7" height="12" rx="1.5" stroke="currentColor" stroke-width="1.5"/>
+            <rect x="11" y="4" width="7" height="12" rx="1.5" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M9.5 10h1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          Compare ADN
+          <span class="nav-badge">New</span>
+        </a>
+        <a href="#" class="nav-item">
+          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <path d="M4 6h12M4 10h8M4 14h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          ADN Reports
+        </a>
+      </nav>
+
+      <div class="sidebar-info">
+        <div class="info-pill"><span class="info-dot"></span>DINOv2 · pgvector</div>
+        <p class="info-desc">CLAHE preprocessing · multi-scale embedding · cosine similarity search</p>
+      </div>
+    </aside>
+
+    <!-- ── Main content ─────────────────────────────────────────────────── -->
+    <main class="main-content">
+
+      <!-- ════════════════════════════════════════════════════════
+           VIEW 1 — IMAGE SEARCH
+           ════════════════════════════════════════════════════════ -->
+      <div id="view-search" class="view">
+        <header class="page-header">
+          <div>
+            <h1 class="page-title">Image Search</h1>
+            <p class="page-subtitle">Upload a micrograph to find its closest match in the database</p>
           </div>
+          <div class="header-badge">
+            <span class="db-badge">matiere_images</span>
+            <span class="db-badge">nuance_images</span>
+          </div>
+        </header>
+
+        <div class="workspace">
+          <!-- Upload panel -->
+          <section class="panel upload-panel" aria-label="Upload image">
+            <div class="panel-head">
+              <h2 class="panel-title">Query image</h2>
+              <span class="step-badge">01</span>
+            </div>
+            <form id="searchForm" novalidate>
+              <input id="imageInput" name="image" type="file" accept=".png,.jpg,.jpeg,.webp" hidden />
+              <button id="dropzone" class="dropzone" type="button" aria-label="Click or drag image to upload">
+                <div class="dropzone-inner">
+                  <div class="dropzone-icon" aria-hidden="true">
+                    <svg viewBox="0 0 48 48" fill="none">
+                      <rect x="8" y="8" width="32" height="32" rx="6" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 3"/>
+                      <path d="M24 20v8M20 24l4-4 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                  </div>
+                  <p class="dropzone-title">Drop micrograph here</p>
+                  <p class="dropzone-sub">or <span class="dropzone-link">browse files</span></p>
+                  <p class="dropzone-formats">PNG · JPG · WEBP</p>
+                </div>
+              </button>
+              <div id="previewWrap" class="preview-wrap" hidden>
+                <div class="preview-img-wrap">
+                  <img id="previewImage" alt="Selected micrograph preview" />
+                  <button id="clearBtn" class="clear-btn" type="button" aria-label="Remove image">
+                    <svg viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                  </button>
+                </div>
+                <div class="preview-meta">
+                  <span id="previewName" class="preview-name">—</span>
+                  <span id="previewSize" class="preview-size">—</span>
+                </div>
+              </div>
+              <button id="submitBtn" class="submit-btn" type="submit" disabled>
+                <span class="submit-label">Find Closest Match</span>
+                <span class="submit-icon" aria-hidden="true">
+                  <svg viewBox="0 0 20 20" fill="none"><circle cx="9" cy="9" r="5.5" stroke="currentColor" stroke-width="1.5"/><path d="M13.5 13.5L17 17" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                </span>
+              </button>
+            </form>
+            <div class="pipeline-info">
+              <p class="pipeline-title">Embedding pipeline</p>
+              <ol class="pipeline-steps">
+                <li>CLAHE contrast enhancement</li>
+                <li>Multi-scale crop views (92 %, 80 %, 66 %)</li>
+                <li>DINOv2-large CLS token extraction</li>
+                <li>L2-normalized vector averaging</li>
+                <li>pgvector cosine similarity (⇒ ORDER BY &lt;=&gt;)</li>
+              </ol>
+            </div>
+          </section>
+
+          <!-- Result panel -->
+          <section class="panel result-panel" aria-label="Search result" aria-live="polite">
+            <div class="panel-head">
+              <h2 class="panel-title">Closest match</h2>
+              <span class="step-badge">02</span>
+            </div>
+            <div id="statusBar" class="status-bar">
+              <span class="status-dot"></span>
+              <span id="statusText">Waiting for an image.</span>
+            </div>
+            <div id="emptyState" class="empty-state">
+              <svg class="empty-icon" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+                <rect x="10" y="10" width="44" height="44" rx="8" stroke="currentColor" stroke-width="1.5" stroke-dasharray="5 4"/>
+                <circle cx="32" cy="30" r="7" stroke="currentColor" stroke-width="1.5"/>
+                <path d="M37.5 37.5L43 43" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+              <p class="empty-title">No result yet</p>
+              <p class="empty-sub">Upload a micrograph image and run the search to see its closest database match.</p>
+            </div>
+            <div id="loaderState" class="loader-state" hidden>
+              <div class="spinner" aria-label="Searching…">
+                <div class="spinner-ring"></div><div class="spinner-ring"></div><div class="spinner-ring"></div>
+              </div>
+              <p class="loader-text">Running DINOv2 pipeline…</p>
+              <p class="loader-sub" id="loaderSub">Computing multi-scale embeddings</p>
+            </div>
+            <article id="resultCard" class="result-card" hidden>
+              <div class="result-body">
+                <span id="resultDomain" class="domain-chip">—</span>
+                <div class="score-row">
+                  <div class="score-label-wrap">
+                    <p class="score-label">Similarity score</p>
+                    <span id="resultScore" class="score-value">—</span>
+                  </div>
+                  <div class="score-bar-track"><div id="scoreBar" class="score-bar-fill"></div></div>
+                </div>
+                <div class="result-fields">
+                  <div class="result-field">
+                    <p class="field-label">Reference</p>
+                    <p id="resultReference" class="field-value field-mono">—</p>
+                  </div>
+                  <div class="result-field">
+                    <p class="field-label">Name</p>
+                    <p id="resultName" class="field-value">—</p>
+                  </div>
+                </div>
+                <div class="action-row">
+                  <a id="adnButton" class="btn-primary" href="#">
+                    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 14l4-4 3 3 5-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    Generate / See ADN
+                  </a>
+                  <button id="cancelAdnButton" class="btn-ghost" type="button" hidden>Cancel</button>
+                </div>
+                <section id="adnPanel" class="inline-adn-panel" hidden>
+                  <div class="inline-adn-head">
+                    <p class="inline-adn-kicker">ADN</p>
+                    <p id="adnMeta" class="inline-adn-meta">-</p>
+                  </div>
+                  <div id="adnContent" class="adn-prose"></div>
+                </section>
+                <div id="downloadPanel" class="download-panel" hidden>
+                  <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 3v9M6.5 8.5L10 12l3.5-3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 14v1a2 2 0 002 2h10a2 2 0 002-2v-1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                  <a id="downloadLink" class="download-link" href="#" target="_blank" rel="noopener noreferrer">Download ADN docx</a>
+                </div>
+              </div>
+            </article>
+          </section>
+        </div>
+      </div><!-- /view-search -->
+
+
+      <!-- ════════════════════════════════════════════════════════
+           VIEW 2 — COMPARE ADN
+           ════════════════════════════════════════════════════════ -->
+      <div id="view-compare" class="view" hidden>
+
+        <header class="page-header">
+          <div>
+            <h1 class="page-title">Compare ADN</h1>
+            <p class="page-subtitle">Upload two micrographs — AI identifies both matches then analyses their ADN differences</p>
+          </div>
+          <div class="header-badge">
+            <span class="db-badge">DINOv2</span>
+            <span class="db-badge accent-purple">Groq Llama</span>
+          </div>
+        </header>
+
+        <!-- Upload row: A / VS / B -->
+        <div class="compare-upload-row">
+
+          <!-- Card A -->
+          <section class="panel cmp-upload-panel" aria-label="Image A">
+            <div class="panel-head">
+              <h2 class="panel-title">Image A</h2>
+              <span class="step-badge cmp-a">A</span>
+            </div>
+            <div class="cmp-form-body">
+              <input id="cmpInputA" type="file" accept=".png,.jpg,.jpeg,.webp" hidden />
+              <button id="cmpDropzoneA" class="dropzone dropzone-sm cmp-side-a" type="button">
+                <div class="dropzone-inner">
+                  <div class="dropzone-icon" aria-hidden="true">
+                    <svg viewBox="0 0 48 48" fill="none"><rect x="8" y="8" width="32" height="32" rx="6" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 3"/><path d="M24 20v8M20 24l4-4 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </div>
+                  <p class="dropzone-title">First micrograph</p>
+                  <p class="dropzone-formats">PNG · JPG · WEBP</p>
+                </div>
+              </button>
+              <div id="cmpPreviewWrapA" class="preview-wrap" hidden>
+                <div class="preview-img-wrap">
+                  <img id="cmpPreviewA" alt="Image A" />
+                  <button id="cmpClearA" class="clear-btn" type="button">
+                    <svg viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                  </button>
+                </div>
+                <div class="preview-meta">
+                  <span id="cmpNameA" class="preview-name">—</span>
+                  <span id="cmpSizeA" class="preview-size">—</span>
+                </div>
+              </div>
+              <div id="cmpMatchA" class="cmp-match-badge cmp-match-a" hidden>
+                <div class="cmb-top">
+                  <span class="match-domain" id="cmpMatchDomainA">—</span>
+                  <span class="match-score" id="cmpMatchScoreA">—</span>
+                </div>
+                <p class="match-ref" id="cmpMatchRefA">—</p>
+                <p class="match-name" id="cmpMatchNameA">—</p>
+              </div>
+            </div>
+          </section>
+
+          <!-- VS pill -->
+          <div class="vs-divider" aria-hidden="true">
+            <div class="vs-line"></div>
+            <div class="vs-pill">VS</div>
+            <div class="vs-line"></div>
+          </div>
+
+          <!-- Card B -->
+          <section class="panel cmp-upload-panel" aria-label="Image B">
+            <div class="panel-head">
+              <h2 class="panel-title">Image B</h2>
+              <span class="step-badge cmp-b">B</span>
+            </div>
+            <div class="cmp-form-body">
+              <input id="cmpInputB" type="file" accept=".png,.jpg,.jpeg,.webp" hidden />
+              <button id="cmpDropzoneB" class="dropzone dropzone-sm cmp-side-b" type="button">
+                <div class="dropzone-inner">
+                  <div class="dropzone-icon" aria-hidden="true">
+                    <svg viewBox="0 0 48 48" fill="none"><rect x="8" y="8" width="32" height="32" rx="6" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 3"/><path d="M24 20v8M20 24l4-4 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </div>
+                  <p class="dropzone-title">Second micrograph</p>
+                  <p class="dropzone-formats">PNG · JPG · WEBP</p>
+                </div>
+              </button>
+              <div id="cmpPreviewWrapB" class="preview-wrap" hidden>
+                <div class="preview-img-wrap">
+                  <img id="cmpPreviewB" alt="Image B" />
+                  <button id="cmpClearB" class="clear-btn" type="button">
+                    <svg viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                  </button>
+                </div>
+                <div class="preview-meta">
+                  <span id="cmpNameB" class="preview-name">—</span>
+                  <span id="cmpSizeB" class="preview-size">—</span>
+                </div>
+              </div>
+              <div id="cmpMatchB" class="cmp-match-badge cmp-match-b" hidden>
+                <div class="cmb-top">
+                  <span class="match-domain" id="cmpMatchDomainB">—</span>
+                  <span class="match-score" id="cmpMatchScoreB">—</span>
+                </div>
+                <p class="match-ref" id="cmpMatchRefB">—</p>
+                <p class="match-name" id="cmpMatchNameB">—</p>
+              </div>
+            </div>
+          </section>
+
+        </div><!-- /compare-upload-row -->
+
+        <!-- CTA -->
+        <div class="compare-cta-row">
+          <button id="compareBtn" class="submit-btn compare-submit-btn" type="button" disabled>
+            <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <path d="M3 10h14M10 4l6 6-6 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <span>Analyse ADN Differences</span>
+          </button>
+          <p class="compare-hint">Searches both images with DINOv2 · pgvector, then generates a structured differential report with Groq Llama</p>
         </div>
 
-        <button id="submitBtn" class="primary-btn" type="submit">Find Match</button>
-      </form>
-
-      <section class="result-panel">
-        <div id="statusBar" class="status-bar">Waiting for an image.</div>
-
-        <div id="emptyState" class="empty-state">
-          Upload an image to see the closest reference and name.
+        <!-- Status -->
+        <div id="cmpStatusBar" class="status-bar" hidden>
+          <span class="status-dot"></span>
+          <span id="cmpStatusText">—</span>
         </div>
 
-        <article id="resultCard" class="result-card" hidden>
-          <div class="result-media">
-            <img id="resultImage" alt="Best match image" />
-          </div>
+        <!-- Results -->
+        <div id="cmpResultArea" class="cmp-result-area" hidden>
 
-          <div class="result-body">
-            <div class="result-badges">
-              <span id="resultDomain" class="badge">-</span>
-              <span id="resultScore" class="badge">-</span>
+          <!-- Score banner -->
+          <div class="cmp-score-banner">
+            <div class="cmp-score-block side-a">
+              <p class="csb-label">Image A — Matched</p>
+              <p class="csb-ref" id="cmpBannerRefA">—</p>
+              <p class="csb-score" id="cmpBannerScoreA">—</p>
             </div>
-
-            <p class="field-label">Reference</p>
-            <h2 id="resultReference" class="result-reference">-</h2>
-
-            <p class="field-label">Name</p>
-            <p id="resultName" class="result-name">-</p>
-
-            <div class="action-row">
-              <a id="adnButton" class="secondary-btn" href="#" target="_blank" rel="noopener noreferrer">Generate / See ADN</a>
-              <button id="cancelAdnButton" class="ghost-btn" type="button" hidden>Cancel generation</button>
+            <div class="cmp-score-center">
+              <p class="cosine-label">Embedding<br>similarity A↔B</p>
+              <p class="cosine-val" id="cmpCosineSim">—</p>
+              <div class="cosine-bar-track"><div class="cosine-bar-fill" id="cosineBarFill"></div></div>
             </div>
-
-            <div id="downloadPanel" class="download-panel" hidden>
-              <p class="field-label">Generated file</p>
-              <a id="downloadLink" class="download-link" href="#" target="_blank" rel="noopener noreferrer">Download ADN docx</a>
+            <div class="cmp-score-block side-b">
+              <p class="csb-label">Image B — Matched</p>
+              <p class="csb-ref" id="cmpBannerRefB">—</p>
+              <p class="csb-score" id="cmpBannerScoreB">—</p>
             </div>
           </div>
-        </article>
-      </section>
-    </section>
-  </main>
+
+          <!-- Tabs -->
+          <div class="cmp-tabs" role="tablist" aria-label="ADN comparison views">
+            <button class="cmp-tab is-active" role="tab" data-tab="diff" aria-selected="true">
+              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 5h12M2 8h8M2 11h10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+              ADN Differences
+            </button>
+            <button class="cmp-tab" role="tab" data-tab="a" aria-selected="false">
+              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="2" y="2" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.2"/></svg>
+              ADN — Image A
+            </button>
+            <button class="cmp-tab" role="tab" data-tab="b" aria-selected="false">
+              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="2" y="2" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.2"/></svg>
+              ADN — Image B
+            </button>
+          </div>
+
+          <div class="cmp-tab-panels">
+
+            <div id="cmpPanel-diff" class="cmp-tab-panel" role="tabpanel">
+              <div id="cmpLoaderDiff" class="panel-loader" hidden>
+                <div class="spinner"><div class="spinner-ring"></div><div class="spinner-ring"></div><div class="spinner-ring"></div></div>
+                <p id="cmpLoaderText" class="loader-text">Generating ADN differential with Groq Llama…</p>
+              </div>
+              <div id="cmpDiffContent" class="adn-prose"></div>
+            </div>
+
+            <div id="cmpPanel-a" class="cmp-tab-panel" role="tabpanel" hidden>
+              <div id="cmpAdnA" class="adn-prose"></div>
+            </div>
+
+            <div id="cmpPanel-b" class="cmp-tab-panel" role="tabpanel" hidden>
+              <div id="cmpAdnB" class="adn-prose"></div>
+            </div>
+
+          </div><!-- /tab-panels -->
+
+          <div id="cmpDownloadRow" class="cmp-download-row" hidden>
+            <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 3v9M6.5 8.5L10 12l3.5-3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 14v1a2 2 0 002 2h10a2 2 0 002-2v-1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+            <a id="cmpDownloadLink" class="download-link" href="#" target="_blank" rel="noopener noreferrer">Download comparison report (.docx)</a>
+          </div>
+
+        </div><!-- /cmpResultArea -->
+      </div><!-- /view-compare -->
+
+    </main>
+  </div><!-- /app-root -->
 
   <script src="{{ url_for('static', filename='materials_intelligence_ui.js') }}" defer></script>
 </body>

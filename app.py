@@ -13,6 +13,7 @@ from typing import Optional, List, Dict, Any
 from urllib.parse import urlparse, unquote, quote
 import re
 import logging
+import unicodedata
 from dotenv import load_dotenv
 
 import numpy as np
@@ -91,8 +92,9 @@ openai_api_key = HARDCODED_OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 
 GROQ_API_KEYS = [
-    "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",
-    "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",
+    "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",
+    "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",
+    "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",
 ]
 
 current_groq_key_index = 0
@@ -136,6 +138,8 @@ def call_groq_with_retry(messages, model="llama-3.3-70b-versatile", temperature=
             return response
         except Exception as e:
             error_message = str(e).lower()
+            if "413" in error_message or "payload too large" in error_message or "request too large" in error_message:
+                raise Exception("❌ Payload trop volumineux pour l'API Groq (413). Réduisez la taille des données envoyées.")
             if "authentication" in error_message or "invalid" in error_message or "unauthorized" in error_message or "401" in error_message:
                 print(f"⚠️ Erreur d'authentification avec la clé #{current_groq_key_index + 1}: {e}")
                 attempts += 1
@@ -685,6 +689,102 @@ def build_image_url(image_path: str) -> str:
     return f"{base}/images/{quote(normalized_path, safe='/')}"
 
 
+def _storage_path_from_external_image_url(image_url: str) -> Optional[str]:
+    raw_value = str(image_url or "").strip()
+    if not raw_value:
+        return None
+    if raw_value.startswith("azure-blob://"):
+        return raw_value
+
+    parsed = urlparse(raw_value)
+    path = unquote(parsed.path or "").lstrip("/")
+
+    if parsed.scheme in {"http", "https"} and parsed.netloc.endswith(".blob.core.windows.net"):
+        if not path:
+            return None
+        container_name, _, blob_name = path.partition("/")
+        if not container_name or not blob_name:
+            return None
+        return f"azure-blob://{container_name}/{blob_name}"
+
+    if parsed.scheme in {"http", "https"}:
+        image_prefix = "/images/"
+        if parsed.path.startswith(image_prefix):
+            blob_name = unquote(parsed.path[len(image_prefix):]).lstrip("/")
+            if not blob_name:
+                return None
+            return _blob_path_from_name(blob_name) if is_azure_blob_enabled() else blob_name
+
+    normalized_path = raw_value.replace("\\", "/")
+    if normalized_path.startswith("/images/"):
+        blob_name = normalized_path[len("/images/"):].lstrip("/")
+        if not blob_name:
+            return None
+        return _blob_path_from_name(blob_name) if is_azure_blob_enabled() else blob_name
+    return normalized_path
+
+
+def _build_image_lookup_matches(cur, storage_path: str) -> List[Dict[str, Any]]:
+    matches: List[Dict[str, Any]] = []
+
+    cur.execute(
+        """
+        SELECT mi.id AS image_id, mi.image_path, mi.matiere_id,
+               m.reference, m.nom_matiere, m.type_matiere
+        FROM public.matiere_images mi
+        INNER JOIN public.matieres m ON m.matiere_id = mi.matiere_id
+        WHERE mi.image_path = %s
+        ORDER BY mi.id ASC
+        """,
+        (storage_path,),
+    )
+    for row in cur.fetchall():
+        row = dict(row)
+        matches.append({
+            "domain": "matiere",
+            "image_id": row["image_id"],
+            "image_path": row["image_path"],
+            "image_url": build_image_url(row["image_path"]),
+            "matiere_id": row["matiere_id"],
+            "nuance_id": None,
+            "reference": row.get("reference"),
+            "display_name": row.get("nom_matiere"),
+            "type_matiere": row.get("type_matiere"),
+            "detail_url": url_for("get_material_details", matiere_id=row["matiere_id"]),
+            "adn_url": url_for("get_fiche_adn", matiere_id=row["matiere_id"]),
+        })
+
+    cur.execute(
+        """
+        SELECT ni.id AS image_id, ni.image_path, ni.nuance_id,
+               n.reference, n.name, n.status
+        FROM public.nuance_images ni
+        INNER JOIN public.nuances n ON n.id = ni.nuance_id
+        WHERE ni.image_path = %s
+        ORDER BY ni.id ASC
+        """,
+        (storage_path,),
+    )
+    for row in cur.fetchall():
+        row = dict(row)
+        matches.append({
+            "domain": "nuance",
+            "image_id": row["image_id"],
+            "image_path": row["image_path"],
+            "image_url": build_image_url(row["image_path"]),
+            "matiere_id": None,
+            "nuance_id": row["nuance_id"],
+            "reference": row.get("reference"),
+            "display_name": row.get("name"),
+            "type_matiere": "Nuance",
+            "status": row.get("status"),
+            "detail_url": url_for("get_nuance_details", nuance_id=row["nuance_id"]),
+            "adn_url": url_for("get_nuance_adn", nuance_id=row["nuance_id"], level="combined"),
+        })
+
+    return matches
+
+
 def is_azure_blob_enabled() -> bool:
     return bool(AZURE_CONNECTION_STRING and AZURE_CONTAINER_NAME)
 
@@ -712,6 +812,50 @@ def get_blob_service_client() -> Optional[BlobServiceClient]:
         except ResourceExistsError:
             pass
     return _BLOB_SERVICE_CLIENT
+
+
+def get_azure_blob_diagnostics(*, check_storage: bool = False) -> Dict[str, Any]:
+    missing_env = []
+    if not AZURE_CONNECTION_STRING:
+        missing_env.append("AZURE_CONNECTION_STRING")
+    if not AZURE_CONTAINER_NAME:
+        missing_env.append("AZURE_CONTAINER_NAME")
+
+    diagnostics: Dict[str, Any] = {
+        "enabled": is_azure_blob_enabled(),
+        "config_ok": False,
+        "missing_env": missing_env,
+        "container_name": AZURE_CONTAINER_NAME or None,
+        "expected_container_name": EXPECTED_AZURE_CONTAINER_NAME or None,
+        "blob_prefix": AZURE_BLOB_PREFIX or None,
+        "storage_checked": False,
+        "storage_reachable": None,
+        "error": None,
+    }
+
+    if missing_env:
+        diagnostics["error"] = f"Missing required environment variables: {', '.join(missing_env)}"
+        return diagnostics
+
+    try:
+        validate_azure_blob_config()
+        diagnostics["config_ok"] = True
+    except Exception as e:
+        diagnostics["error"] = str(e)
+        return diagnostics
+
+    if check_storage:
+        diagnostics["storage_checked"] = True
+        try:
+            blob_service = get_blob_service_client()
+            diagnostics["storage_reachable"] = bool(
+                blob_service and blob_service.get_container_client(AZURE_CONTAINER_NAME).exists()
+            )
+        except Exception as e:
+            diagnostics["storage_reachable"] = False
+            diagnostics["error"] = str(e)
+
+    return diagnostics
 
 
 def _build_blob_name(filename: str) -> str:
@@ -791,6 +935,69 @@ def _load_pil_image_from_storage_path(storage_path: str) -> Optional[Image.Image
         return Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception:
         return None
+
+
+def _load_pil_image_from_docx_reference(image_ref: Dict[str, Any]) -> Optional[Image.Image]:
+    if not isinstance(image_ref, dict):
+        return None
+
+    storage_path = (image_ref.get("storage_path") or image_ref.get("path") or "").strip()
+    if storage_path:
+        image_obj = _load_pil_image_from_storage_path(storage_path)
+        if image_obj:
+            return image_obj
+
+    image_url = (image_ref.get("image_url") or image_ref.get("url") or "").strip()
+    if image_url:
+        normalized_storage_path = _storage_path_from_external_image_url(image_url)
+        if normalized_storage_path:
+            image_obj = _load_pil_image_from_storage_path(normalized_storage_path)
+            if image_obj:
+                return image_obj
+        try:
+            response = requests.get(image_url, timeout=20)
+            response.raise_for_status()
+            return Image.open(io.BytesIO(response.content)).convert("RGB")
+        except Exception:
+            return None
+
+    return None
+
+
+def _append_images_to_docx(doc: Document, image_refs: List[Dict[str, Any]]) -> int:
+    added_count = 0
+    for image_ref in image_refs[:10]:
+        image_obj = _load_pil_image_from_docx_reference(image_ref)
+        if not image_obj:
+            continue
+
+        caption = (image_ref.get("caption") or image_ref.get("label") or image_ref.get("title") or "").strip()
+        magnification = str(image_ref.get("magnification") or "").strip()
+        protocol = str(image_ref.get("protocol") or "").strip()
+
+        if caption:
+            caption_heading = doc.add_heading(caption, level=3)
+            caption_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        image_stream = io.BytesIO()
+        image_obj.save(image_stream, format="PNG")
+        image_stream.seek(0)
+        doc.add_picture(image_stream, width=Inches(5.5))
+        doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        meta_parts = []
+        if magnification:
+            meta_parts.append(f"Grossissement: {magnification}")
+        if protocol:
+            meta_parts.append(f"Protocole: {protocol}")
+        if meta_parts:
+            meta = doc.add_paragraph(" | ".join(meta_parts))
+            meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        doc.add_paragraph()
+        added_count += 1
+
+    return added_count
 
 
 # =============================================================================
@@ -1042,10 +1249,70 @@ SOURCE JSON:
     return content
 
 
-def generate_nuance_adn_content_with_openai(nuance, snapshot):
-    if not groq_client:
-        raise Exception("Groq client not initialized - set GROQ_API_KEY or hardcoded keys")
-    prompt_data = {
+def _truncate_snapshot_for_prompt(snapshot, max_json_chars=80000):
+    """Reduce snapshot size to fit within Groq API payload limits."""
+    snap = dict(snapshot)
+    # Remove redundant flattened composition (already in 'composition')
+    snap.pop("composition_flat", None)
+    # Strip image paths (not useful for text generation)
+    if "images" in snap:
+        snap["images"] = [{"image_id": img.get("image_id"), "expert_note": img.get("expert_note")} for img in snap.get("images", [])]
+    # Remove deep nested ADN if still too large
+    json_str = json.dumps(snap, ensure_ascii=False, default=str)
+    if len(json_str) > max_json_chars and "composition" in snap:
+        for comp in snap["composition"]:
+            comp.pop("matiere_adn", None)
+            comp.pop("black_mix_adn", None)
+            comp.pop("sub_nuance_adn", None)
+        json_str = json.dumps(snap, ensure_ascii=False, default=str)
+    # Final hard truncation as safety net
+    if len(json_str) > max_json_chars:
+        json_str = json_str[:max_json_chars] + "\n... (truncated)"
+    return json_str
+
+
+def _build_compact_nuance_prompt_data(nuance, snapshot):
+    components = []
+    for comp in snapshot.get("composition", []):
+        components.append({
+            "reference": comp.get("reference"),
+            "material_name": comp.get("material_name"),
+            "component_name": comp.get("component_name"),
+            "component_type": comp.get("component_type"),
+            "quantity": comp.get("quantity"),
+            "unit": comp.get("unit"),
+            "metadata": comp.get("metadata"),
+        })
+
+    process_steps = []
+    for step in snapshot.get("process_steps", []):
+        process_steps.append({
+            "step_order": step.get("step_order"),
+            "step_name": step.get("step_name"),
+            "machine": step.get("machine"),
+            "parameters": step.get("parameters"),
+            "materials": step.get("materials"),
+        })
+
+    control_plan = []
+    for row in snapshot.get("control_plan", []):
+        control_plan.append({
+            "parameter_name": row.get("parameter_name"),
+            "target_value": row.get("target_value"),
+            "min_value": row.get("min_value"),
+            "max_value": row.get("max_value"),
+            "unit": row.get("unit"),
+        })
+
+    images = []
+    for img in snapshot.get("images", [])[:3]:
+        note_json = ((img.get("expert_note") or {}).get("note_json") or {}) if isinstance(img.get("expert_note"), dict) else {}
+        images.append({
+            "image_id": img.get("image_id"),
+            "expert_note": note_json,
+        })
+
+    return {
         "nuance_identity": {
             "id": nuance.get("id"),
             "reference": nuance.get("reference"),
@@ -1053,9 +1320,22 @@ def generate_nuance_adn_content_with_openai(nuance, snapshot):
             "status": nuance.get("status"),
             "created_at": nuance.get("created_at"),
             "document_revision_history": nuance.get("document_revision_history"),
+            "cuisson": snapshot.get("cuisson"),
         },
-        "snapshot": serialize_to_json_compatible(snapshot),
+        "components": components,
+        "process_steps": process_steps,
+        "control_plan": control_plan,
+        "images": images,
     }
+
+
+def generate_nuance_adn_content_with_openai(nuance, snapshot):
+    if not groq_client:
+        raise Exception("Groq client not initialized - set GROQ_API_KEY or hardcoded keys")
+    prompt_data = _build_compact_nuance_prompt_data(
+        nuance,
+        serialize_to_json_compatible(snapshot),
+    )
     prompt = f"""You are a senior industrial carbon and graphite manufacturing engineer.
 Generate a structured NUANCE ADN report in professional English using ONLY the JSON source data below.
 Do not invent missing values. If data is missing, explicitly write "Not available".
@@ -1494,6 +1774,7 @@ def browser_search_materials():
 @app.route("/health", methods=["GET"])
 def health():
     check_db = request.args.get("check_db", "false").strip().lower() in {"1", "true", "yes"}
+    check_storage = request.args.get("check_storage", "false").strip().lower() in {"1", "true", "yes"}
     db_ok = db_error = None
     if check_db:
         try:
@@ -1506,13 +1787,21 @@ def health():
         except Exception as e:
             db_ok = False
             db_error = str(e)
-    return jsonify({"status": "ok", "dino_loaded": DINO_MODEL is not None, "groq_configured": groq_client is not None, "openai_configured": client is not None, "db_ok": db_ok, "db_error": db_error}), 200
+    return jsonify({
+        "status": "ok",
+        "dino_loaded": DINO_MODEL is not None,
+        "groq_configured": groq_client is not None,
+        "openai_configured": client is not None,
+        "db_ok": db_ok,
+        "db_error": db_error,
+        "azure_blob": get_azure_blob_diagnostics(check_storage=check_storage),
+    }), 200
 
 
 @app.route("/images/<path:filename>", methods=["GET"])
 def serve_image(filename):
+    requested_path = unquote(filename).replace("\\", "/")
     try:
-        requested_path = unquote(filename).replace("\\", "/")
         local_path = Path(IMAGES_DIR / requested_path)
         if local_path.exists():
             return send_from_directory(str(IMAGES_DIR), requested_path)
@@ -1537,8 +1826,16 @@ def serve_image(filename):
                 if blob_client.exists():
                     image_bytes = blob_client.download_blob().readall()
                     return send_file(io.BytesIO(image_bytes), download_name=Path(blob_name).name)
+        else:
+            logging.warning("Azure blob storage is disabled for image request: %s", requested_path)
     except Exception:
-        pass
+        logging.exception("serve_image failed for requested path: %s", requested_path)
+    logging.info(
+        "Image not found. requested_path=%s azure_enabled=%s container=%s",
+        requested_path,
+        is_azure_blob_enabled(),
+        AZURE_CONTAINER_NAME or None,
+    )
     return jsonify({"error": "not_found"}), 404
 
 
@@ -1707,7 +2004,7 @@ def upload_and_search():
         image_filename = f"{image_stem}_{int(time.time())}_{uuid.uuid4().hex}.jpg"
         image_path = _store_pil_image(img, image_filename, format="JPEG", quality=95, content_type="image/jpeg")
 
-        query_embedding = compute_embedding_from_pil(img)
+        query_embedding = compute_query_embedding_from_pil(img)   # FIX 1: normalized multi-scale
         if scope == "auto":
             # Fetch more from each table, then fuse into a single global top_k.
             k_each = min(50, max(top_k * 2, top_k))
@@ -1769,6 +2066,48 @@ def get_material_details(matiere_id):
             return jsonify({"success": True, "material": material, "fiches_matieres": fiches, "specifications": specifications, "expert_notes": expert_notes, "summary": {"matiere_id": matiere_id, "nom_matiere": material.get("nom_matiere"), "reference": material.get("reference"), "type_matiere": material.get("type_matiere"), "num_fiches": len(fiches), "num_specifications": len(specifications), "num_expert_notes": len(expert_notes)}}), 200
     except Exception as e:
         return jsonify({"success": False, "error": "retrieval_failed", "message": str(e)}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.route("/image_lookup", methods=["GET"])
+def image_lookup():
+    image_url = (request.args.get("image_url") or "").strip()
+    if not image_url:
+        return jsonify({"success": False, "error": "missing_image_url"}), 400
+
+    storage_path = _storage_path_from_external_image_url(image_url)
+    if not storage_path:
+        return jsonify({"success": False, "error": "invalid_image_url"}), 400
+
+    conn = None
+    try:
+        conn = get_db_conn()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            matches = _build_image_lookup_matches(cur, storage_path)
+
+        if not matches:
+            return jsonify({
+                "success": False,
+                "error": "image_not_found",
+                "query": {
+                    "image_url": image_url,
+                    "normalized_storage_path": storage_path,
+                },
+            }), 404
+
+        return jsonify({
+            "success": True,
+            "query": {
+                "image_url": image_url,
+                "normalized_storage_path": storage_path,
+            },
+            "match_count": len(matches),
+            "matches": matches,
+        }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": "image_lookup_failed", "message": str(e)}), 500
     finally:
         if conn:
             conn.close()
@@ -2135,51 +2474,97 @@ RÈGLES GÉNÉRALES: Aucune hallucination — utiliser UNIQUEMENT les données J
             conn.close()
 
 
+# =============================================================================
+# DOCX GENERATION — FROM ASSISTANT-PROVIDED MARKDOWN CONTENT (no Groq)
+# =============================================================================
+
+@app.route("/generate_docx_from_content", methods=["POST"])
+def generate_docx_from_content():
+    """Accept markdown content from the assistant and convert it to a DOCX file.
+
+    Expected JSON body:
+        title    (str, required) – Document heading
+        content  (str, required) – Markdown body written by the assistant
+        reference (str, optional) – Used in the filename, defaults to "report"
+        images   (list, optional) – Image references to append to the DOCX
+    """
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "").strip()
+    content = (data.get("content") or "").strip()
+    reference = (data.get("reference") or "report").strip()
+    images = data.get("images") or []
+
+    if not title or not content:
+        return jsonify({"success": False, "error": "missing_parameters",
+                        "message": "Both 'title' and 'content' are required."}), 400
+
+    if not isinstance(images, list):
+        return jsonify({"success": False, "error": "invalid_images",
+                        "message": "'images' must be an array when provided."}), 400
+
+    if len(content) > 500_000:
+        return jsonify({"success": False, "error": "content_too_large",
+                        "message": "Content exceeds 500 000 characters."}), 413
+
+    try:
+        doc = Document()
+        heading = doc.add_heading(title, level=1)
+        heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        info = doc.add_paragraph()
+        info.add_run(f"Référence: {reference}\n").bold = True
+        info.add_run(f"Généré le: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+        doc.add_paragraph()
+
+        add_formatted_markdown_to_docx(doc, content)
+
+        images_added = 0
+        if images:
+            doc.add_page_break()
+            images_heading = doc.add_heading("Images micrographiques", level=2)
+            images_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            images_added = _append_images_to_docx(doc, images)
+            if images_added == 0:
+                doc.add_paragraph("Aucune image exploitable n'a pu etre chargee depuis les references fournies.")
+
+        filename, download_url, absolute_url = _save_docx_and_build_url(
+            doc, "ADN_Report", reference
+        )
+        return jsonify({
+            "success": True,
+            "file_name": filename,
+            "download_url": download_url,
+            "absolute_url": absolute_url,
+            "images_added": images_added,
+            "expires_in": "1 hour",
+        }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": "generation_failed",
+                        "message": str(e)}), 500
+
+
 @app.route("/populate_fiches_adn_table", methods=["POST"])
 def populate_fiches_adn_table():
+    """Manual full rebuild — only needed after a bulk import
+    that bypassed the triggers, or for initial setup."""
+    conn = None
     try:
         conn = get_db_conn()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT matiere_id, nom_matiere, reference, type_matiere FROM public.matieres ORDER BY matiere_id")
-            materials = cur.fetchall()
-            if not materials:
-                return jsonify({"success": False, "message": "No materials found"}), 404
-            processed_count = updated_count = inserted_count = error_count = 0
-            errors_details = []
-            for material in materials:
-                try:
-                    matiere_id = material["matiere_id"]
-                    cur.execute("SELECT fiche_id FROM public.fiches_matieres WHERE matiere_id = %s ORDER BY fiche_id DESC", (matiere_id,))
-                    fiches = [dict(row) for row in cur.fetchall()]
-                    specifications_list = []
-                    for fiche in fiches:
-                        cur.execute("SELECT spec_id, fiche_id, source_type, donnees, date_creation, derniere_modification FROM public.specifications WHERE fiche_id = %s ORDER BY spec_id", (fiche["fiche_id"],))
-                        specifications_list.extend([dict(row) for row in cur.fetchall()])
-                    cur.execute("""
-                        SELECT men.id, men.matiere_image_id, men.note_json, men.created_at, mi.image_path
-                        FROM public.matiere_expert_notes men
-                        INNER JOIN public.matiere_images mi ON mi.id = men.matiere_image_id
-                        WHERE mi.matiere_id = %s ORDER BY men.created_at DESC
-                    """, (matiere_id,))
-                    expert_notes = [dict(row) for row in cur.fetchall()]
-                    aggregated_data = serialize_to_json_compatible({"fiches": fiches, "specifications": specifications_list, "expert_notes": expert_notes, "summary": {"num_fiches": len(fiches), "num_specifications": len(specifications_list), "num_expert_notes": len(expert_notes)}})
-                    cur.execute("SELECT fiche_adn_id FROM public.fiches_adn_matieres WHERE matiere_id = %s", (matiere_id,))
-                    existing = cur.fetchone()
-                    if existing:
-                        cur.execute("UPDATE public.fiches_adn_matieres SET nom_matiere=%s, reference=%s, type_matiere=%s, specifications=%s, num_specifications=%s, derniere_modification=CURRENT_TIMESTAMP WHERE matiere_id=%s",
-                                    (material["nom_matiere"], material["reference"], material["type_matiere"], Json(aggregated_data), len(specifications_list), matiere_id))
-                        updated_count += 1
-                    else:
-                        cur.execute("INSERT INTO public.fiches_adn_matieres (matiere_id, nom_matiere, reference, type_matiere, specifications, num_specifications, date_creation, derniere_modification) VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-                                    (matiere_id, material["nom_matiere"], material["reference"], material["type_matiere"], Json(aggregated_data), len(specifications_list)))
-                        inserted_count += 1
-                    processed_count += 1
-                    conn.commit()
-                except Exception as mat_error:
-                    error_count += 1
-                    errors_details.append({"matiere_id": material.get("matiere_id"), "error": str(mat_error)})
-                    conn.rollback()
-            return jsonify({"success": error_count == 0, "summary": {"total_materials": len(materials), "processed": processed_count, "inserted": inserted_count, "updated": updated_count, "errors": error_count}, "errors_details": errors_details[:10]}), 200
+            cur.execute(
+                "SELECT matiere_id FROM public.matieres ORDER BY matiere_id"
+            )
+            matiere_ids = [r["matiere_id"] for r in cur.fetchall()]
+            for matiere_id in matiere_ids:
+                cur.execute(
+                    "SELECT refresh_fiche_adn_for_matiere(%s)",
+                    (matiere_id,)
+                )
+            conn.commit()
+        return jsonify({
+            "success": True,
+            "rebuilt": len(matiere_ids)
+        }), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
@@ -2244,7 +2629,7 @@ def search():
     if err:
         return jsonify(err[0]), err[1]
     try:
-        query_embedding = compute_embedding_from_pil(img)
+        query_embedding = compute_query_embedding_from_pil(img)   # FIX 2: normalized multi-scale
         rows = search_similar_in_db(query_embedding, top_k=top_k)
         results = [{"id": r["id"], "image_url": build_image_url(r["image_path"]), "matiere_id": r["matiere_id"], "material_name": r["nom_matiere"], "reference": r["reference"], "similarity": float(r["similarity"]) if r["similarity"] is not None else None} for r in rows]
         return jsonify({"success": True, "results": results}), 200
@@ -2467,7 +2852,15 @@ def normalize_control_plan(control_plan_raw):
             sollwerte = control_plan_raw.get("sollwerte") or {}
             specs = sollwerte.get("active_specifications") or []
 
-        full_sheet_data = {k: v for k, v in control_plan_raw.items() if k != "active_specifications"}
+        full_sheet_data = control_plan_raw.get("data_sheet")
+        if full_sheet_data is None:
+            full_sheet_data = {
+                k: v
+                for k, v in control_plan_raw.items()
+                if k not in ("active_specifications", "sollwerte")
+            }
+        if full_sheet_data is None:
+            full_sheet_data = {}
 
         result = []
         for spec in specs:
@@ -2482,6 +2875,42 @@ def normalize_control_plan(control_plan_raw):
         return result
 
     return []
+
+
+def normalize_step_materials_payload(data):
+    """
+    Accept step materials in two formats:
+    - MAP (legacy/current): {"1": ["6600035", ...], "2": [...]}
+    - LIST (Actions-friendly): [{"step_order": 1, "materials": ["6600035", ...]}, ...]
+    Returns a normalized dict keyed by string step order.
+    """
+    normalized = {}
+
+    step_materials_list = data.get("step_materials_list") or []
+    if isinstance(step_materials_list, list):
+        for entry in step_materials_list:
+            if not isinstance(entry, dict):
+                continue
+            step_order = entry.get("step_order")
+            if step_order in (None, ""):
+                continue
+            materials = entry.get("materials")
+            if materials is None:
+                materials = entry.get("references")
+            if not isinstance(materials, list):
+                materials = []
+            normalized[str(step_order)] = [str(ref).strip() for ref in materials if str(ref).strip()]
+
+    step_materials_map = data.get("step_materials") or {}
+    if isinstance(step_materials_map, dict):
+        for step_order, materials in step_materials_map.items():
+            if step_order in (None, ""):
+                continue
+            if not isinstance(materials, list):
+                materials = []
+            normalized[str(step_order).strip()] = [str(ref).strip() for ref in materials if str(ref).strip()]
+
+    return normalized
 
 # =============================================================================
 # BLACK MIX — CORE HELPERS
@@ -2603,7 +3032,7 @@ def submit_black_mix():
     mix_name = data.get("mix_name")
     components = data.get("components", [])
     process_steps = data.get("process_steps", [])
-    step_materials_map = data.get("step_materials", {})
+    step_materials_map = normalize_step_materials_payload(data)
     control_plan_raw = data.get("control_plan", [])
     control_plan = normalize_control_plan(control_plan_raw)
     document_revision_history = data.get("document_revision_history")
@@ -2758,7 +3187,7 @@ def update_black_mix(mix_id):
 
                 components         = data.get("components", [])
                 process_steps      = data.get("process_steps", [])
-                step_materials_map = data.get("step_materials", {})
+                step_materials_map = normalize_step_materials_payload(data)
                 control_plan_raw   = data.get("control_plan", [])
                 control_plan       = normalize_control_plan(control_plan_raw)
 
@@ -3107,6 +3536,24 @@ def get_cuisson_program_by_number(cur, program_number: str):
     row = cur.fetchone()
     if not row:
         return None
+    # Support both tuple rows and RealDictCursor rows used by the API routes.
+    if isinstance(row, dict):
+        ovens = {}
+        for i in range(1, 14):
+            val = row.get(f"oven_{i}")
+            if val:
+                ovens[f"oven_{i}"] = val
+        return {
+            "id":                row.get("id"),
+            "program_number":    row.get("program_number"),
+            "max_temperature_c": float(row["max_temperature"]) if row.get("max_temperature") is not None else None,
+            "kontrolle":         row.get("kontrolle"),
+            "type":              row.get("type"),
+            "start_temp_c":      float(row["start_temp"]) if row.get("start_temp") is not None else 20,
+            "ovens":             ovens,
+            "phases":            row.get("phases_json"),
+        }
+
     # Build ovens dict (only non-null)
     ovens = {}
     for i in range(13):
@@ -3116,10 +3563,10 @@ def get_cuisson_program_by_number(cur, program_number: str):
     return {
         "id":                row[0],
         "program_number":    row[1],
-        "max_temperature_c": float(row[2]) if row[2] else None,
+        "max_temperature_c": float(row[2]) if row[2] is not None else None,
         "kontrolle":         row[3],
         "type":              row[4],
-        "start_temp_c":      float(row[5]) if row[5] else 20,
+        "start_temp_c":      float(row[5]) if row[5] is not None else 20,
         "ovens":             ovens,
         "phases":            row[19],
     }
@@ -3331,7 +3778,7 @@ def submit_nuance():
     nuance_name        = data.get("nuance_name")
     components         = data.get("components", [])
     process_steps      = data.get("process_steps", [])
-    step_materials_map = data.get("step_materials", {})
+    step_materials_map = normalize_step_materials_payload(data)
     control_plan_raw   = data.get("control_plan", [])
     control_plan       = normalize_control_plan(control_plan_raw)
 
@@ -3686,7 +4133,7 @@ def upload_nuance_image():
         file_bytes = file.read()
         file_path = _store_image_bytes(file_bytes, unique_filename, content_type=file.mimetype or "application/octet-stream")
         img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-        embedding = compute_embedding_from_pil(img)
+        embedding = _normalize_embedding(compute_embedding_from_pil(img))   # FIX 3: normalize before storing
         conn = get_db_conn()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT name, reference FROM public.nuances WHERE id = %s", (int(nuance_id),))
@@ -3727,7 +4174,7 @@ def search_similar_nuances():
     if err:
         return jsonify(err[0]), err[1]
     try:
-        query_embedding = compute_embedding_from_pil(img)
+        query_embedding = compute_query_embedding_from_pil(img)   # FIX 4: normalized multi-scale
         rows = search_similar_nuances_in_db(query_embedding, top_k=top_k)
         results = [{"id": r["id"], "image_url": build_image_url(r["image_path"]), "nuance_id": r["nuance_id"], "nuance_name": r["nuance_name"], "reference": r["reference"], "similarity": float(r["similarity"]) if r["similarity"] is not None else None} for r in rows]
         return jsonify({"success": True, "results": results}), 200
@@ -3738,27 +4185,6 @@ def search_similar_nuances():
 # =============================================================================
 # CUISSON PROGRAMS — ENDPOINTS (UPDATED with kontrolle + VARCHAR)
 # =============================================================================
-
-@app.route("/cuisson-programs", methods=["GET"])
-def list_cuisson_programs():
-    conn = psycopg2.connect(DB_DSN)
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT id, program_number, max_temperature, kontrolle, type,
-                       start_temp, oven_1, oven_2, oven_3, oven_4, oven_5,
-                       oven_6, oven_7, oven_8, oven_9, oven_10, oven_11,
-                       oven_12, oven_13, phases_json
-                FROM public.cuisson_programs
-                ORDER BY program_number
-            """)
-            rows = [dict(r) for r in cur.fetchall()]
-            return jsonify({"success": True, "count": len(rows), "programs": rows}), 200
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-    finally:
-        conn.close()
-
 
 @app.route("/cuisson-programs/<string:program_number>", methods=["GET"])
 def get_cuisson_program_detail(program_number):
@@ -3821,66 +4247,6 @@ def parse_cuisson_field():
         conn.close()
 
 
-@app.route("/nuance/<int:nuance_id>/set-cuisson", methods=["POST"])
-def set_nuance_cuisson(nuance_id):
-    """
-    Associate a cuisson program to a nuance.
-    Body: { "warne_nachbehandlung": "101 25" }
-    """
-    data = request.get_json() or {}
-    raw_value = data.get("warne_nachbehandlung", "").strip()
-    if not raw_value:
-        return jsonify({"success": False, "error": "Champ 'warne_nachbehandlung' requis. Ex: '101 25'"}), 400
-
-    program_number, h2_percent = parse_warne_nachbehandlung(raw_value)
-    if not program_number:
-        return jsonify({"success": False, "error": f"Format invalide: '{raw_value}'. Attendu: '101 25'"}), 400
-
-    conn = psycopg2.connect(DB_DSN)
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id, reference FROM public.nuances WHERE id = %s", (nuance_id,))
-            nuance = cur.fetchone()
-            if not nuance:
-                return jsonify({"success": False, "error": "Nuance non trouvée"}), 404
-
-            program_number, h2_percent, cuisson_program_id = _resolve_cuisson_program(cur, raw_value)
-
-            cur.execute(
-                """
-                UPDATE public.nuances
-                SET cuisson_raw            = %s,
-                    cuisson_program_number = %s,
-                    cuisson_h2_percent     = %s,
-                    cuisson_program_id     = %s,
-                    updated_at             = NOW()
-                WHERE id = %s
-                """,
-                (raw_value, program_number, h2_percent, cuisson_program_id, nuance_id)
-            )
-            conn.commit()
-
-            program = get_cuisson_program_by_number(cur, program_number) if cuisson_program_id else None
-            n2_percent = (100 - h2_percent) if h2_percent is not None else None
-
-            return jsonify({
-                "success":             True,
-                "message":             f"Programme de cuisson '{raw_value}' associé à la nuance {nuance['reference']}",
-                "nuance_id":           nuance_id,
-                "cuisson_raw":         raw_value,
-                "program_number":      program_number,
-                "h2_percent":          h2_percent,
-                "n2_percent":          n2_percent,
-                "atmosphere":          f"H2 {h2_percent}% + N2 {n2_percent}%",
-                "program_found_in_db": cuisson_program_id is not None,
-                "program":             program,
-            }), 200
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"success": False, "error": str(e)}), 500
-    finally:
-        conn.close()
-
 @app.route("/nuance/<int:nuance_id>/update", methods=["PUT"])
 def update_nuance(nuance_id):
     if not request.is_json:
@@ -3914,7 +4280,7 @@ def update_nuance(nuance_id):
 
                 components         = data.get("components", [])
                 process_steps      = data.get("process_steps", [])
-                step_materials_map = data.get("step_materials", {})
+                step_materials_map = normalize_step_materials_payload(data)
                 control_plan_raw   = data.get("control_plan", [])
                 control_plan       = normalize_control_plan(control_plan_raw)
 
@@ -4256,13 +4622,13 @@ def _parse_sollwerte(xls_sheet, book):
 
 
 def _parse_data_sheet(xls_sheet, book):
-    """Parse the reference/data sheet (e.g. '049 91') into structured measurement records."""
-    import xlrd
+    """Parse the reference/data sheet after Sollwerte into rich measurement records."""
     result = {
         "type": "",
         "reference": "",
         "method": "",
         "headers": [],
+        "columns": [],
         "measurements": []
     }
 
@@ -4274,6 +4640,9 @@ def _parse_data_sheet(xls_sheet, book):
     result["reference"] = _xlrd_cell_to_str(xls_sheet.cell(0, 1), book)
     if xls_sheet.ncols > 4:
         result["method"] = _xlrd_cell_to_str(xls_sheet.cell(0, 4), book)
+    columns = _build_data_sheet_columns(xls_sheet, book)
+    result["columns"] = columns
+    result["headers"] = [col["label"] for col in columns]
 
     # Data rows start at row 7 (index 7) based on structure:
     # Row 3: top headers (Datum, Charge, Prüfer, Schüttdichte, Siebe)
@@ -4286,34 +4655,211 @@ def _parse_data_sheet(xls_sheet, book):
         if not row_num:
             continue
 
-        datum = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 1), book)
-        charge = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 2), book)
-        pruefer = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 3), book)
+        values = {}
+        for col in columns:
+            value = _xlrd_cell_to_str(xls_sheet.cell(row_idx, col["index"]), book)
+            if value != "":
+                values[col["key"]] = value
+
+        identity_present = any(values.get(key) for key in ("datum", "charge", "pruefer", "teil", "los", "bemerkung"))
+        actual_present = any(values.get(col["key"]) for col in columns if col.get("role") == "actual")
+        if not identity_present and not actual_present:
+            continue
 
         record = {
-            "nr": row_num,
-            "datum": datum,
-            "charge": charge,
-            "pruefer": pruefer,
-            "schuettdichte": _xlrd_cell_to_str(xls_sheet.cell(row_idx, 4), book),
+            "nr": values.get("nr", row_num),
+            "datum": values.get("datum", ""),
+            "charge": values.get("charge", ""),
+            "pruefer": values.get("pruefer", ""),
+            "values": values,
         }
 
-        # Sieve IST values only (SOLL is already in Sollwerte)
-        if xls_sheet.ncols > 10:
-            record["sieve_630"] = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 10), book)
-        if xls_sheet.ncols > 13:
-            record["sieve_355"] = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 13), book)
-        if xls_sheet.ncols > 16:
-            record["sieve_90"] = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 16), book)
-        if xls_sheet.ncols > 19:
-            record["sieve_lt90"] = _xlrd_cell_to_str(xls_sheet.cell(row_idx, 19), book)
-
-        # Remove empty values to save space
-        record = {k: v for k, v in record.items() if v}
+        for extra_key in ("teil", "los", "bemerkung"):
+            if values.get(extra_key):
+                record[extra_key] = values[extra_key]
 
         result["measurements"].append(record)
 
     return result
+
+
+def _excel_column_name(index):
+    """Convert a zero-based column index to Excel-style letters."""
+    index += 1
+    name = ""
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def _normalize_text_for_key(text):
+    """Normalize text into a stable ASCII key."""
+    normalized = unicodedata.normalize("NFKD", str(text or ""))
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    ascii_text = ascii_text.lower()
+    ascii_text = re.sub(r"[^a-z0-9]+", "_", ascii_text).strip("_")
+    return ascii_text
+
+
+def _build_data_sheet_columns(xls_sheet, book):
+    """Build dynamic column metadata from the four header rows above the data block."""
+    fixed_columns = {
+        0: ("nr", "Nr"),
+        1: ("datum", "Datum"),
+        2: ("charge", "Charge"),
+        3: ("pruefer", "Prüfer"),
+    }
+    generic_groups = {"siebe"}
+    columns = []
+
+    for col_idx in range(xls_sheet.ncols):
+        if col_idx in fixed_columns:
+            key, label = fixed_columns[col_idx]
+            columns.append({
+                "index": col_idx,
+                "excel_column": _excel_column_name(col_idx),
+                "key": key,
+                "label": label,
+                "parameter_label": label,
+                "role": "meta",
+            })
+            continue
+
+        row3 = _xlrd_cell_to_str(xls_sheet.cell(3, col_idx), book) if xls_sheet.nrows > 3 else ""
+        row4 = _xlrd_cell_to_str(xls_sheet.cell(4, col_idx), book) if xls_sheet.nrows > 4 else ""
+        row5 = _xlrd_cell_to_str(xls_sheet.cell(5, col_idx), book) if xls_sheet.nrows > 5 else ""
+        row6 = _xlrd_cell_to_str(xls_sheet.cell(6, col_idx), book) if xls_sheet.nrows > 6 else ""
+
+        base_label = row4 or row3 or f"Column {col_idx + 1}"
+        if row3 and _normalize_text_for_key(row3) in generic_groups and row4:
+            base_label = row4
+
+        label_parts = []
+        if row3 and row3 != base_label and _normalize_text_for_key(row3) not in generic_groups:
+            label_parts.append(row3)
+        label_parts.append(base_label)
+        if row5:
+            label_parts.append(row5)
+        if row6:
+            label_parts.append(row6)
+
+        deduped_parts = []
+        for part in label_parts:
+            part = str(part or "").strip()
+            if not part:
+                continue
+            if deduped_parts and deduped_parts[-1].lower() == part.lower():
+                continue
+            deduped_parts.append(part)
+
+        label = " | ".join(deduped_parts) if deduped_parts else f"Column {col_idx + 1}"
+        key = _normalize_text_for_key(label) or f"col_{col_idx + 1}"
+
+        role_hint = " ".join([row5, row6]).lower()
+        if "ist" in role_hint:
+            role = "actual"
+        elif row5 or row6:
+            role = "spec"
+        else:
+            role = "meta"
+
+        columns.append({
+            "index": col_idx,
+            "excel_column": _excel_column_name(col_idx),
+            "key": key,
+            "label": label,
+            "parameter_label": base_label,
+            "role": role,
+        })
+
+    return columns
+
+
+def _get_measurement_value(measurement, key):
+    """Read a measurement value from the nested values map with a flat fallback."""
+    values = measurement.get("values") or {}
+    if key in values:
+        return values.get(key)
+    return measurement.get(key)
+
+
+def _parse_numeric_value(raw_value):
+    """Parse a numeric measurement value."""
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+    cleaned = text.replace(" ", "").replace(",", ".")
+    try:
+        return float(cleaned)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_label_for_match(text):
+    """Normalize a parameter label for matching specs to measurement columns."""
+    normalized = _normalize_text_for_key(text)
+    tokens = [tok for tok in normalized.split("_") if tok and tok not in {"ist", "soll", "min", "max"}]
+    return "_".join(tokens)
+
+
+def _match_spec_columns(active_specs, columns):
+    """Match active Sollwerte specs to actual-value columns from the data sheet."""
+    actual_columns = [col for col in (columns or []) if col.get("role") == "actual"]
+    if not active_specs or not actual_columns:
+        return {}
+
+    mapping = {}
+    for spec in active_specs:
+        spec_name = spec.get("parameter") or spec.get("parameter_name") or ""
+        spec_norm = _normalize_label_for_match(spec_name)
+        best_column = None
+        best_score = 0
+
+        for column in actual_columns:
+            col_norm = _normalize_label_for_match(column.get("parameter_label") or column.get("label") or "")
+            if not col_norm:
+                continue
+
+            if spec_norm == col_norm:
+                score = 100
+            elif spec_norm and (spec_norm in col_norm or col_norm in spec_norm):
+                score = 80
+            else:
+                spec_tokens = {tok for tok in spec_norm.split("_") if tok}
+                col_tokens = {tok for tok in col_norm.split("_") if tok}
+                score = len(spec_tokens & col_tokens)
+
+            if score > best_score:
+                best_score = score
+                best_column = column
+
+        if best_column and best_score > 0:
+            mapping[spec_name] = best_column
+
+    return mapping
+
+
+def _select_latest_measurements(measurements):
+    """Return only the rows that belong to the latest dated measurement bucket."""
+    latest_date = None
+    latest_rows = []
+
+    for measurement in _sort_measurements_by_date(measurements):
+        parsed = _parse_measurement_date(measurement.get("datum", ""))
+        if not parsed:
+            continue
+        date_key = parsed.date()
+        if latest_date is None or date_key > latest_date:
+            latest_date = date_key
+            latest_rows = [measurement]
+        elif date_key == latest_date:
+            latest_rows.append(measurement)
+
+    return {
+        "latest_date": latest_date.isoformat() if latest_date else "",
+        "measurements": latest_rows,
+    }
 
 
 def _parse_measurement_date(raw_value):
@@ -4397,68 +4943,49 @@ def _summarize_measurements_by_year(grouped_measurements):
     return summary
 
 
-def _compute_measurement_stats(measurements, active_specs=None):
-    """Compute summary statistics for measurement data to avoid sending all rows."""
+def _compute_measurement_stats(measurements, active_specs=None, columns=None):
+    """Compute summary statistics using spec-to-column matching from the data sheet."""
     if not measurements:
         return {"count": 0}
 
-    # Numeric fields to aggregate
-    fields = ["schuettdichte", "sieve_630", "sieve_355", "sieve_90", "sieve_lt90"]
     stats = {"count": len(measurements)}
+    spec_columns = _match_spec_columns(active_specs or [], columns or [])
 
-    for field in fields:
+    for spec in active_specs or []:
+        spec_name = spec.get("parameter") or spec.get("parameter_name") or ""
+        column = spec_columns.get(spec_name)
+        if not column:
+            continue
+
         values = []
-        for m in measurements:
-            raw = m.get(field, "")
-            if raw:
-                try:
-                    values.append(float(str(raw).replace(",", ".")))
-                except (ValueError, TypeError):
-                    pass
-        if values:
-            avg = sum(values) / len(values)
-            stats[field] = {
-                "count": len(values),
-                "min": round(min(values), 2),
-                "max": round(max(values), 2),
-                "mean": round(avg, 2),
-                "std": round((sum((x - avg) ** 2 for x in values) / len(values)) ** 0.5, 2)
-            }
-            # Count out-of-spec if specs are available
-            if active_specs:
-                spec = None
-                spec_map = {
-                    "schuettdichte": "schüttdichte",
-                    "sieve_630": "630",
-                    "sieve_355": "355",
-                    "sieve_90": "> 90",
-                    "sieve_lt90": "< 90"
-                }
-                search_key = spec_map.get(field, "")
-                for s in active_specs:
-                    if search_key in s.get("parameter", "").lower():
-                        spec = s
-                        break
-                if spec:
-                    spec_min = None
-                    spec_max = None
-                    try:
-                        if spec.get("min"):
-                            spec_min = float(str(spec["min"]).replace(",", "."))
-                    except (ValueError, TypeError):
-                        pass
-                    try:
-                        if spec.get("max"):
-                            spec_max = float(str(spec["max"]).replace(",", "."))
-                    except (ValueError, TypeError):
-                        pass
-                    oos = 0
-                    for v in values:
-                        if (spec_min is not None and v < spec_min) or (spec_max is not None and v > spec_max):
-                            oos += 1
-                    stats[field]["out_of_spec"] = oos
+        for measurement in measurements:
+            parsed = _parse_numeric_value(_get_measurement_value(measurement, column["key"]))
+            if parsed is not None:
+                values.append(parsed)
 
-    # Date range
+        if not values:
+            continue
+
+        avg = sum(values) / len(values)
+        spec_min = _parse_numeric_value(spec.get("min") if spec.get("min") not in ("", None) else spec.get("min_value"))
+        spec_max = _parse_numeric_value(spec.get("max") if spec.get("max") not in ("", None) else spec.get("max_value"))
+        out_of_spec = 0
+        for value in values:
+            if (spec_min is not None and value < spec_min) or (spec_max is not None and value > spec_max):
+                out_of_spec += 1
+
+        stats[spec_name] = {
+            "count": len(values),
+            "min": round(min(values), 2),
+            "max": round(max(values), 2),
+            "mean": round(avg, 2),
+            "std": round((sum((x - avg) ** 2 for x in values) / len(values)) ** 0.5, 2),
+            "out_of_spec": out_of_spec,
+            "out_of_spec_pct": round((out_of_spec / len(values)) * 100, 2) if values else 0.0,
+            "column_key": column["key"],
+            "column_label": column["label"],
+        }
+
     dated_measurements = [m for m in _sort_measurements_by_date(measurements) if m.get("datum")]
     if dated_measurements:
         stats["date_range"] = {
@@ -4469,68 +4996,58 @@ def _compute_measurement_stats(measurements, active_specs=None):
     return stats
 
 
-def _find_non_conformities(measurements, active_specs):
-    """Find charges (lots) whose measurement values exceed min/max from Sollwerte.
-    A charge may appear multiple times if it was re-tested after a non-conformity."""
+def _find_non_conformities(measurements, active_specs, columns=None):
+    """Find charges whose measured values exceed Sollwerte min/max limits."""
     if not measurements or not active_specs:
         return []
 
-    # Build spec lookup: field_name -> (min, max)
-    spec_map = {
-        "schuettdichte": "schüttdichte",
-        "sieve_630": "630",
-        "sieve_355": "355",
-        "sieve_90": "> 90",
-        "sieve_lt90": "< 90"
-    }
-    spec_limits = {}
-    for field, search_key in spec_map.items():
-        for s in active_specs:
-            if search_key in s.get("parameter", "").lower():
-                spec_min = None
-                spec_max = None
-                try:
-                    if s.get("min"):
-                        spec_min = float(str(s["min"]).replace(",", "."))
-                except (ValueError, TypeError):
-                    pass
-                try:
-                    if s.get("max"):
-                        spec_max = float(str(s["max"]).replace(",", "."))
-                except (ValueError, TypeError):
-                    pass
-                if spec_min is not None or spec_max is not None:
-                    spec_limits[field] = (spec_min, spec_max, s.get("parameter", ""))
-                break
+    spec_columns = _match_spec_columns(active_specs, columns or [])
+    if not spec_columns:
+        return []
 
     non_conf = []
-    for m in measurements:
-        charge = m.get("charge", "")
+    for measurement in measurements:
+        charge = measurement.get("charge", "")
         if not charge:
             continue
+
         failures = []
-        for field, (s_min, s_max, param_name) in spec_limits.items():
-            raw = m.get(field, "")
-            if not raw:
+        for spec in active_specs:
+            param_name = spec.get("parameter") or spec.get("parameter_name") or ""
+            column = spec_columns.get(param_name)
+            if not column:
                 continue
-            try:
-                val = float(str(raw).replace(",", "."))
-            except (ValueError, TypeError):
+
+            value = _parse_numeric_value(_get_measurement_value(measurement, column["key"]))
+            if value is None:
                 continue
-            if (s_min is not None and val < s_min) or (s_max is not None and val > s_max):
-                failures.append({
+
+            spec_min = _parse_numeric_value(spec.get("min") if spec.get("min") not in ("", None) else spec.get("min_value"))
+            spec_max = _parse_numeric_value(spec.get("max") if spec.get("max") not in ("", None) else spec.get("max_value"))
+            if (spec_min is not None and value < spec_min) or (spec_max is not None and value > spec_max):
+                failure = {
                     "parameter": param_name,
-                    "value": val,
-                    "min": s_min,
-                    "max": s_max
-                })
+                    "value": value,
+                    "min": spec_min,
+                    "max": spec_max,
+                    "column_label": column["label"],
+                }
+                spec_unit_match = re.search(r"\[([^\]]+)\]", param_name)
+                if spec_unit_match:
+                    failure["unit"] = spec_unit_match.group(1)
+                failures.append(failure)
+
         if failures:
-            non_conf.append({
+            item = {
                 "charge": charge,
-                "nr": m.get("nr", ""),
-                "datum": m.get("datum", ""),
-                "failures": failures
-            })
+                "nr": measurement.get("nr", ""),
+                "datum": measurement.get("datum", ""),
+                "failures": failures,
+            }
+            for extra_key in ("teil", "los", "bemerkung"):
+                if measurement.get(extra_key):
+                    item[extra_key] = measurement[extra_key]
+            non_conf.append(item)
 
     return non_conf
 
@@ -4623,24 +5140,30 @@ def convert_xls_to_json():
                 active_specs = sollwerte_data.get("active_specifications", [])
                 measurements_by_year = _group_measurements_by_year(all_measurements)
                 measurements_by_year_summary = _summarize_measurements_by_year(measurements_by_year)
+                latest_measurements = _select_latest_measurements(all_measurements)
 
                 # Find charges with values outside spec
-                non_conformities = _find_non_conformities(all_measurements, active_specs)
+                non_conformities = _find_non_conformities(all_measurements, active_specs, data_sheet_result.get("columns"))
 
                 ds_response = {
                     "sheet_name": data_sheet_name,
                     "type": data_sheet_result["type"],
                     "reference": data_sheet_result["reference"],
                     "method": data_sheet_result["method"],
+                    "columns": data_sheet_result.get("columns", []),
                     "total_measurements": len(all_measurements),
+                    "latest_measurement_date": latest_measurements["latest_date"],
+                    "recent_measurements_count": len(latest_measurements["measurements"]),
+                    "recent_measurements": latest_measurements["measurements"],
                     "measurements_by_year_summary": measurements_by_year_summary,
+                    "non_conformities": non_conformities,
                 }
                 if mode == "full":
                     ds_response["measurements"] = all_measurements
                     ds_response["measurements_by_year"] = measurements_by_year
                 else:
-                    # Summary mode: stats + last N rows
-                    ds_response["statistics"] = _compute_measurement_stats(all_measurements, active_specs)
+                    # Summary mode: stats + compact recent-date persistence payload
+                    ds_response["statistics"] = _compute_measurement_stats(all_measurements, active_specs, data_sheet_result.get("columns"))
                     ds_response["last_measurements"] = all_measurements[-max_rows:]
                     ds_response["measurements_by_year"] = {
                         year: rows[-max_rows:]
@@ -4861,7 +5384,7 @@ def search_image_unified():
 
     # ── 6. Compute DINOv2 embedding ───────────────────────────────────────────
     try:
-        query_embedding = compute_embedding_from_pil(pil_img)
+        query_embedding = compute_query_embedding_from_pil(pil_img)   # FIX 5: normalized multi-scale
     except Exception as exc:
         temp_path.unlink(missing_ok=True)
         return jsonify({
@@ -4975,7 +5498,329 @@ def search_image_unified():
 #
 # This ensures temp images (uploaded by GPT) are deleted after 15 minutes
 # while docx files in DOCX_TEMP_DIR retain their existing 1-hour TTL.
+# =============================================================================
+# PASTE THIS ROUTE INTO app.py  — after the browser_search_materials route
+# (around line 1537, before the /health route)
+# =============================================================================
+#
+# Requirements already present in app.py:
+#   compute_query_embedding_from_pil, search_similar_globally_in_db,
+#   _format_global_browser_results, _normalize_embedding,
+#   generate_fiche_adn_content_with_groq / generate_nuance_adn_content_with_openai,
+#   _get_fiche_adn, call_groq_with_retry, _save_docx_and_build_url
+#
+# HTML template must have:
+#   data-compare-endpoint="{{ url_for('compare_micrographs') }}"
 
+
+@app.route("/api/materials/compare", methods=["POST"])
+def compare_micrographs():
+    """
+    Compare two uploaded micrograph images.
+
+    Pipeline:
+      1. Load both images, run compute_query_embedding_from_pil (DINOv2 multi-scale)
+      2. pgvector search each embedding against matiere_images + nuance_images
+      3. Compute cross-embedding cosine similarity   (1 - cos_distance)
+      4. Retrieve ADN data for both best matches (from fiches_adn_matieres or nuances)
+      5. Call Groq Llama to generate a structured differential ADN report
+      6. Return JSON:
+            match_a, match_b,
+            cross_similarity, cross_similarity_pct,
+            adn_a (markdown), adn_b (markdown), adn_diff (markdown),
+            download_url (optional docx)
+
+    Multipart body:
+        image_a  — file
+        image_b  — file
+    """
+    # ── 1. Validate uploads ───────────────────────────────────────────────────
+    if "image_a" not in request.files or "image_b" not in request.files:
+        return jsonify({"success": False, "error": "missing_images",
+                        "message": "Provide both image_a and image_b as multipart files."}), 400
+
+    file_a = request.files["image_a"]
+    file_b = request.files["image_b"]
+
+    for label, f in [("image_a", file_a), ("image_b", file_b)]:
+        if not f or not f.filename:
+            return jsonify({"success": False, "error": f"missing_{label}"}), 400
+        if not allowed_file(f.filename):
+            return jsonify({"success": False, "error": f"invalid_file_type_{label}",
+                            "allowed": sorted(list(ALLOWED_EXTENSIONS))}), 400
+
+    # ── 2. Open images ────────────────────────────────────────────────────────
+    try:
+        bytes_a = file_a.read()
+        img_a   = Image.open(io.BytesIO(bytes_a)).convert("RGB")
+    except (UnidentifiedImageError, Exception) as e:
+        return jsonify({"success": False, "error": "image_a_invalid", "message": str(e)}), 400
+
+    try:
+        bytes_b = file_b.read()
+        img_b   = Image.open(io.BytesIO(bytes_b)).convert("RGB")
+    except (UnidentifiedImageError, Exception) as e:
+        return jsonify({"success": False, "error": "image_b_invalid", "message": str(e)}), 400
+
+    # ── 3. Compute embeddings (DINOv2 multi-scale) ────────────────────────────
+    try:
+        emb_a = compute_query_embedding_from_pil(img_a)
+        emb_b = compute_query_embedding_from_pil(img_b)
+    except Exception as e:
+        logging.error(f"compare_micrographs: embedding failed: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "embedding_failed", "message": str(e)}), 500
+
+    # ── 4. pgvector search — best match for each ──────────────────────────────
+    try:
+        rows_a = search_similar_globally_in_db(emb_a, top_k=1)
+        rows_b = search_similar_globally_in_db(emb_b, top_k=1)
+    except Exception as e:
+        logging.error(f"compare_micrographs: search failed: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "search_failed", "message": str(e)}), 500
+
+    if not rows_a:
+        return jsonify({"success": False, "error": "no_match_a",
+                        "message": "Image A returned no match from the database."}), 404
+    if not rows_b:
+        return jsonify({"success": False, "error": "no_match_b",
+                        "message": "Image B returned no match from the database."}), 404
+
+    results_a = _format_global_browser_results(rows_a)
+    results_b = _format_global_browser_results(rows_b)
+    match_a   = results_a[0]
+    match_b   = results_b[0]
+
+    # ── 5. Cross-embedding cosine similarity ──────────────────────────────────
+    def _cosine_sim(u: np.ndarray, v: np.ndarray) -> float:
+        u = u.ravel().astype("float32")
+        v = v.ravel().astype("float32")
+        denom = (np.linalg.norm(u) * np.linalg.norm(v))
+        if denom == 0:
+            return 0.0
+        return float(np.dot(u, v) / denom)
+
+    cross_sim     = _cosine_sim(emb_a, emb_b)
+    cross_sim_pct = round(max(0.0, min(1.0, cross_sim)) * 100, 2)
+
+    # ── 6. Retrieve ADN content for each match ────────────────────────────────
+    def _get_adn_text_for_match(match: dict) -> str:
+        """Return a best-effort ADN markdown string for a match dict."""
+        domain     = (match.get("domain") or "").lower()
+        reference  = match.get("reference") or ""
+        matiere_id = match.get("matiere_id")
+        nuance_id  = match.get("nuance_id")
+
+        conn = get_db_conn()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if domain == "matiere" and matiere_id:
+                    # Try fiches_adn_matieres first
+                    fiche = _get_fiche_adn(cur, matiere_id=matiere_id)
+                    if not fiche and reference:
+                        fiche = _get_fiche_adn(cur, reference=reference)
+                    if fiche:
+                        specs = fiche.get("specifications") or {}
+                        try:
+                            return generate_fiche_adn_content_with_groq(
+                                fiche_data   = fiche,
+                                material_name= fiche.get("nom_matiere", ""),
+                                reference    = fiche.get("reference", reference),
+                                type_matiere = fiche.get("type_matiere", ""),
+                                specifications = specs,
+                            )
+                        except Exception as eg:
+                            logging.warning(f"ADN groq generation failed for {reference}: {eg}")
+                    # Fallback: return minimal summary from matieres table
+                    cur.execute("SELECT nom_matiere, reference, type_matiere FROM public.matieres WHERE matiere_id = %s LIMIT 1", (matiere_id,))
+                    row = cur.fetchone()
+                    if row:
+                        return (
+                            f"# Material ADN — {row['reference']}\n\n"
+                            f"**Name**: {row['nom_matiere']}\n"
+                            f"**Type**: {row['type_matiere'] or 'N/A'}\n\n"
+                            "_Detailed ADN data not available for this material._"
+                        )
+
+                elif domain == "nuance" and nuance_id:
+                    cur.execute("""
+                        SELECT n.id, n.reference, n.name, n.status,
+                               n.created_at, n.document_revision_history
+                        FROM public.nuances n WHERE n.id = %s LIMIT 1
+                    """, (nuance_id,))
+                    nuance = cur.fetchone()
+                    if nuance:
+                        # Build a snapshot (simplified — use whatever fields are available)
+                        snapshot = {
+                            "nuance_id": nuance_id,
+                            "reference": nuance.get("reference"),
+                            "name":      nuance.get("name"),
+                        }
+                        try:
+                            return generate_nuance_adn_content_with_openai(
+                                nuance   = dict(nuance),
+                                snapshot = snapshot,
+                            )
+                        except Exception as eg:
+                            logging.warning(f"Nuance ADN groq failed for {reference}: {eg}")
+                    return (
+                        f"# Nuance ADN — {reference}\n\n"
+                        "_Detailed ADN data not available for this nuance._"
+                    )
+        finally:
+            conn.close()
+
+        return f"# ADN — {reference}\n\n_ADN data not available._"
+
+    try:
+        adn_text_a = _get_adn_text_for_match(match_a)
+    except Exception as e:
+        logging.warning(f"compare_micrographs: ADN-A fetch failed: {e}")
+        adn_text_a = f"# ADN — {match_a.get('reference','A')}\n\n_ADN retrieval failed: {e}_"
+
+    try:
+        adn_text_b = _get_adn_text_for_match(match_b)
+    except Exception as e:
+        logging.warning(f"compare_micrographs: ADN-B fetch failed: {e}")
+        adn_text_b = f"# ADN — {match_b.get('reference','B')}\n\n_ADN retrieval failed: {e}_"
+
+    # ── 7. Generate differential report (Groq Llama) ──────────────────────────
+    diff_prompt = f"""You are a senior materials science engineer.
+You have been given two material ADN (Material DNA) reports identified from micrograph images.
+Your task is to produce a **structured, professional differential analysis** in English.
+
+## Match A
+- Reference : {match_a.get('reference', 'N/A')}
+- Name      : {match_a.get('display_name') or match_a.get('material_name', 'N/A')}
+- Domain    : {match_a.get('domain', 'N/A')}
+- Similarity: {round(simPctFromMatch(match_a) or 0, 1) if (match_a.get('similarity_pct') or match_a.get('similarity')) else 'N/A'}%
+
+## Match B
+- Reference : {match_b.get('reference', 'N/A')}
+- Name      : {match_b.get('display_name') or match_b.get('material_name', 'N/A')}
+- Domain    : {match_b.get('domain', 'N/A')}
+- Similarity: {round(simPctFromMatch(match_b) or 0, 1) if (match_b.get('similarity_pct') or match_b.get('similarity')) else 'N/A'}%
+
+Cross-embedding cosine similarity between the two query images: **{cross_sim_pct}%**
+(100% = identical embedding space → visually/structurally identical; 0% = completely different)
+
+## ADN — Material A
+{adn_text_a[:3000]}
+
+## ADN — Material B
+{adn_text_b[:3000]}
+
+---
+
+Generate a differential analysis with EXACTLY this structure (Markdown):
+
+# ADN Differential Analysis — A vs B
+
+## 1. Executive Comparison Summary
+(2-3 sentences summarising the key difference between A and B)
+
+## 2. Visual & Structural Similarity
+- Cross-embedding similarity interpretation
+- What it implies about grain structure, surface texture, morphology
+
+## 3. Key ADN Differences
+| Property | Material A | Material B | Delta / Comment |
+|---|---|---|---|
+(Fill in all relevant properties found in both ADNs)
+
+## 4. Chemical Composition Differences
+(Compare chemical profiles; note elements present in one but not the other)
+
+## 5. Physical & Mechanical Properties Comparison
+(Compare hardness, density, granulometry, process temperatures if available)
+
+## 6. Application & Usage Divergence
+(Where would you use A vs B? Trade-offs?)
+
+## 7. Quality & Specification Gaps
+(Different standards, controls, or spec ranges)
+
+## 8. Expert Recommendation
+(Which material is preferable for which use case, and why)
+
+Use tables wherever meaningful. Be precise, factual, and concise.
+Do NOT invent data — if a property is missing for one material, write "Not available".
+ALL OUTPUT IN ENGLISH ONLY.
+"""
+
+    def _safe_sim_pct(m):
+        v = m.get("similarity_pct") if m.get("similarity_pct") is not None else (m.get("similarity", 0) or 0) * 100
+        return round(float(v), 1) if v else 0.0
+
+    # Patch simPctFromMatch for use in the f-string above (it's a JS function name, use Python inline)
+    def simPctFromMatch(m):
+        if not m: return None
+        if m.get("similarity_pct") is not None: return m["similarity_pct"]
+        if m.get("similarity")     is not None: return m["similarity"] * 100
+        return None
+
+    try:
+        diff_response = call_groq_with_retry(
+            messages   = [{"role": "user", "content": diff_prompt}],
+            model      = "llama-3.3-70b-versatile",
+            temperature= 0.2,
+            max_tokens = 6000,
+        )
+        adn_diff = diff_response.choices[0].message.content if diff_response.choices else ""
+        if not adn_diff or len(adn_diff.strip()) < 100:
+            raise Exception("Groq returned insufficient differential content")
+    except Exception as e:
+        logging.error(f"compare_micrographs: Groq diff failed: {e}", exc_info=True)
+        adn_diff = (
+            "# ADN Differential Analysis — A vs B\n\n"
+            f"_Differential generation failed: {e}_\n\n"
+            f"**Match A**: {match_a.get('reference','N/A')} — "
+            f"{match_a.get('display_name') or match_a.get('material_name','')}\n\n"
+            f"**Match B**: {match_b.get('reference','N/A')} — "
+            f"{match_b.get('display_name') or match_b.get('material_name','')}\n\n"
+            f"Cross-embedding similarity: **{cross_sim_pct}%**"
+        )
+
+    # ── 8. (Optional) Generate docx ──────────────────────────────────────────
+    download_url  = None
+    absolute_url  = None
+    try:
+        doc = Document()
+        doc.add_heading("ADN Differential Analysis", 0)
+        doc.add_paragraph(f"Image A: {match_a.get('reference','N/A')} — {match_a.get('display_name') or match_a.get('material_name','')}")
+        doc.add_paragraph(f"Image B: {match_b.get('reference','N/A')} — {match_b.get('display_name') or match_b.get('material_name','')}")
+        doc.add_paragraph(f"Cross-embedding similarity: {cross_sim_pct}%")
+        doc.add_heading("Differential Report", level=1)
+        # Split diff text into paragraphs for docx
+        for line in adn_diff.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("# "):
+                doc.add_heading(line[2:], level=1)
+            elif line.startswith("## "):
+                doc.add_heading(line[3:], level=2)
+            elif line.startswith("### "):
+                doc.add_heading(line[4:], level=3)
+            else:
+                doc.add_paragraph(line)
+        ref_label = f"{match_a.get('reference','A')}_vs_{match_b.get('reference','B')}"
+        _, download_url, absolute_url = _save_docx_and_build_url(doc, "compare_adn", ref_label)
+    except Exception as e:
+        logging.warning(f"compare_micrographs: docx generation failed: {e}")
+
+    # ── 9. Response ───────────────────────────────────────────────────────────
+    return jsonify({
+        "success":             True,
+        "match_a":             match_a,
+        "match_b":             match_b,
+        "cross_similarity":    cross_sim,
+        "cross_similarity_pct": cross_sim_pct,
+        "adn_a":               adn_text_a,
+        "adn_b":               adn_text_b,
+        "adn_diff":            adn_diff,
+        "download_url":        download_url,
+        "absolute_url":        absolute_url,
+    }), 200
 # =============================================================================
 # =============================================================================
 # MAIN

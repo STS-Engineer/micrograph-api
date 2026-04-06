@@ -7,8 +7,8 @@ import sys
 import time
 from pathlib import Path
 
-from azure.core.exceptions import ServiceResponseError
 from azure.core.exceptions import ResourceExistsError
+from azure.core.exceptions import ServiceResponseError
 from azure.storage.blob import BlobServiceClient
 from dotenv import load_dotenv
 
@@ -19,13 +19,7 @@ BASE_DIR = Path(__file__).resolve().parent
 AZURE_CONNECTION_STRING = os.getenv("AZURE_CONNECTION_STRING", "").strip()
 AZURE_CONTAINER_NAME = os.getenv("AZURE_CONTAINER_NAME", "").strip()
 AZURE_BLOB_PREFIX = os.getenv("AZURE_BLOB_PREFIX", "micrograph-images").strip("/ ")
-
-IMAGE_DIRS = [
-    BASE_DIR / "embeddings_v7" / "images",
-    BASE_DIR / "output_v3" / "images",
-    BASE_DIR / "output_v4" / "images",
-]
-GIT_LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1"
+DEFAULT_TARGET_FOLDER = "micrograph-docs"
 
 
 def require_env(name: str, value: str) -> str:
@@ -34,24 +28,44 @@ def require_env(name: str, value: str) -> str:
     return value
 
 
-def build_blob_name(source_dir: Path, file_path: Path) -> str:
+def resolve_source_dir(source_dir: str) -> Path:
+    candidate = Path(source_dir).expanduser()
+    if not candidate.is_absolute():
+        candidate = BASE_DIR / candidate
+    return candidate.resolve()
+
+
+def build_blob_name(source_dir: Path, file_path: Path, target_folder: str) -> str:
     relative_name = file_path.relative_to(source_dir).as_posix()
-    folder_name = source_dir.parent.name
+    source_folder_name = source_dir.name
     if AZURE_BLOB_PREFIX:
-        return f"{AZURE_BLOB_PREFIX}/{folder_name}/{relative_name}"
-    return f"{folder_name}/{relative_name}"
+        return f"{AZURE_BLOB_PREFIX}/{target_folder}/{source_folder_name}/{relative_name}"
+    return f"{target_folder}/{source_folder_name}/{relative_name}"
 
 
-def is_git_lfs_pointer(file_path: Path) -> bool:
-    try:
-        with open(file_path, "rb") as f:
-            return f.read(256).startswith(GIT_LFS_POINTER_PREFIX)
-    except OSError:
-        return False
+def iter_source_files(source_dir: Path, match_filter: str):
+    for file_path in source_dir.rglob("*"):
+        if not file_path.is_file():
+            continue
+        if match_filter and match_filter not in str(file_path).casefold():
+            continue
+        yield file_path
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Upload local image assets to Azure Blob Storage.")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Upload one or more local folders to Azure Blob Storage while preserving their structure."
+    )
+    parser.add_argument(
+        "source_dirs",
+        nargs="+",
+        help="One or more local folders to upload.",
+    )
+    parser.add_argument(
+        "--target-folder",
+        default=DEFAULT_TARGET_FOLDER,
+        help="Virtual folder inside the Azure blob prefix.",
+    )
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -80,10 +94,24 @@ def main() -> None:
         default=3,
         help="Number of attempts for each blob upload on transient network errors.",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
 
     require_env("AZURE_CONNECTION_STRING", AZURE_CONNECTION_STRING)
     require_env("AZURE_CONTAINER_NAME", AZURE_CONTAINER_NAME)
+
+    target_folder = args.target_folder.strip("/ ") or DEFAULT_TARGET_FOLDER
+    match_filter = args.match.casefold().strip()
+    source_dirs = [resolve_source_dir(source_dir) for source_dir in args.source_dirs]
+
+    for source_dir in source_dirs:
+        if not source_dir.exists():
+            raise RuntimeError(f"Source directory does not exist: {source_dir}")
+        if not source_dir.is_dir():
+            raise RuntimeError(f"Source path is not a directory: {source_dir}")
 
     blob_service = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
     container_client = blob_service.get_container_client(AZURE_CONTAINER_NAME)
@@ -94,42 +122,31 @@ def main() -> None:
 
     uploaded = 0
     overwritten = 0
-    skipped = 0
-    skipped_lfs_pointers = 0
+    skipped_existing = 0
     failed = 0
-    match_filter = args.match.casefold().strip()
+    scanned = 0
 
-    for image_dir in IMAGE_DIRS:
-        if not image_dir.exists():
-            print(f"Skipping missing directory: {image_dir}")
-            continue
-
-        for file_path in image_dir.rglob("*"):
-            if not file_path.is_file():
-                continue
-            if match_filter and match_filter not in str(file_path).casefold():
-                continue
-            if is_git_lfs_pointer(file_path):
-                skipped_lfs_pointers += 1
-                print(f"Skipping Git LFS pointer (run 'git lfs pull' first): {file_path}")
-                continue
-
-            blob_name = build_blob_name(image_dir, file_path)
+    for source_dir in source_dirs:
+        print(f"Scanning: {source_dir}")
+        for file_path in iter_source_files(source_dir, match_filter):
+            scanned += 1
+            blob_name = build_blob_name(source_dir, file_path, target_folder)
             blob_client = container_client.get_blob_client(blob_name)
             blob_exists = blob_client.exists()
 
             if blob_exists and not args.overwrite:
-                skipped += 1
+                skipped_existing += 1
                 continue
 
             content_type, _ = mimetypes.guess_type(file_path.name)
             print(f"Uploading: {file_path} -> {blob_name}")
+
             upload_succeeded = False
             for attempt in range(1, max(args.retries, 1) + 1):
                 try:
-                    with open(file_path, "rb") as f:
+                    with open(file_path, "rb") as stream:
                         blob_client.upload_blob(
-                            f,
+                            stream,
                             overwrite=args.overwrite,
                             content_type=content_type or "application/octet-stream",
                             connection_timeout=args.connection_timeout,
@@ -162,9 +179,9 @@ def main() -> None:
 
     print(
         "Done. "
-        f"Uploaded={uploaded}, Overwritten={overwritten}, Skipped={skipped}, "
-        f"SkippedLFSPointers={skipped_lfs_pointers}, Failed={failed}, "
-        f"Container={AZURE_CONTAINER_NAME}"
+        f"Scanned={scanned}, Uploaded={uploaded}, Overwritten={overwritten}, "
+        f"SkippedExisting={skipped_existing}, Failed={failed}, "
+        f"Container={AZURE_CONTAINER_NAME}, TargetFolder={target_folder}"
     )
     if failed:
         sys.exit(1)
